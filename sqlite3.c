@@ -23,6 +23,29 @@
 **    
 */
 #ifndef SQLITE_AMALGAMATION
+
+#include <float.h>
+
+#pragma warning(disable: 4244 4049 4761 4305 4056 4756)
+
+//////////DEBUG/////////////////////////
+#ifdef _WINDOWS
+#ifdef _DEBUG
+#include "j_afxdbgheap.h"
+#define new DEBUG_NEW
+static const char THIS_FILE[] = __FILE__;
+#endif
+#endif
+////////////////////////////////////////
+
+/* Note: neither INFINITY nor NDEBUG is defined here on purpose.
+** sqlite3.c already carries its own workarounds for both:
+** "#if !defined(INFINITY) && defined(_MSC_VER)" for the former, and
+** "#if !defined(NDEBUG) && !defined(SQLITE_DEBUG)" for the latter, which
+** is what keeps the SQLITE_DEBUG-only assert()s in mutex_w32.c out of a
+** build that defines neither macro.
+*/
+
 #define SQLITE_CORE 1
 #define SQLITE_AMALGAMATION 1
 #ifndef SQLITE_PRIVATE
@@ -15124,6 +15147,11 @@ struct fts5_api {
 #include <inttypes.h>
 #endif
 
+#ifndef UINT64_C
+#define UINT64_C(val) val##Ui64
+#define INT64_C(val) val##i64
+#endif
+
 /*
 ** The following macros are used to cast pointers to integers and
 ** integers to pointers.  The way you do this varies from one compiler
@@ -15853,7 +15881,7 @@ SQLITE_PRIVATE void sqlite3HashClear(Hash*);
 # define float sqlite_int64
 # define fabs(X) ((X)<0?-(X):(X))
 # define sqlite3IsOverflow(X) 0
-# define INFINITY (9223372036854775807LL)
+# define INFINITY (9223372036854775807I64)
 # ifndef SQLITE_BIG_DBL
 #   define SQLITE_BIG_DBL (((sqlite3_int64)1)<<50)
 # endif
@@ -25140,7 +25168,7 @@ SQLITE_PRIVATE const u8 sqlite3SmallTypeSizes[];
 #define FOUR_BYTE_UINT(x)  (((u32)(x)[0]<<24)|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
 #define FOUR_BYTE_U64(x)   (((u64)(x)[0]<<24)|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
 #define FOUR_BYTE_INT(x)   ((int)FOUR_BYTE_UINT(x))
-#define SIX_BYTE_INT(x)    (FOUR_BYTE_UINT(x+2)+4294967296LL*TWO_BYTE_INT(x))
+#define SIX_BYTE_INT(x)    (FOUR_BYTE_UINT(x+2)+((((i64)1)<<32))*TWO_BYTE_INT(x))
 
 /*
 ** Function prototypes
@@ -31427,10 +31455,54 @@ SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
 */
 #ifdef SQLITE_MUTEX_W32
 
-#if MSVC_VERSION>0
+/*
+** When SQLITE_WIN32_USE_SRWLOCK is defined, the slim reader/writer lock
+** (SRWLOCK) APIs are used for non-recursive mutexes.  Those APIs are an
+** operating system feature rather than a compiler feature:  they need
+** Windows Vista or later, and TryAcquireSRWLockExclusive() needs Windows
+** 7 or later.  The decision is therefore taken from _WIN32_WINNT -- the
+** version of Windows being targeted -- and not from the compiler version.
+** Deciding on the compiler would make a modern compiler emit static
+** imports of the SRWLOCK entry points even when targeting Windows XP, and
+** the resulting binary would fail to load there.
+**
+** When the macro ends up undefined the SRWLOCK code paths are compiled
+** out and every mutex falls back to a Win32 CRITICAL_SECTION, so the
+** build still runs on older versions of Windows.  Define
+** SQLITE_WIN32_NO_SRWLOCK to force that fallback, or define
+** SQLITE_WIN32_USE_SRWLOCK to force SRWLOCK on.
+*/
+
+/* __declspec(align()) is available from Visual C++ .NET 2002 (1300) on. */
+#if MSVC_VERSION>=1300
 # define ALIGN128 __declspec(align(128))
 #else
 # define ALIGN128
+#endif
+
+#if !defined(SQLITE_WIN32_USE_SRWLOCK) && !defined(SQLITE_WIN32_NO_SRWLOCK)
+# if defined(_WIN32_WINNT) && _WIN32_WINNT>=0x0601
+   /* The SDK must actually declare the SRWLOCK entry points.  They arrived
+   ** with the Windows SDK bundled with Visual C++ 2008; _MSC_VER is used
+   ** directly here rather than MSVC_VERSION because the latter is also
+   ** switched off by SQLITE_DISABLE_INTRINSIC, which is unrelated. */
+#  if !defined(_MSC_VER) || _MSC_VER>=1500
+#   define SQLITE_WIN32_USE_SRWLOCK
+#  endif
+# endif
+#endif
+
+/* Both mutex code paths below call TryEnterCriticalSection(), but the SDK
+** that ships with Visual C++ 6.0 only declares it when _WIN32_WINNT is set
+** to 0x0400 or above.  Without a declaration the call is emitted as __cdecl
+** and the link fails with "unresolved external _TryEnterCriticalSection".
+** The entry point exists on Windows NT 4.0 and later; it is absent on
+** Windows 95/98/Me, which SQLite no longer supports in any case.
+*/
+#if defined(_MSC_VER) && _MSC_VER<1300
+# if !defined(_WIN32_WINNT) || _WIN32_WINNT<0x0400
+WINBASEAPI BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION);
+# endif
 #endif
 
 #pragma warning(push)
@@ -31448,7 +31520,9 @@ SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
 struct sqlite3_mutex {
   union {
     CRITICAL_SECTION cs;     /* The CRITICAL_SECTION mutex.  id==1 */
+#ifdef SQLITE_WIN32_USE_SRWLOCK
     SRWLOCK srwl;            /* The Slim reader/writer lock.  id!=1 */
+#endif
   } u;
   int id;                    /* Mutex type */
 #ifdef SQLITE_DEBUG
@@ -31521,7 +31595,13 @@ static int winMutexInit(void){
     for(i=0; i<ArraySize(aWindowsMutex); i++){
       sqlite3_mutex *p = &aWindowsMutex[i].m;
       p->id = i+2;
+#ifdef SQLITE_WIN32_USE_SRWLOCK
       InitializeSRWLock(&p->u.srwl);
+#else
+      /* SRWLOCK disabled: share the SQLITE_MUTEX_RECURSIVE code path and
+      ** initialize a CRITICAL_SECTION instead. */
+      InitializeCriticalSection(&p->u.cs);
+#endif
 #ifdef SQLITE_DEBUG
       p->nRef = 0;
       p->owner = 0;
@@ -31544,6 +31624,12 @@ static int winMutexEnd(void){
   ** (which should be the last to shutdown.) */
   if( InterlockedCompareExchange(&winMutex_lock, 0, 1)==1 ){
     if( winMutex_isInit==1 ){
+#ifndef SQLITE_WIN32_USE_SRWLOCK
+      int i;
+      for(i=0; i<ArraySize(aWindowsMutex); i++){
+        DeleteCriticalSection(&aWindowsMutex[i].m.u.cs);
+      }
+#endif
       winMutex_isInit = 0;
     }
   }
@@ -31612,11 +31698,17 @@ static sqlite3_mutex *winMutexAlloc(int iType){
         p->trace = 1;
 #endif
 #endif
+#ifdef SQLITE_WIN32_USE_SRWLOCK
         if( iType==SQLITE_MUTEX_RECURSIVE ){
           InitializeCriticalSection(&p->u.cs);
         }else{
           InitializeSRWLock(&p->u.srwl);
         }
+#else
+        /* SRWLOCK disabled: SQLITE_MUTEX_FAST falls through to the
+        ** SQLITE_MUTEX_RECURSIVE path and uses a CRITICAL_SECTION. */
+        InitializeCriticalSection(&p->u.cs);
+#endif
       }
       break;
     }
@@ -31649,12 +31741,21 @@ static sqlite3_mutex *winMutexAlloc(int iType){
 static void winMutexFree(sqlite3_mutex *p){
   assert( p );
   assert( p->nRef==0 && p->owner==0 );
+#ifdef SQLITE_WIN32_USE_SRWLOCK
   if( p->id==SQLITE_MUTEX_FAST ){
     sqlite3_free(p);
   }else if( p->id==SQLITE_MUTEX_RECURSIVE ){
     DeleteCriticalSection(&p->u.cs);
     sqlite3_free(p);
   }else{
+#else
+  /* SRWLOCK disabled: SQLITE_MUTEX_FAST shares the SQLITE_MUTEX_RECURSIVE
+  ** teardown and must release its CRITICAL_SECTION too. */
+  if( p->id==SQLITE_MUTEX_FAST || p->id==SQLITE_MUTEX_RECURSIVE ){
+    DeleteCriticalSection(&p->u.cs);
+    sqlite3_free(p);
+  }else{
+#endif
 #ifdef SQLITE_ENABLE_API_ARMOR
     (void)SQLITE_MISUSE_BKPT;
 #endif
@@ -31678,11 +31779,16 @@ static void winMutexEnter(sqlite3_mutex *p){
   assert( p->id==SQLITE_MUTEX_RECURSIVE || winMutexNotheld(p) );
 #endif
   assert( winMutex_isInit==1 );
+#ifdef SQLITE_WIN32_USE_SRWLOCK
   if( p->id==SQLITE_MUTEX_RECURSIVE ){
     EnterCriticalSection(&p->u.cs);
   }else{
     AcquireSRWLockExclusive(&p->u.srwl);
   }
+#else
+  /* SRWLOCK disabled: every mutex uses the SQLITE_MUTEX_RECURSIVE path. */
+  EnterCriticalSection(&p->u.cs);
+#endif
 #ifdef SQLITE_DEBUG
   assert( p->nRef>0 || p->owner==0 );
   p->owner = GetCurrentThreadId();
@@ -31703,11 +31809,16 @@ static int winMutexTry(sqlite3_mutex *p){
   ** used it is merely an optimization.  So it is OK for it to always
   ** fail.
   */
+#ifdef SQLITE_WIN32_USE_SRWLOCK
   if( p->id==SQLITE_MUTEX_RECURSIVE ){
     rc = TryEnterCriticalSection(&p->u.cs);
   }else{
     rc = TryAcquireSRWLockExclusive(&p->u.srwl);
   }
+#else
+  /* SRWLOCK disabled: every mutex uses the SQLITE_MUTEX_RECURSIVE path. */
+  rc = TryEnterCriticalSection(&p->u.cs);
+#endif
   if( rc ){
 #ifdef SQLITE_DEBUG
     p->owner = GetCurrentThreadId();
@@ -31744,11 +31855,16 @@ static void winMutexLeave(sqlite3_mutex *p){
   assert( p->nRef==0 || p->id==SQLITE_MUTEX_RECURSIVE );
 #endif
   assert( winMutex_isInit==1 );
+#ifdef SQLITE_WIN32_USE_SRWLOCK
   if( p->id==SQLITE_MUTEX_RECURSIVE ){
     LeaveCriticalSection(&p->u.cs);
   }else{
     ReleaseSRWLockExclusive(&p->u.srwl);
   }
+#else
+  /* SRWLOCK disabled: every mutex uses the SQLITE_MUTEX_RECURSIVE path. */
+  LeaveCriticalSection(&p->u.cs);
+#endif
 #ifdef SQLITE_DEBUG
   if( p->trace ){
     OSTRACE(("LEAVE-MUTEX tid=%lu, mutex(%d)=%p (%d), nRef=%d\n",
@@ -32019,7 +32135,7 @@ static SQLITE_NOINLINE void test_oom_breakpoint(u64 n){
   assert( (nOomFault>>32) < 0xffffffff );
 }
 #else
-# define test_oom_breakpoint(X)   /* No-op for production builds */
+# define test_oom_breakpoint(n)   /* No-op for production builds */
 #endif
 
 /*
@@ -37530,12 +37646,12 @@ static int countLeadingZeros(u64 m){
   return __builtin_clzll(m);
 #else
   int n = 0;
-  if( m <= 0x00000000ffffffffULL) { n += 32; m <<= 32; }
-  if( m <= 0x0000ffffffffffffULL) { n += 16; m <<= 16; }
-  if( m <= 0x00ffffffffffffffULL) { n += 8;  m <<= 8;  }
-  if( m <= 0x0fffffffffffffffULL) { n += 4;  m <<= 4;  }
-  if( m <= 0x3fffffffffffffffULL) { n += 2;  m <<= 2;  }
-  if( m <= 0x7fffffffffffffffULL) { n += 1;            }
+  if( m <= 0x00000000ffffffffUi64) { n += 32; m <<= 32; }
+  if( m <= 0x0000ffffffffffffUi64) { n += 16; m <<= 16; }
+  if( m <= 0x00ffffffffffffffUi64) { n += 8;  m <<= 8;  }
+  if( m <= 0x0fffffffffffffffUi64) { n += 4;  m <<= 4;  }
+  if( m <= 0x3fffffffffffffffUi64) { n += 2;  m <<= 2;  }
+  if( m <= 0x7fffffffffffffffUi64) { n += 1;            }
   return n;
 #endif
 }
@@ -38205,13 +38321,13 @@ SQLITE_PRIVATE void sqlite3FpDecode(FpDecode *p, double r, int iRound, int mxRou
   memcpy(&v,&r,8);
   e = (v>>52)&0x7ff;
   if( e==0x7ff ){
-    p->isSpecial = 1 + (v!=0x7ff0000000000000LL);
+    p->isSpecial = 1 + (v!=0x7ff0000000000000i64);
     p->n = 0;
     p->iDP = 0;
     p->z = p->zBuf;
     return;
   }
-  v &= 0x000fffffffffffffULL;
+  v &= 0x000fffffffffffffUi64;
   if( e==0 ){
     int nn = countLeadingZeros(v);
     v <<= nn;
@@ -38335,7 +38451,7 @@ SQLITE_PRIVATE int sqlite3GetUInt32(const char *z, u32 *pI){
   int i;
   for(i=0; sqlite3Isdigit(z[i]); i++){
     v = v*10 + z[i] - '0';
-    if( v>4294967296LL ){ *pI = 0; return 0; }
+    if( v>4294967296i64 ){ *pI = 0; return 0; }
   }
   if( i==0 || z[i]!=0 ){ *pI = 0; return 0; }
   *pI = (u32)v;
@@ -49654,8 +49770,8 @@ static struct win_syscall {
 #endif
 #define osGetTempPathW ((DWORD(WINAPI*)(DWORD,LPWSTR))aSyscall[18].pCurrent)
 
-  { "GetTickCount64",          (SYSCALL)GetTickCount64,          0 },
-#define osGetTickCount64 ((ULONGLONG(WINAPI*)(VOID))aSyscall[19].pCurrent)
+  { "GetTickCount",            (SYSCALL)GetTickCount,            0 },
+#define osGetTickCount ((DWORD(WINAPI*)(VOID))aSyscall[19].pCurrent)
 
 #ifdef SQLITE_UWP
   { "HeapAlloc",               (SYSCALL)0,                       0 },
@@ -54286,8 +54402,8 @@ static int winRandomness(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
     xorMemory(&e, (unsigned char*)&pid, sizeof(pid));
   }
   {
-    ULONGLONG cnt = osGetTickCount64();
-    xorMemory(&e, (unsigned char*)&cnt, sizeof(cnt));
+    DWORD cnt = osGetTickCount();
+    xorMemory(&e, (unsigned char*)&cnt, sizeof(DWORD));
   }
   {
     LARGE_INTEGER i;
@@ -86001,7 +86117,7 @@ SQLITE_PRIVATE int sqlite3RealSameAsInt(double r1, sqlite3_int64 i){
   double r2 = (double)i;
   return r1==0.0
       || (memcmp(&r1, &r2, sizeof(r1))==0
-          && i >= -2251799813685248LL && i < 2251799813685248LL);
+          && i >= -2251799813685248i64 && i < 2251799813685248i64);
 }
 
 /* Convert a floating point value to its closest integer.  Do so in
@@ -87121,7 +87237,7 @@ SQLITE_PRIVATE int sqlite3ValueFromExpr(
     if( rc==SQLITE_OK && pVal
      && affinity==SQLITE_AFF_REAL
      && (pVal->flags & MEM_Int)
-     && (pVal->u.i<-140737488355328LL || pVal->u.i>140737488355327LL)
+     && (pVal->u.i<-140737488355328I64 || pVal->u.i>140737488355327I64)
     ){
       /* If the integer value is too large to fit in a 6-byte integer and
       ** the affinity is REAL, convert it to a real value now. In most
@@ -91551,7 +91667,7 @@ SQLITE_PRIVATE void sqlite3VdbeSerialGet(
       pMem->u.i = FOUR_BYTE_INT(buf);
 #ifdef __HP_cc
       /* Work around a sign-extension bug in the HP compiler for HP/UX */
-      if( buf[0]&0x80 ) pMem->u.i |= 0xffffffff80000000LL;
+      if( buf[0]&0x80 ) pMem->u.i |= 0xffffffff80000000i64;
 #endif
       pMem->flags = MEM_Int;
       testcase( pMem->u.i<0 );
@@ -92516,7 +92632,7 @@ SQLITE_PRIVATE RecordCompare sqlite3VdbeFindCompare(UnpackedRecord *p){
     int flags = p->aMem[0].flags;
     if( p->pKeyInfo->aSortFlags[0] ){
       if( p->pKeyInfo->aSortFlags[0] & KEYINFO_ORDER_BIGNULL ){
-        return sqlite3VdbeRecordCompare;
+        return &sqlite3VdbeRecordCompare;
       }
       p->r1 = 1;
       p->r2 = -1;
@@ -92526,7 +92642,7 @@ SQLITE_PRIVATE RecordCompare sqlite3VdbeFindCompare(UnpackedRecord *p){
     }
     if( (flags & MEM_Int) ){
       p->u.i = p->aMem[0].u.i;
-      return vdbeRecordCompareInt;
+      return &vdbeRecordCompareInt;
     }
     testcase( flags & MEM_Real );
     testcase( flags & MEM_Null );
@@ -92537,11 +92653,11 @@ SQLITE_PRIVATE RecordCompare sqlite3VdbeFindCompare(UnpackedRecord *p){
       assert( flags & MEM_Str );
       p->u.z = p->aMem[0].z;
       p->n = p->aMem[0].n;
-      return vdbeRecordCompareString;
+      return &vdbeRecordCompareString;
     }
   }
 
-  return sqlite3VdbeRecordCompare;
+  return &sqlite3VdbeRecordCompare;
 }
 
 /*
@@ -99679,11 +99795,11 @@ case OP_TypeCheck: {
             ** that will fit in 6 bytes, then change the type to MEM_IntReal
             ** so that we keep the high-resolution integer value but know that
             ** the type really wants to be REAL. */
-            testcase( pIn1->u.i==140737488355328LL );
-            testcase( pIn1->u.i==140737488355327LL );
-            testcase( pIn1->u.i==-140737488355328LL );
-            testcase( pIn1->u.i==-140737488355329LL );
-            if( pIn1->u.i<=140737488355327LL && pIn1->u.i>=-140737488355328LL){
+            testcase( pIn1->u.i==140737488355328i64 );
+            testcase( pIn1->u.i==140737488355327i64 );
+            testcase( pIn1->u.i==-140737488355328i64 );
+            testcase( pIn1->u.i==-140737488355329i64 );
+            if( pIn1->u.i<=140737488355327i64 && pIn1->u.i>=-140737488355328i64){
               pIn1->flags |= MEM_IntReal;
               pIn1->flags &= ~MEM_Int;
             }else{
@@ -99915,8 +100031,8 @@ case OP_MakeRecord: {
       testcase( uu==127 );               testcase( uu==128 );
       testcase( uu==32767 );             testcase( uu==32768 );
       testcase( uu==8388607 );           testcase( uu==8388608 );
-      testcase( uu==2147483647 );        testcase( uu==2147483648LL );
-      testcase( uu==140737488355327LL ); testcase( uu==140737488355328LL );
+      testcase( uu==2147483647 );        testcase( uu==2147483648i64 );
+      testcase( uu==140737488355327i64 ); testcase( uu==140737488355328i64 );
       if( uu<=127 ){
         if( (i&1)==i && p->minWriteFileFormat>=4 ){
           pRec->uTemp = 8+(u32)uu;
@@ -99933,7 +100049,7 @@ case OP_MakeRecord: {
       }else if( uu<=2147483647 ){
         nData += 4;
         pRec->uTemp = 4;
-      }else if( uu<=140737488355327LL ){
+      }else if( uu<=140737488355327i64 ){
         nData += 6;
         pRec->uTemp = 5;
       }else{
@@ -107872,13 +107988,13 @@ static SorterRecord *vdbeSorterMerge(
 */
 static SorterCompare vdbeSorterGetCompare(VdbeSorter *p){
   if( p->typeMask & SORTER_TYPE_INTEGER ){
-    return vdbeSorterCompareInt;
+    return &vdbeSorterCompareInt;
   }else if( p->typeMask & SORTER_TYPE_TEXT ){
-    return vdbeSorterCompareText;
+    return &vdbeSorterCompareText;
   }else if( p->typeMask & SORTER_TYPE_REAL ){
-    return vdbeSorterCompareReal;
+    return &vdbeSorterCompareReal;
   }
-  return vdbeSorterCompare;
+  return &vdbeSorterCompare;
 }
 
 /*
@@ -136059,7 +136175,7 @@ static void kahanBabuskaNeumaierStep(
 ** Add a (possibly large) integer to the running sum.
 */
 static void kahanBabuskaNeumaierStepInt64(volatile SumCtx *pSum, i64 iVal){
-  if( iVal<=-4503599627370496LL || iVal>=+4503599627370496LL ){
+  if( iVal<=-4503599627370496i64 || iVal>=+4503599627370496i64 ){
     i64 iBig, iSm;
     iSm = iVal % 16384;
     iBig = iVal - iSm;
@@ -136077,7 +136193,7 @@ static void kahanBabuskaNeumaierInit(
   volatile SumCtx *p,
   i64 iVal
 ){
-  if( iVal<=-4503599627370496LL || iVal>=+4503599627370496LL ){
+  if( iVal<=-4503599627370496i64 || iVal>=+4503599627370496i64 ){
     i64 iSm = iVal % 16384;
     p->rSum = (double)(iVal - iSm);
     p->rErr = (double)iSm;
@@ -216991,7 +217107,13 @@ static void jsonReturnFromBlob(
           ** large to appear as an SQLite integer so it must be converted
           ** into floating point. */
           double r;
-          r = (double)*(sqlite3_uint64*)&iRes;
+          /* MSVC 6 cannot convert unsigned __int64 to double (C2520), so
+          ** split the value in two.  Casting straight to sqlite3_int64
+          ** would be wrong: this branch only runs when bit 63 is set, and
+          ** the whole point is to read those bits as a positive value. */
+          sqlite3_uint64 uRes = *(sqlite3_uint64*)&iRes;
+          r = (double)(sqlite3_int64)(uRes>>1)*2.0
+                + (double)(sqlite3_int64)(uRes&1);
           sqlite3_result_double(pCtx, bNeg ? -r : r);
         }else{
           sqlite3_result_int64(pCtx, bNeg ? -iRes : iRes);
@@ -226198,9 +226320,9 @@ static void icuCaseFunc16(sqlite3_context *p, int nArg, sqlite3_value **apArg){
     zOutput = zNew;
     status = U_ZERO_ERROR;
     if( bToUpper ){
-      nOut = 2LL*u_strToUpper(zOutput,nOut/2,zInput,nInput/2,zLocale,&status);
+      nOut = 2I64*u_strToUpper(zOutput,nOut/2,zInput,nInput/2,zLocale,&status);
     }else{
-      nOut = 2LL*u_strToLower(zOutput,nOut/2,zInput,nInput/2,zLocale,&status);
+      nOut = 2I64*u_strToLower(zOutput,nOut/2,zInput,nInput/2,zLocale,&status);
     }
 
     if( U_SUCCESS(status) ){
