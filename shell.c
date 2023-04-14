@@ -1646,7 +1646,8 @@ int sqlite3MemTraceDeactivate(void){
 **
 ******************************************************************************
 **
-** This SQLite extension implements functions that compute SHA3 hashes.
+** This SQLite extension implements functions that compute SHA3 hashes
+** in the way described by the (U.S.) NIST FIPS 202 SHA-3 Standard.
 ** Two SQL functions are implemented:
 **
 **     sha3(X,SIZE)
@@ -17931,7 +17932,7 @@ static char *shell_error_context(const char *zSql, sqlite3 *db){
   if( db==0
    || zSql==0
    || (iOffset = sqlite3_error_offset(db))<0
-   || iOffset>=strlen(zSql)
+   || iOffset>=(int)strlen(zSql)
   ){
     return sqlite3_mprintf("");
   }

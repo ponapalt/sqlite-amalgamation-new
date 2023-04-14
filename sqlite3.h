@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.42.0"
 #define SQLITE_VERSION_NUMBER 3042000
-#define SQLITE_SOURCE_ID      "2023-04-07 14:03:30 d8f50b31e8d64fce5141da4a016767a15482703364692a55df346f059fc9d30c"
+#define SQLITE_SOURCE_ID      "2023-04-14 14:36:34 430ec1a61507d8afd8adc161f577f32856dba21506db9717fae3d14570786439"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -2496,7 +2496,7 @@ struct sqlite3_mem_methods {
 #define SQLITE_DBCONFIG_ENABLE_VIEW           1015 /* int int* */
 #define SQLITE_DBCONFIG_LEGACY_FILE_FORMAT    1016 /* int int* */
 #define SQLITE_DBCONFIG_TRUSTED_SCHEMA        1017 /* int int* */
-#define SQLITE_DBCONFIG_STMT_SCANSTATUS       1080 /* int int*  */
+#define SQLITE_DBCONFIG_STMT_SCANSTATUS       1018 /* int int*  */
 #define SQLITE_DBCONFIG_REVERSE_SCANORDER     1019 /* int int* */
 #define SQLITE_DBCONFIG_MAX                   1019 /* Largest DBCONFIG */
 
