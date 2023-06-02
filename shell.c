@@ -15909,7 +15909,7 @@ static int recoverIsValidPage(u8 *aTmp, const u8 *a, int n){
     if( iFree>(n-4) ) return 0;
     iNext = recoverGetU16(&a[iFree]);
     nByte = recoverGetU16(&a[iFree+2]);
-    if( iFree+nByte>n ) return 0;
+    if( iFree+nByte>n || nByte<4 ) return 0;
     if( iNext && iNext<iFree+nByte ) return 0;
     memset(&aUsed[iFree], 0xFF, nByte);
     iFree = iNext;
@@ -27544,7 +27544,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       bail_on_error = 1;
     }else if( cli_strcmp(z,"-nonce")==0 ){
       free(data.zNonce);
-      data.zNonce = strdup(argv[++i]);
+      data.zNonce = strdup(cmdline_option_value(argc, argv, ++i));
     }else if( cli_strcmp(z,"-unsafe-testing")==0 ){
       ShellSetFlag(&data,SHFLG_TestingMode);
     }else if( cli_strcmp(z,"-safe")==0 ){

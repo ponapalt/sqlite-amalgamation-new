@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.43.0"
 #define SQLITE_VERSION_NUMBER 3043000
-#define SQLITE_SOURCE_ID      "2023-05-25 16:49:06 6e79505df915612b60696e4eec5c9973175fe6ecf273eb3152b996e63ae54a07"
+#define SQLITE_SOURCE_ID      "2023-06-02 18:05:54 2d962b84dd8ac2d0968f0283f8f082c1c2a7a1f99b59053b2ad8f58745396447"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -3388,8 +3388,10 @@ SQLITE_API SQLITE_DEPRECATED void *sqlite3_profile(sqlite3*,
 ** M argument should be the bitwise OR-ed combination of
 ** zero or more [SQLITE_TRACE] constants.
 **
-** ^Each call to either sqlite3_trace() or sqlite3_trace_v2() overrides
-** (cancels) any prior calls to sqlite3_trace() or sqlite3_trace_v2().
+** ^Each call to either sqlite3_trace(D,X,P) or sqlite3_trace_v2(D,M,X,P)
+** overrides (cancels) all prior calls to sqlite3_trace(D,X,P) or
+** sqlite3_trace_v2(D,M,X,P) for the [database connection] D.  Each
+** database connection may have at most one trace callback.
 **
 ** ^The X callback is invoked whenever any of the events identified by
 ** mask M occur.  ^The integer return value from the callback is currently
