@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.44.0"
 #define SQLITE_VERSION_NUMBER 3044000
-#define SQLITE_SOURCE_ID      "2023-09-01 11:10:09 8ca1d815a57be1fade59fb8ea5705c27b10294e4959c8a9c624f1623df6a5f63"
+#define SQLITE_SOURCE_ID      "2023-09-07 17:54:12 a917ebf17b27951d1c6906e9068e816ef29861701f2e8f4f1a13acce5737f680"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -7217,6 +7217,9 @@ struct sqlite3_module {
   /* The methods above are in versions 1 and 2 of the sqlite_module object.
   ** Those below are for version 3 and greater. */
   int (*xShadowName)(const char*);
+  /* The methods above are in versions 1 through 3 of the sqlite_module object.
+  ** Those below are for version 4 and greater. */
+  int (*xIntegrity)(sqlite3_vtab *pVTab, char**);
 };
 
 /*
