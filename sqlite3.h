@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.44.0"
 #define SQLITE_VERSION_NUMBER 3044000
-#define SQLITE_SOURCE_ID      "2023-09-18 20:42:06 f9d62b853ce8bfbfdc9f137e984e7a1b51d70e88c38b136b4fad1e8ae6ee8913"
+#define SQLITE_SOURCE_ID      "2023-09-29 15:56:40 615ab71761754b072439f92e73fdb98c916b820937bcca8904f4be34936d5f9c"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -10610,6 +10610,13 @@ SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_recover(sqlite3 *db, const c
 ** SQLITE_SERIALIZE_NOCOPY bit is set but no contiguous copy
 ** of the database exists.
 **
+** After the call, if the SQLITE_SERIALIZE_NOCOPY bit had been set,
+** the returned buffer content will remain accessible and unchanged
+** until either the next write operation on the connection or when
+** the connection is closed, and applications must not modify the
+** buffer. If the bit had been clear, the returned buffer will not
+** be accessed by SQLite after the call.
+**
 ** A call to sqlite3_serialize(D,S,P,F) might return NULL even if the
 ** SQLITE_SERIALIZE_NOCOPY bit is omitted from argument F if a memory
 ** allocation error occurs.
@@ -10657,6 +10664,9 @@ SQLITE_API unsigned char *sqlite3_serialize(
 ** connection closes.  If the SQLITE_DESERIALIZE_RESIZEABLE bit is set, then
 ** SQLite will try to increase the buffer size using sqlite3_realloc64()
 ** if writes on the database cause it to grow larger than M bytes.
+**
+** Applications must not modify the buffer P or invalidate it before
+** the database connection D is closed.
 **
 ** The sqlite3_deserialize() interface will fail with SQLITE_BUSY if the
 ** database is currently in a read transaction or is involved in a backup
