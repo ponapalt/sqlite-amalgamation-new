@@ -473,7 +473,6 @@ static int stdin_is_interactive = 1;
   static int console_utf8 = sizeof(char*)/4 - 1;
 #else
 # define SHELL_WIN_UTF8_OPT 0
-  static const int console_utf8 = 0;
 #endif
 
 /*
@@ -5359,7 +5358,8 @@ static sqlite3_module seriesModule = {
   0,                         /* xSavepoint */
   0,                         /* xRelease */
   0,                         /* xRollbackTo */
-  0                          /* xShadowName */
+  0,                         /* xShadowName */
+  0                          /* xIntegrity */
 };
 
 #endif /* SQLITE_OMIT_VIRTUALTABLE */
@@ -7257,6 +7257,7 @@ static int fsdirRegister(sqlite3 *db){
     0,                         /* xRelease */
     0,                         /* xRollbackTo */
     0,                         /* xShadowName */
+    0                          /* xIntegrity */
   };
 
   int rc = sqlite3_create_module(db, "fsdir", &fsdirModule, 0);
@@ -7777,7 +7778,8 @@ static sqlite3_module completionModule = {
   0,                         /* xSavepoint */
   0,                         /* xRelease */
   0,                         /* xRollbackTo */
-  0                          /* xShadowName */
+  0,                         /* xShadowName */
+  0                          /* xIntegrity */
 };
 
 #endif /* SQLITE_OMIT_VIRTUALTABLE */
@@ -10688,7 +10690,8 @@ static int zipfileRegister(sqlite3 *db){
     0,                         /* xSavepoint */
     0,                         /* xRelease */
     0,                         /* xRollback */
-    0                          /* xShadowName */
+    0,                         /* xShadowName */
+    0                          /* xIntegrity */
   };
 
   int rc = sqlite3_create_module(db, "zipfile"  , &zipfileModule, 0);
@@ -11687,6 +11690,7 @@ static int idxRegisterVtab(sqlite3expert *p){
     0,                            /* xRelease */
     0,                            /* xRollbackTo */
     0,                            /* xShadowName */
+    0,                            /* xIntegrity */
   };
 
   return sqlite3_create_module(p->dbv, "expert", &expertModule, (void*)p);
@@ -14269,7 +14273,8 @@ static int sqlite3DbdataRegister(sqlite3 *db){
     0,                            /* xSavepoint */
     0,                            /* xRelease */
     0,                            /* xRollbackTo */
-    0                             /* xShadowName */
+    0,                            /* xShadowName */
+    0                             /* xIntegrity */
   };
 
   int rc = sqlite3_create_module(db, "sqlite_dbdata", &dbdata_module, 0);
