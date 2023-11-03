@@ -146,9 +146,9 @@ extern "C" {
 ** [sqlite3_libversion_number()], [sqlite3_sourceid()],
 ** [sqlite_version()] and [sqlite_source_id()].
 */
-#define SQLITE_VERSION        "3.44.0"
-#define SQLITE_VERSION_NUMBER 3044000
-#define SQLITE_SOURCE_ID      "2023-10-27 17:40:46 27fc14303a0c6942e8cf5017d66c7ff5fcbc700a6109a93768263370f608397e"
+#define SQLITE_VERSION        "3.45.0"
+#define SQLITE_VERSION_NUMBER 3045000
+#define SQLITE_SOURCE_ID      "2023-11-03 17:20:20 8f5e9c192ff2820d8cfb076ab28f30697d10c22710583d6c7fd7019c4a0ea795"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -3955,6 +3955,7 @@ SQLITE_API void sqlite3_free_filename(sqlite3_filename);
 **
 ** ^The sqlite3_errmsg() and sqlite3_errmsg16() return English-language
 ** text that describes the error, as either UTF-8 or UTF-16 respectively.
+** (See how SQLite handles [invalid UTF] for exceptions to this rule.)
 ** ^(Memory to hold the error message string is managed internally.
 ** The application does not need to worry about freeing the result.
 ** However, the error string might be overwritten or deallocated by
@@ -6624,7 +6625,7 @@ SQLITE_API int sqlite3_db_readonly(sqlite3 *db, const char *zDbName);
 SQLITE_API int sqlite3_txn_state(sqlite3*,const char *zSchema);
 
 /*
-** CAPI3REF: Allowed return values from [sqlite3_txn_state()]
+** CAPI3REF: Allowed return values from sqlite3_txn_state()
 ** KEYWORDS: {transaction state}
 **
 ** These constants define the current transaction state of a database file.
