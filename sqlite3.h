@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.45.0"
 #define SQLITE_VERSION_NUMBER 3045000
-#define SQLITE_SOURCE_ID      "2023-11-10 17:49:26 ac39800bb2685fa287c7d834faed75f0bc61320ef986de314392d6eadb574d30"
+#define SQLITE_SOURCE_ID      "2023-11-17 17:55:03 8fa3915dbfdd9a5b0fcf4d695590b3de7e7d19d2917924186ca889cd60bf0eb9"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -3954,15 +3954,17 @@ SQLITE_API void sqlite3_free_filename(sqlite3_filename);
 ** </ul>
 **
 ** ^The sqlite3_errmsg() and sqlite3_errmsg16() return English-language
-** text that describes the error, as either UTF-8 or UTF-16 respectively.
+** text that describes the error, as either UTF-8 or UTF-16 respectively,
+** or NULL if no error message is available.
 ** (See how SQLite handles [invalid UTF] for exceptions to this rule.)
 ** ^(Memory to hold the error message string is managed internally.
 ** The application does not need to worry about freeing the result.
 ** However, the error string might be overwritten or deallocated by
 ** subsequent calls to other SQLite interface functions.)^
 **
-** ^The sqlite3_errstr() interface returns the English-language text
-** that describes the [result code], as UTF-8.
+** ^The sqlite3_errstr(E) interface returns the English-language text
+** that describes the [result code] E, as UTF-8, or NULL if E is not an
+** result code for which a text error message is available.
 ** ^(Memory to hold the error message string is managed internally
 ** and must not be freed by the application)^.
 **
