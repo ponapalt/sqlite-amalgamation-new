@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.45.0"
 #define SQLITE_VERSION_NUMBER 3045000
-#define SQLITE_SOURCE_ID      "2023-12-08 16:56:50 1503cba6d17e9bade7a5c103ddd23241ff4741f9a2e3032ffe2987af243dae65"
+#define SQLITE_SOURCE_ID      "2023-12-15 16:28:02 23b92d915c12ee768857e2c3c961832f390cad9b53b8bcfc2b97664baab25bb7"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -8039,9 +8039,11 @@ SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs*);
 **
 ** ^(Some systems (for example, Windows 95) do not support the operation
 ** implemented by sqlite3_mutex_try().  On those systems, sqlite3_mutex_try()
-** will always return SQLITE_BUSY. The SQLite core only ever uses
-** sqlite3_mutex_try() as an optimization so this is acceptable
-** behavior.)^
+** will always return SQLITE_BUSY. In most cases the SQLite core only uses
+** sqlite3_mutex_try() as an optimization, so this is acceptable
+** behavior. The exceptions are unix builds that set the
+** SQLITE_ENABLE_SETLK_TIMEOUT build option. In that case a working
+** sqlite3_mutex_try() is required.)^
 **
 ** ^The sqlite3_mutex_leave() routine exits a mutex that was
 ** previously entered by the same thread.   The behavior
@@ -8300,6 +8302,7 @@ SQLITE_API int sqlite3_test_control(int op, ...);
 #define SQLITE_TESTCTRL_ASSERT                  12
 #define SQLITE_TESTCTRL_ALWAYS                  13
 #define SQLITE_TESTCTRL_RESERVE                 14  /* NOT USED */
+#define SQLITE_TESTCTRL_JSON_SELFCHECK          14
 #define SQLITE_TESTCTRL_OPTIMIZATIONS           15
 #define SQLITE_TESTCTRL_ISKEYWORD               16  /* NOT USED */
 #define SQLITE_TESTCTRL_SCRATCHMALLOC           17  /* NOT USED */
