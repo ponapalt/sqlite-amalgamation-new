@@ -1261,6 +1261,9 @@ SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn){
  *   setOutputStream(FILE *pf)
  * This is normally the stream that CLI normal output goes to.
  * For the stand-alone CLI, it is stdout with no .output redirect.
+ *
+ * The ?putz(z) forms are required for the Fiddle builds for string literal
+ * output, in aid of enforcing format string to argument correspondence.
  */
 # define sputz(s,z) fPutsUtf8(z,s)
 # define sputf fPrintfUtf8
@@ -1272,12 +1275,18 @@ SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn){
 
 #else
 /* For Fiddle, all console handling and emit redirection is omitted. */
-# define sputz(fp,z) fputs(z,fp)
-# define sputf fprintf
-# define oputz(z) fputs(z,stdout)
-# define oputf printf
-# define eputz(z) fputs(z,stderr)
+/* These next 3 macros are for emitting formatted output. When complaints
+ * from the WASM build are issued for non-formatted output, (when a mere
+ * string literal is to be emitted, the ?putz(z) forms should be used.
+ * (This permits compile-time checking of format string / argument mismatch.)
+ */
+# define oputf(fmt, ...) printf(fmt,__VA_ARGS__)
 # define eputf(fmt, ...) fprintf(stderr,fmt,__VA_ARGS__)
+# define sputf(fp,fmt, ...) fprintf(fp,fmt,__VA_ARGS__)
+/* These next 3 macros are for emitting simple string literals. */
+# define oputz(z) fputs(z,stdout)
+# define eputz(z) fputs(z,stderr)
+# define sputz(fp,z) fputs(z,fp)
 # define oputb(buf,na) fwrite(buf,1,na,stdout)
 #endif
 
@@ -27949,7 +27958,7 @@ static int do_meta_command(char *zLine, ShellState *p){
             }
           }
           if( bShowHelp ){
-            oputf(
+            oputz(
                "Usage: .testctrl fault_install ARGS\n"
                "Possible arguments:\n"
                "   off               Disable faultsim\n"
