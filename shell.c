@@ -14609,7 +14609,7 @@ static const char *intckParseCreateIndex(const char *z, int iCol, int *pnByte){
     int n = intckGetToken(&z[iOff]);
     if( n==5 && 0==sqlite3_strnicmp(&z[iOff], "where", 5) ){
       zRet = &z[iOff+5];
-      nRet = strlen(zRet);
+      nRet = (int)strlen(zRet);
     }
     iOff += n;
   }
@@ -14972,7 +14972,7 @@ int sqlite3_intck_open(
   sqlite3_intck *pNew = 0;
   int rc = SQLITE_OK;
   const char *zDb = zDbArg ? zDbArg : "main";
-  int nDb = strlen(zDb);
+  int nDb = (int)strlen(zDb);
 
   pNew = (sqlite3_intck*)sqlite3_malloc(sizeof(*pNew) + nDb + 1);
   if( pNew==0 ){
@@ -15125,7 +15125,6 @@ const char *sqlite3_intck_test_sql(sqlite3_intck *p, const char *zObj){
   }
   return p->zTestSql;
 }
-
 
 /************************* End ../ext/intck/sqlite3intck.c ********************/
 
@@ -21762,6 +21761,7 @@ static void exec_prepared_stmt_columnar(
   rc = sqlite3_step(pStmt);
   if( rc!=SQLITE_ROW ) return;
   nColumn = sqlite3_column_count(pStmt);
+  if( nColumn==0 ) goto columnar_end;
   nAlloc = nColumn*4;
   if( nAlloc<=0 ) nAlloc = 1;
   azData = sqlite3_malloc64( nAlloc*sizeof(char*) );
@@ -21847,7 +21847,6 @@ static void exec_prepared_stmt_columnar(
     if( n>p->actualWidth[j] ) p->actualWidth[j] = n;
   }
   if( seenInterrupt ) goto columnar_end;
-  if( nColumn==0 ) goto columnar_end;
   switch( p->cMode ){
     case MODE_Column: {
       colSep = "  ";
@@ -30824,7 +30823,7 @@ sqlite3_vfs * fiddle_db_vfs(const char *zDbName){
 
 /* Only for emcc experimentation purposes. */
 sqlite3 * fiddle_db_arg(sqlite3 *arg){
-    printf("fiddle_db_arg(%p)\n", (const void*)arg);
+    oputf("fiddle_db_arg(%p)\n", (const void*)arg);
     return arg;
 }
 
@@ -30850,12 +30849,22 @@ const char * fiddle_db_filename(const char * zDbName){
 
 /*
 ** Completely wipes out the contents of the currently-opened database
-** but leaves its storage intact for reuse.
+** but leaves its storage intact for reuse. If any transactions are
+** active, they are forcibly rolled back.
 */
 void fiddle_reset_db(void){
   if( globalDb ){
-    int rc = sqlite3_db_config(globalDb, SQLITE_DBCONFIG_RESET_DATABASE, 1, 0);
-    if( 0==rc ) rc = sqlite3_exec(globalDb, "VACUUM", 0, 0, 0);
+    int rc;
+    while( sqlite3_txn_state(globalDb,0)>0 ){
+      /*
+      ** Resolve problem reported in
+      ** https://sqlite.org/forum/forumpost/0b41a25d65
+      */
+      oputz("Rolling back in-progress transaction.\n");
+      sqlite3_exec(globalDb,"ROLLBACK", 0, 0, 0);
+    }
+    rc = sqlite3_db_config(globalDb, SQLITE_DBCONFIG_RESET_DATABASE, 1, 0);
+    if( 0==rc ) sqlite3_exec(globalDb, "VACUUM", 0, 0, 0);
     sqlite3_db_config(globalDb, SQLITE_DBCONFIG_RESET_DATABASE, 0, 0);
   }
 }
