@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.46.0"
 #define SQLITE_VERSION_NUMBER 3046000
-#define SQLITE_SOURCE_ID      "2024-03-28 10:58:18 3d4b1f0791384d3e531d6757daecf67e5b873954de61f37032474e3ae23cd22b"
+#define SQLITE_SOURCE_ID      "2024-04-05 13:56:05 4484ec6d26b31305e31de89bdbae26344d8083a7e7de20861430d31737d9979c"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -8363,7 +8363,7 @@ SQLITE_API int sqlite3_test_control(int op, ...);
 ** The sqlite3_keyword_count() interface returns the number of distinct
 ** keywords understood by SQLite.
 **
-** The sqlite3_keyword_name(N,Z,L) interface finds the N-th keyword and
+** The sqlite3_keyword_name(N,Z,L) interface finds the 0-based N-th keyword and
 ** makes *Z point to that keyword expressed as UTF8 and writes the number
 ** of bytes in the keyword into *L.  The string that *Z points to is not
 ** zero-terminated.  The sqlite3_keyword_name(N,Z,L) routine returns
