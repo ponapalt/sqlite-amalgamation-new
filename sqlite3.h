@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.47.0"
 #define SQLITE_VERSION_NUMBER 3047000
-#define SQLITE_SOURCE_ID      "2024-05-31 15:39:00 a07ec16bbc056fbc23a7bd58e5e32ef691c13e9babeb542918cf9a01cac40c20"
+#define SQLITE_SOURCE_ID      "2024-06-06 23:56:36 c4a9dda2809c6e0e3d928e11e5553ead82cd9df551bcd35b11a7d869ef80ab8e"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -10832,8 +10832,6 @@ SQLITE_API int sqlite3_deserialize(
 #if defined(__wasi__)
 # undef SQLITE_WASI
 # define SQLITE_WASI 1
-# undef SQLITE_OMIT_WAL
-# define SQLITE_OMIT_WAL 1/* because it requires shared memory APIs */
 # ifndef SQLITE_OMIT_LOAD_EXTENSION
 #  define SQLITE_OMIT_LOAD_EXTENSION
 # endif
