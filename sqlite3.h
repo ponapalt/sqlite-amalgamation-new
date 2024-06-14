@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.47.0"
 #define SQLITE_VERSION_NUMBER 3047000
-#define SQLITE_SOURCE_ID      "2024-06-06 23:56:36 c4a9dda2809c6e0e3d928e11e5553ead82cd9df551bcd35b11a7d869ef80ab8e"
+#define SQLITE_SOURCE_ID      "2024-06-12 22:15:25 5bd9fd5f61e7cd1ed3b44c5cabc759c154c98eb40ad10d29e61f142aaa062ddf"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -772,8 +772,8 @@ struct sqlite3_file {
 ** to xUnlock() is a no-op.
 ** The xCheckReservedLock() method checks whether any database connection,
 ** either in this process or in some other process, is holding a RESERVED,
-** PENDING, or EXCLUSIVE lock on the file.  It returns true
-** if such a lock exists and false otherwise.
+** PENDING, or EXCLUSIVE lock on the file.  It returns, via its output
+** pointer parameter, true if such a lock exists and false otherwise.
 **
 ** The xFileControl() method is a generic interface that allows custom
 ** VFS implementations to directly control an open file using the
