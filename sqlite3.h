@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.47.0"
 #define SQLITE_VERSION_NUMBER 3047000
-#define SQLITE_SOURCE_ID      "2024-08-23 15:18:02 396f720f36a937145ac727c2750acfd26e4eda350b46d648d82a7e9985545a9f"
+#define SQLITE_SOURCE_ID      "2024-08-30 16:51:41 e48add02695a41b26a04e7942b5333e2bf4dc5598e363367aea3a4690982667d"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -13180,9 +13180,9 @@ struct Fts5ExtensionApi {
   /* Below this point are iVersion>=4 only */
   int (*xColumnLocale)(Fts5Context*, int iCol, const char **pz, int *pn);
   int (*xTokenize_v2)(Fts5Context*,
-    const char *pText, int nText, /* Text to tokenize */
-    const char *pLoc, int nLoc,   /* Locale to pass to tokenizer */
-    void *pCtx,                   /* Context passed to xToken() */
+    const char *pText, int nText,      /* Text to tokenize */
+    const char *pLocale, int nLocale,  /* Locale to pass to tokenizer */
+    void *pCtx,                        /* Context passed to xToken() */
     int (*xToken)(void*, int, const char*, int, int, int)       /* Callback */
   );
 };
@@ -13294,18 +13294,19 @@ struct Fts5ExtensionApi {
 **
 ** FTS5_TOKENIZER
 **
-** There is also an fts5_tokenizer object. This is an older version of
-** fts5_tokenizer_v2. It is similar except that:
+** There is also an fts5_tokenizer object. This is an older, deprecated,
+** version of fts5_tokenizer_v2. It is similar except that:
 **
 **  <ul>
 **    <li> There is no "iVersion" field, and
 **    <li> The xTokenize() method does not take a locale argument.
 **  </ul>
 **
-** fts5_tokenizer tokenizers should be registered with the xCreateTokenizer()
-** function, instead of xCreateTokenizer_v2(). Tokenizers implementations
-** registered using either API may be retrieved using both xFindTokenizer()
-** and xFindTokenizer_v2().
+** Legacy fts5_tokenizer tokenizers must be registered using the
+** legacy xCreateTokenizer() function, instead of xCreateTokenizer_v2().
+**
+** Tokenizer implementations registered using either API may be retrieved
+** using both xFindTokenizer() and xFindTokenizer_v2().
 **
 ** SYNONYM SUPPORT
 **

@@ -264,6 +264,7 @@ extern LPWSTR sqlite3_win32_utf8_to_unicode(const char *zText);
 # define SQLITE_CIO_NO_CLASSIFY
 # define SQLITE_CIO_NO_TRANSLATE
 # define SQLITE_CIO_NO_SETMODE
+# define SQLITE_CIO_NO_FLUSH
 #endif
 /************************* Begin ../ext/consio/console_io.h ******************/
 /*
@@ -445,11 +446,18 @@ ePutbUtf8(const char *cBuf, int nAccept);
 #endif
 
 /*
+** Flush the given output stream. Return non-zero for success, else 0.
+*/
+#if !defined(SQLITE_CIO_NO_FLUSH) && !defined(SQLITE_CIO_NO_SETMODE)
+SQLITE_INTERNAL_LINKAGE int
+fFlushBuffer(FILE *pfOut);
+#endif
+
+/*
 ** Collect input like fgets(...) with special provisions for input
-** from the console on platforms that require same. Defers to the
-** C library fgets() when input is not from the console. Newline
-** translation may be done as set by set{Binary,Text}Mode(). As a
-** convenience, pfIn==NULL is treated as stdin.
+** from the console on such platforms as require same. Newline
+** translation may be done as set by set{Binary,Text}Mode().
+** As a convenience, pfIn==NULL is treated as stdin.
 */
 SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn);
 /* Like fGetsUtf8 except stream is always the designated input. */
@@ -1146,6 +1154,86 @@ oPutbUtf8(const char *cBuf, int nAccept){
 # endif
 }
 
+/*
+** Flush the given output stream. Return non-zero for success, else 0.
+*/
+#if !defined(SQLITE_CIO_NO_FLUSH) && !defined(SQLITE_CIO_NO_SETMODE)
+SQLITE_INTERNAL_LINKAGE int
+fFlushBuffer(FILE *pfOut){
+# if CIO_WIN_WC_XLATE && !defined(SHELL_OMIT_FIO_DUPE)
+  return FlushFileBuffers(handleOfFile(pfOut))? 1 : 0;
+# else
+  return fflush(pfOut);
+# endif
+}
+#endif
+
+#if CIO_WIN_WC_XLATE \
+   && !defined(SHELL_OMIT_FIO_DUPE) \
+   && defined(SQLITE_USE_ONLY_WIN32)
+static struct FileAltIds {
+  int fd;
+  HANDLE fh;
+} altIdsOfFile(FILE *pf){
+  struct FileAltIds rv = { _fileno(pf) };
+  union { intptr_t osfh; HANDLE fh; } fid = {
+    (rv.fd>=0)? _get_osfhandle(rv.fd) : (intptr_t)INVALID_HANDLE_VALUE
+  };
+  rv.fh = fid.fh;
+  return rv;
+}
+
+SQLITE_INTERNAL_LINKAGE size_t
+cfWrite(const void *buf, size_t osz, size_t ocnt, FILE *pf){
+  size_t rv = 0;
+  struct FileAltIds fai = altIdsOfFile(pf);
+  int fmode = _setmode(fai.fd, _O_BINARY);
+  _setmode(fai.fd, fmode);
+  while( rv < ocnt ){
+    size_t nbo = osz;
+    while( nbo > 0 ){
+      DWORD dwno = (nbo>(1L<<24))? 1L<<24 : (DWORD)nbo;
+      BOOL wrc = TRUE;
+      BOOL genCR = (fmode & _O_TEXT)!=0;
+      if( genCR ){
+        const char *pnl = (const char*)memchr(buf, '\n', nbo);
+        if( pnl ) nbo = pnl - (const char*)buf;
+        else genCR = 0;
+      }
+      if( dwno>0 ) wrc = WriteFile(fai.fh, buf, dwno, 0,0);
+      if( genCR && wrc ){
+        wrc = WriteFile(fai.fh, "\r\n", 2, 0,0);
+        ++dwno; /* Skip over the LF */
+      }
+      if( !wrc ) return rv;
+      buf = (const char*)buf + dwno;
+      nbo += dwno;
+    }
+    ++rv;
+  }
+  return rv;
+}
+
+SQLITE_INTERNAL_LINKAGE char *
+cfGets(char *cBuf, int n, FILE *pf){
+  int nci = 0;
+  struct FileAltIds fai = altIdsOfFile(pf);
+  int fmode = _setmode(fai.fd, _O_BINARY);
+  BOOL eatCR = (fmode & _O_TEXT)!=0;
+  _setmode(fai.fd, fmode);
+  while( nci < n-1 ){
+    DWORD nr;
+    if( !ReadFile(fai.fh, cBuf+nci, 1, &nr, 0) || nr==0 ) break;
+    if( nr>0 && (!eatCR || cBuf[nci]!='\r') ) nci += nr;
+  }
+  if( nci < n ) cBuf[nci] = 0;
+  return (nci>0)? cBuf : 0;
+}
+# else
+#  define cfWrite(b,os,no,f) fwrite(b,os,no,f)
+#  define cfGets(b,n,f) fgets(b,n,f)
+# endif
+
 # ifdef CONSIO_EPUTB
 SQLITE_INTERNAL_LINKAGE int
 ePutbUtf8(const char *cBuf, int nAccept){
@@ -1157,7 +1245,7 @@ ePutbUtf8(const char *cBuf, int nAccept){
     return conZstrEmit(ppst, cBuf, nAccept);
   }else {
 #  endif
-    return (int)fwrite(cBuf, 1, nAccept, pfErr);
+    return (int)cfWrite(cBuf, 1, nAccept, pfErr);
 #  if CIO_WIN_WC_XLATE
   }
 #  endif
@@ -1223,7 +1311,7 @@ SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn){
 #  endif
   }else{
 # endif
-    return fgets(cBuf, ncMax, pfIn);
+    return cfGets(cBuf, ncMax, pfIn);
 # if CIO_WIN_WC_XLATE
   }
 # endif
@@ -1267,11 +1355,12 @@ SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn){
 # define eputz(z) ePutsUtf8(z)
 # define eputf ePrintfUtf8
 # define oputb(buf,na) oPutbUtf8(buf,na)
+# define fflush(s) fFlushBuffer(s);
 
 #else
 /* For Fiddle, all console handling and emit redirection is omitted. */
 /* These next 3 macros are for emitting formatted output. When complaints
- * from the WASM build are issued for non-formatted output, (when a mere
+ * from the WASM build are issued for non-formatted output, when a mere
  * string literal is to be emitted, the ?putz(z) forms should be used.
  * (This permits compile-time checking of format string / argument mismatch.)
  */
@@ -1283,6 +1372,7 @@ SQLITE_INTERNAL_LINKAGE char* fGetsUtf8(char *cBuf, int ncMax, FILE *pfIn){
 # define eputz(z) fputs(z,stderr)
 # define sputz(fp,z) fputs(z,fp)
 # define oputb(buf,na) fwrite(buf,1,na,stdout)
+# undef fflush
 #endif
 
 /* True if the timer is enabled */
@@ -1523,6 +1613,14 @@ static char *shell_strncpy(char *dest, const char *src, size_t n){
 }
 
 /*
+** strcpy() workalike to squelch an unwarranted link-time warning
+** from OpenBSD.
+*/
+static void shell_strcpy(char *dest, const char *src){
+  while( (*(dest++) = *(src++))!=0 ){}
+}
+
+/*
 ** Optionally disable dynamic continuation prompt.
 ** Unless disabled, the continuation prompt shows open SQL lexemes if any,
 ** or open parentheses level if non-zero, or continuation prompt as set.
@@ -1587,7 +1685,7 @@ static char *dynamicContinuePrompt(void){
       size_t ncp = strlen(continuePrompt);
       size_t ndp = strlen(dynPrompt.zScannerAwaits);
       if( ndp > ncp-3 ) return continuePrompt;
-      strcpy(dynPrompt.dynamicPrompt, dynPrompt.zScannerAwaits);
+      shell_strcpy(dynPrompt.dynamicPrompt, dynPrompt.zScannerAwaits);
       while( ndp<3 ) dynPrompt.dynamicPrompt[ndp++] = ' ';
       shell_strncpy(dynPrompt.dynamicPrompt+3, continuePrompt+3,
               PROMPT_LEN_MAX-4);
@@ -22369,10 +22467,11 @@ static void bind_prepared_stmt(ShellState *pArg, sqlite3_stmt *pStmt){
     }else if( strncmp(zVar, "$int_", 5)==0 ){
       sqlite3_bind_int(pStmt, i, atoi(&zVar[5]));
     }else if( strncmp(zVar, "$text_", 6)==0 ){
-      char *zBuf = sqlite3_malloc64( strlen(zVar)-5 );
+      size_t szVar = strlen(zVar);
+      char *zBuf = sqlite3_malloc64( szVar-5 );
       if( zBuf ){
-        memcpy(zBuf, &zVar[6], strlen(zVar)-5);
-        sqlite3_bind_text64(pStmt, i, zBuf, -1, sqlite3_free, SQLITE_UTF8);
+        memcpy(zBuf, &zVar[6], szVar-5);
+        sqlite3_bind_text64(pStmt, i, zBuf, szVar-6, sqlite3_free, SQLITE_UTF8);
       }
     }else{
       sqlite3_bind_null(pStmt, i);
@@ -29865,7 +29964,7 @@ static int do_meta_command(char *zLine, ShellState *p){
           for(ii=2; ii<nArg; ii++){
             const char *z = azArg[ii];
             int useLabel = 0;
-            const char *zLabel;
+            const char *zLabel = 0;
             if( (z[0]=='+'|| z[0]=='-') && !IsDigit(z[1]) ){
               useLabel = z[0];
               zLabel = &z[1];
@@ -29882,11 +29981,11 @@ static int do_meta_command(char *zLine, ShellState *p){
               }
               if( jj>=ArraySize(aLabel) ){
                 eputf("Error: no such optimization: \"%s\"\n", zLabel);
-                eputf("Should be one of:");
+                eputz("Should be one of:");
                 for(jj=0; jj<ArraySize(aLabel); jj++){
                   eputf(" %s", aLabel[jj].zLabel);
                 }
-                eputf("\n");
+                eputz("\n");
                 rc = 1;
                 goto meta_command_exit;
               }
@@ -29903,9 +30002,9 @@ static int do_meta_command(char *zLine, ShellState *p){
             curOpt = ~newOpt;
           }
           if( newOpt==0 ){
-            oputf("+All\n");
+            oputz("+All\n");
           }else if( newOpt==0xffffffff ){
-            oputf("-All\n");
+            oputz("-All\n");
           }else{
             int jj;
             for(jj=0; jj<ArraySize(aLabel); jj++){
