@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.47.0"
 #define SQLITE_VERSION_NUMBER 3047000
-#define SQLITE_SOURCE_ID      "2024-08-30 16:51:41 e48add02695a41b26a04e7942b5333e2bf4dc5598e363367aea3a4690982667d"
+#define SQLITE_SOURCE_ID      "2024-09-06 15:01:00 d94541ae76b5d8b69f5524f10dcccc0814283f438a03f553848ed631a1983633"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -5615,6 +5615,15 @@ SQLITE_API int sqlite3_create_window_function(
 ** [sqlite3_result_subtype()] should avoid setting this property, as the
 ** purpose of this property is to disable certain optimizations that are
 ** incompatible with subtypes.
+**
+** [[SQLITE_SELFORDER1]] <dt>SQLITE_SELFORDER1</dt><dd>
+** The SQLITE_SELFORDER1 flag indicates that the function is an aggregate
+** that internally orders the values provided to the first argument.  The
+** ordered-set aggregate SQL notation with a single ORDER BY term can be
+** used to invoke this function.  If the ordered-set aggregate notation is
+** used on a function that lacks this flag, then an error is raised. Note
+** that the ordered-set aggregate syntax is only available if SQLite is
+** built using the -DSQLITE_ENABLE_ORDERED_SET_AGGREGATES compile-time option.
 ** </dd>
 ** </dl>
 */
@@ -5623,6 +5632,7 @@ SQLITE_API int sqlite3_create_window_function(
 #define SQLITE_SUBTYPE          0x000100000
 #define SQLITE_INNOCUOUS        0x000200000
 #define SQLITE_RESULT_SUBTYPE   0x001000000
+#define SQLITE_SELFORDER1       0x002000000
 
 /*
 ** CAPI3REF: Deprecated Functions
