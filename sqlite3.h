@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.47.0"
 #define SQLITE_VERSION_NUMBER 3047000
-#define SQLITE_SOURCE_ID      "2024-10-11 17:02:37 9b87ea219bce5689a69efac31063b9b11928e59124c0d36194715ff7faa5129d"
+#define SQLITE_SOURCE_ID      "2024-10-18 16:50:29 07843ac245661e8b8e086ad9d36c60bacf11784e9c56482593691fb97732f04f"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4232,7 +4232,7 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 ** is the number of bytes in the input string <i>including</i>
 ** the nul-terminator.
 ** Note that nByte measure the length of the input in bytes, not
-** characters, even for the UTF-16 inferfaces.
+** characters, even for the UTF-16 interfaces.
 **
 ** ^If pzTail is not NULL then *pzTail is made to point to the first byte
 ** past the end of the first SQL statement in zSql.  These routines only
@@ -9344,6 +9344,16 @@ typedef struct sqlite3_backup sqlite3_backup;
 ** APIs are not strictly speaking threadsafe. If they are invoked at the
 ** same time as another thread is invoking sqlite3_backup_step() it is
 ** possible that they return invalid values.
+**
+** <b>Alternatives To Using The Backup API</b>
+**
+** Other techniques for safely creating a consistent backup of an SQLite
+** database include:
+**
+** <ul>
+** <li> The [VACUUM INTO] command.
+** <li> The [sqlite3_rsync] utility program.
+** </ul>
 */
 SQLITE_API sqlite3_backup *sqlite3_backup_init(
   sqlite3 *pDest,                        /* Destination database handle */
@@ -13219,7 +13229,6 @@ struct Fts5ExtensionApi {
 ** Applications may also register custom tokenizer types. A tokenizer
 ** is registered by providing fts5 with a populated instance of the
 ** following structure. All structure methods must be defined, setting
-**
 ** any member of the fts5_tokenizer struct to NULL leads to undefined
 ** behaviour. The structure methods are expected to function as follows:
 **
