@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.48.0"
 #define SQLITE_VERSION_NUMBER 3048000
-#define SQLITE_SOURCE_ID      "2024-10-25 15:28:00 c4da7fa279274e5a6fe214b5c22f17bcf9b40299aeeab5bfbdae2ba0b2de6af0"
+#define SQLITE_SOURCE_ID      "2024-11-01 01:56:27 2dcc465a7090811ddbc210673f37b4c3a4439c501874abefd403efe1e98f5b17"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -10889,7 +10889,7 @@ SQLITE_API int sqlite3_deserialize(
 #ifdef __cplusplus
 }  /* End of the 'extern "C"' block */
 #endif
-#endif /* SQLITE3_H */
+/* #endif for SQLITE3_H will be added by mksqlite3.tcl */
 
 /******** Begin file sqlite3rtree.h *********/
 /*
@@ -13581,3 +13581,4 @@ struct fts5_api {
 #endif /* _FTS5_H */
 
 /******** End of fts5.h *********/
+#endif /* SQLITE3_H */
