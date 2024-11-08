@@ -407,8 +407,8 @@ FILE *sqlite3_fopen(const char *zFilename, const char *zMode){
 
   sz1 = (int)strlen(zFilename);
   sz2 = (int)strlen(zMode);
-  b1 = malloc( (sz1+1)*sizeof(b1[0]) );
-  b2 = malloc( (sz2+1)*sizeof(b1[0]) );
+  b1 = sqlite3_malloc( (sz1+1)*sizeof(b1[0]) );
+  b2 = sqlite3_malloc( (sz2+1)*sizeof(b1[0]) );
   if( b1 && b2 ){
     sz1 = MultiByteToWideChar(CP_UTF8, 0, zFilename, sz1, b1, sz1);
     b1[sz1] = 0;
@@ -416,8 +416,8 @@ FILE *sqlite3_fopen(const char *zFilename, const char *zMode){
     b2[sz2] = 0;
     fp = _wfopen(b1, b2);
   }
-  free(b1);
-  free(b2);
+  sqlite3_free(b1);
+  sqlite3_free(b2);
   simBinaryOther = 0;
   return fp;
 }
@@ -433,8 +433,8 @@ FILE *sqlite3_popen(const char *zCommand, const char *zMode){
 
   sz1 = (int)strlen(zCommand);
   sz2 = (int)strlen(zMode);
-  b1 = malloc( (sz1+1)*sizeof(b1[0]) );
-  b2 = malloc( (sz2+1)*sizeof(b1[0]) );
+  b1 = sqlite3_malloc( (sz1+1)*sizeof(b1[0]) );
+  b2 = sqlite3_malloc( (sz2+1)*sizeof(b1[0]) );
   if( b1 && b2 ){
     sz1 = MultiByteToWideChar(CP_UTF8, 0, zCommand, sz1, b1, sz1);
     b1[sz1] = 0;
@@ -442,8 +442,8 @@ FILE *sqlite3_popen(const char *zCommand, const char *zMode){
     b2[sz2] = 0;
     fp = _wpopen(b1, b2);
   }
-  free(b1);
-  free(b2);
+  sqlite3_free(b1);
+  sqlite3_free(b2);
   return fp;
 }
 
@@ -457,7 +457,7 @@ char *sqlite3_fgets(char *buf, int sz, FILE *in){
     ** that into UTF-8.  Otherwise, non-ASCII characters all get translated
     ** into '?'.
     */
-    wchar_t *b1 = malloc( sz*sizeof(wchar_t) );
+    wchar_t *b1 = sqlite3_malloc( sz*sizeof(wchar_t) );
     if( b1==0 ) return 0;
     _setmode(_fileno(in), IsConsole(in) ? _O_WTEXT : _O_U8TEXT);
     if( fgetws(b1, sz/4, in)==0 ){
@@ -523,7 +523,7 @@ int sqlite3_fputs(const char *z, FILE *out){
     ** use O_U8TEXT for everything in text mode.
     */
     int sz = (int)strlen(z);
-    wchar_t *b1 = malloc( (sz+1)*sizeof(wchar_t) );
+    wchar_t *b1 = sqlite3_malloc( (sz+1)*sizeof(wchar_t) );
     if( b1==0 ) return 0;
     sz = MultiByteToWideChar(CP_UTF8, 0, z, sz, b1, sz);
     b1[sz] = 0;
@@ -5069,10 +5069,10 @@ int sqlite3_percentile_init(
 ){
   int rc = SQLITE_OK;
   unsigned int i;
-#if defined(SQLITE3_H) || defined(SQLITE_STATIC_PERCENTILE)
-  (void)pApi;      /* Unused parameter */
-#else
+#ifdef SQLITE3EXT_H
   SQLITE_EXTENSION_INIT2(pApi);
+#else
+  (void)pApi;      /* Unused parameter */
 #endif
   (void)pzErrMsg;  /* Unused parameter */
   for(i=0; i<sizeof(aPercentFunc)/sizeof(aPercentFunc[0]); i++){
@@ -6830,7 +6830,7 @@ static int seriesBestIndex(
       continue;
     }
     if( pConstraint->iColumn<SERIES_COLUMN_START ){
-      if( pConstraint->iColumn==SERIES_COLUMN_VALUE ){
+      if( pConstraint->iColumn==SERIES_COLUMN_VALUE && pConstraint->usable ){
         switch( op ){
           case SQLITE_INDEX_CONSTRAINT_EQ:
           case SQLITE_INDEX_CONSTRAINT_IS: {
@@ -21940,8 +21940,8 @@ const char *zSkipValidUtf8(const char *z, int nAccept, long ccm){
   const char *pcLimit = (nAccept>=0)? z+nAccept : 0;
   assert(z!=0);
   while( (pcLimit)? (z<pcLimit) : (ng-- != 0) ){
-    char c = *z;
-    if( (c & 0x80) == 0 ){
+    unsigned char c = *(u8*)z;
+    if( c<0x7f ){
       if( ccm != 0L && c < 0x20 && ((1L<<c) & ccm) != 0 ) return z;
       ++z; /* ASCII */
     }else if( (c & 0xC0) != 0xC0 ) return z; /* not a lead byte */
@@ -22009,10 +22009,10 @@ static void output_c_string(FILE *out, const char *z){
 }
 
 /*
-** Output the given string as a quoted according to JSON quoting rules.
+** Output the given string as quoted according to JSON quoting rules.
 */
 static void output_json_string(FILE *out, const char *z, i64 n){
-  char c;
+  unsigned char c;
   static const char *zq = "\"";
   static long ctrlMask = ~0L;
   static const char *zDQBS = "\"\\";
@@ -22032,7 +22032,7 @@ static void output_json_string(FILE *out, const char *z, i64 n){
       z = pcEnd;
     }
     if( z >= pcLimit ) break;
-    c = *(z++);
+    c = (unsigned char)*(z++);
     switch( c ){
     case '"': case '\\':
       cbsSay = (char)c;
@@ -22047,8 +22047,8 @@ static void output_json_string(FILE *out, const char *z, i64 n){
     if( cbsSay ){
       ace[1] = cbsSay;
       sqlite3_fputs(ace, out);
-    }else if( c<=0x1f ){
-      sqlite3_fprintf(out, "u%04x", c);
+    }else if( c<=0x1f || c>=0x7f ){
+      sqlite3_fprintf(out, "\\u%04x", c);
     }else{
       ace[1] = (char)c;
       sqlite3_fputs(ace+1, out);
