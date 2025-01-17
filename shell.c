@@ -462,7 +462,7 @@ char *sqlite3_fgets(char *buf, int sz, FILE *in){
 #ifndef SQLITE_USE_STDIO_FOR_CONSOLE
     DWORD nRead = 0;
     if( IsConsole(in)
-     && ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), b1, sz, &nRead, 0)
+     && ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), b1, sz-1, &nRead, 0)
     ){
       b1[nRead] = 0;
     }else
@@ -5291,15 +5291,15 @@ static u8* fromBase64( char *pIn, int ncIn, u8 *pOut ){
       case ND:
         /*  Treat dark non-digits as pad, but they terminate decode too. */
         ncIn = 0;
-        deliberate_fall_through;
+        deliberate_fall_through; /* FALLTHRU */
       case WS:
         /* Treat whitespace as pad and terminate this group.*/
         nti = nac;
-        deliberate_fall_through;
+        deliberate_fall_through; /* FALLTHRU */
       case PC:
         bdp = 0;
         --nbo;
-        deliberate_fall_through;
+        deliberate_fall_through; /* FALLTHRU */
       default: /* bdp is the digit value. */
         qv = qv<<6 | bdp;
         break;
@@ -5308,10 +5308,13 @@ static u8* fromBase64( char *pIn, int ncIn, u8 *pOut ){
     switch( nbo ){
     case 3:
       pOut[2] = (qv) & 0xff;
+      deliberate_fall_through; /* FALLTHRU */
     case 2:
       pOut[1] = (qv>>8) & 0xff;
+      deliberate_fall_through; /* FALLTHRU */
     case 1:
       pOut[0] = (qv>>16) & 0xff;
+      break;
     }
     pOut += nbo;
   }
@@ -5646,12 +5649,16 @@ static u8* fromBase85( char *pIn, int ncIn, u8 *pOut ){
     switch( nbo ){
     case 4:
       *pOut++ = (qv >> 24)&0xff;
+      /* FALLTHRU */
     case 3:
       *pOut++ = (qv >> 16)&0xff;
+      /* FALLTHRU */
     case 2:
       *pOut++ = (qv >> 8)&0xff;
+      /* FALLTHRU */
     case 1:
       *pOut++ = qv&0xff;
+      /* FALLTHRU */
     case 0:
       break;
     }
@@ -7694,7 +7701,8 @@ static const char *re_subcompile_string(ReCompiled *p){
 ** regular expression.  Applications should invoke this routine once
 ** for every call to re_compile() to avoid memory leaks.
 */
-static void re_free(ReCompiled *pRe){
+static void re_free(void *p){
+  ReCompiled *pRe = (ReCompiled*)p;
   if( pRe ){
     sqlite3_free(pRe->aOp);
     sqlite3_free(pRe->aArg);
@@ -27489,7 +27497,7 @@ static int arProcessSwitch(ArCommand *pAr, int eSwitch, const char *zArg){
       break;
     case AR_SWITCH_APPEND:
       pAr->bAppend = 1;
-      deliberate_fall_through;
+      deliberate_fall_through; /* FALLTHRU */
     case AR_SWITCH_FILE:
       pAr->zFile = zArg;
       break;
@@ -30231,6 +30239,7 @@ static int do_meta_command(char *zLine, ShellState *p){
     if( zFile==0 ){
       zFile = sqlite3_mprintf("stdout");
     }
+    shell_check_oom(zFile);
     if( bOnce ){
       p->outCount = 2;
     }else{
@@ -30273,6 +30282,7 @@ static int do_meta_command(char *zLine, ShellState *p){
 #else
       FILE *pfPipe = sqlite3_popen(zFile + 1, "w");
       if( pfPipe==0 ){
+        assert( stderr!=NULL );
         sqlite3_fprintf(stderr,"Error: cannot open pipe \"%s\"\n", zFile + 1);
         rc = 1;
       }else{
@@ -30285,7 +30295,8 @@ static int do_meta_command(char *zLine, ShellState *p){
       FILE *pfFile = output_file_open(zFile);
       if( pfFile==0 ){
         if( cli_strcmp(zFile,"off")!=0 ){
-          sqlite3_fprintf(stderr,"Error: cannot write to \"%s\"\n", zFile);
+         assert( stderr!=NULL );
+         sqlite3_fprintf(stderr,"Error: cannot write to \"%s\"\n", zFile);
         }
         rc = 1;
       } else {
@@ -32178,7 +32189,7 @@ static QuickScanState quickscan(char *zLine, QuickScanState qss,
         break;
       case '[':
         cin = ']';
-        deliberate_fall_through;
+        deliberate_fall_through; /* FALLTHRU */
       case '`': case '\'': case '"':
         cWait = cin;
         qss = QSS_HasDark | cWait;
@@ -32213,7 +32224,7 @@ static QuickScanState quickscan(char *zLine, QuickScanState qss,
             ++zLine;
             continue;
           }
-          deliberate_fall_through;
+          deliberate_fall_through; /* FALLTHRU */
         case ']':
           CONTINUE_PROMPT_AWAITC(pst, 0);
           qss = QSS_SETV(qss, 0);
