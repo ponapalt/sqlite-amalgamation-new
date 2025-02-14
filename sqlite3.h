@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.50.0"
 #define SQLITE_VERSION_NUMBER 3050000
-#define SQLITE_SOURCE_ID      "2025-02-07 15:49:21 45e462c0060e51c3375a226d636148e3415ee6020e544ecc84861c7aef4ecf7b"
+#define SQLITE_SOURCE_ID      "2025-02-14 16:42:37 ff508926651d632d86081ccde89d3367c89538dde469e9e925540d634ac8a416"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -12010,19 +12010,6 @@ SQLITE_API int sqlite3changeset_concat(
   int *pnOut,                     /* OUT: Number of bytes in output changeset */
   void **ppOut                    /* OUT: Buffer containing output changeset */
 );
-
-
-/*
-** CAPI3REF: Upgrade the Schema of a Changeset/Patchset
-*/
-SQLITE_API int sqlite3changeset_upgrade(
-  sqlite3 *db,
-  const char *zDb,
-  int nIn, const void *pIn,       /* Input changeset */
-  int *pnOut, void **ppOut        /* OUT: Inverse of input */
-);
-
-
 
 /*
 ** CAPI3REF: Changegroup Handle
