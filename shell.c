@@ -3756,6 +3756,9 @@ SQLITE_EXTENSION_INIT1
 # define UNUSED_PARAMETER(X)  (void)(X)
 #endif
 
+#ifndef IsSpace
+#define IsSpace(X)  isspace((unsigned char)X)
+#endif
 
 /* A decimal object */
 typedef struct Decimal Decimal;
@@ -3805,7 +3808,7 @@ static Decimal *decimalNewFromText(const char *zIn, int n){
   p->nFrac = 0;
   p->a = sqlite3_malloc64( n+1 );
   if( p->a==0 ) goto new_from_text_failed;
-  for(i=0; isspace(zIn[i]); i++){}
+  for(i=0; IsSpace(zIn[i]); i++){}
   if( zIn[i]=='-' ){
     p->sign = 1;
     i++;
@@ -9029,6 +9032,11 @@ SQLITE_EXTENSION_INIT1
 
 #ifndef SQLITE_OMIT_VIRTUALTABLE
 
+#ifndef IsAlnum
+#define IsAlnum(X)  isalnum((unsigned char)X)
+#endif
+
+
 /* completion_vtab is a subclass of sqlite3_vtab which will
 ** serve as the underlying representation of a completion virtual table
 */
@@ -9365,7 +9373,7 @@ static int completionFilter(
   }
   if( pCur->zLine!=0 && pCur->zPrefix==0 ){
     int i = pCur->nLine;
-    while( i>0 && (isalnum(pCur->zLine[i-1]) || pCur->zLine[i-1]=='_') ){
+    while( i>0 && (IsAlnum(pCur->zLine[i-1]) || pCur->zLine[i-1]=='_') ){
       i--;
     }
     pCur->nPrefix = pCur->nLine - i;
@@ -21245,37 +21253,53 @@ static void recoverUninstallWrapper(sqlite3_recover *p){
 static void recoverStep(sqlite3_recover *p){
   assert( p && p->errCode==SQLITE_OK );
   switch( p->eState ){
-    case RECOVER_STATE_INIT:
+    case RECOVER_STATE_INIT: {
+      int bUseWrapper = 1;
       /* This is the very first call to sqlite3_recover_step() on this object.
       */
       recoverSqlCallback(p, "BEGIN");
       recoverSqlCallback(p, "PRAGMA writable_schema = on");
+      recoverSqlCallback(p, "PRAGMA foreign_keys = off");
 
       recoverEnterMutex();
-      recoverInstallWrapper(p);
 
       /* Open the output database. And register required virtual tables and 
       ** user functions with the new handle. */
       recoverOpenOutput(p);
 
-      /* Open transactions on both the input and output databases. */
-      sqlite3_file_control(p->dbIn, p->zDb, SQLITE_FCNTL_RESET_CACHE, 0);
-      recoverExec(p, p->dbIn, "PRAGMA writable_schema = on");
-      recoverExec(p, p->dbIn, "BEGIN");
-      if( p->errCode==SQLITE_OK ) p->bCloseTransaction = 1;
-      recoverExec(p, p->dbIn, "SELECT 1 FROM sqlite_schema");
-      recoverTransferSettings(p);
-      recoverOpenRecovery(p);
-      recoverCacheSchema(p);
+      /* Attempt to open a transaction and read page 1 of the input database.
+      ** Two attempts may be made - one with a wrapper installed to ensure
+      ** that the database header is sane, and then if that attempt returns
+      ** SQLITE_NOTADB, then again with no wrapper. The second attempt is
+      ** required for encrypted databases.  */
+      if( p->errCode==SQLITE_OK ){
+        do{
+          p->errCode = SQLITE_OK;
+          if( bUseWrapper ) recoverInstallWrapper(p);
 
-      recoverUninstallWrapper(p);
+          /* Open a transaction on the input database. */
+          sqlite3_file_control(p->dbIn, p->zDb, SQLITE_FCNTL_RESET_CACHE, 0);
+          recoverExec(p, p->dbIn, "PRAGMA writable_schema = on");
+          recoverExec(p, p->dbIn, "BEGIN");
+          if( p->errCode==SQLITE_OK ) p->bCloseTransaction = 1;
+          recoverExec(p, p->dbIn, "SELECT 1 FROM sqlite_schema");
+          recoverTransferSettings(p);
+          recoverOpenRecovery(p);
+          recoverCacheSchema(p);
+
+          if( bUseWrapper ) recoverUninstallWrapper(p);
+        }while( p->errCode==SQLITE_NOTADB 
+             && (bUseWrapper--) 
+             && SQLITE_OK==sqlite3_exec(p->dbIn, "ROLLBACK", 0, 0, 0)
+        );
+      }
+
       recoverLeaveMutex();
-
       recoverExec(p, p->dbOut, "BEGIN");
-
       recoverWriteSchema1(p);
       p->eState = RECOVER_STATE_WRITING;
       break;
+    }
       
     case RECOVER_STATE_WRITING: {
       if( p->w1.pTbls==0 ){
@@ -22907,6 +22931,8 @@ static int shell_callback(
       char cEnd = 0;
       char c;
       int nLine = 0;
+      int isIndex;
+      int isWhere = 0;
       assert( nArg==1 );
       if( azArg[0]==0 ) break;
       if( sqlite3_strlike("CREATE VIEW%", azArg[0], 0)==0
@@ -22915,6 +22941,8 @@ static int shell_callback(
         sqlite3_fprintf(p->out, "%s;\n", azArg[0]);
         break;
       }
+      isIndex = sqlite3_strlike("CREATE INDEX%", azArg[0], 0)==0
+             || sqlite3_strlike("CREATE UNIQUE INDEX%", azArg[0], 0)==0;
       z = sqlite3_mprintf("%s", azArg[0]);
       shell_check_oom(z);
       j = 0;
@@ -22944,14 +22972,26 @@ static int shell_callback(
             nParen++;
           }else if( c==')' ){
             nParen--;
-            if( nLine>0 && nParen==0 && j>0 ){
+            if( nLine>0 && nParen==0 && j>0 && !isWhere ){
               printSchemaLineN(p->out, z, j, "\n");
               j = 0;
             }
+          }else if( (c=='w' || c=='W')
+                 && nParen==0 && isIndex
+                 && sqlite3_strnicmp("WHERE",&z[i],5)==0
+                 && !IsAlnum(z[i+5]) && z[i+5]!='_' ){
+            isWhere = 1;
+          }else if( isWhere && (c=='A' || c=='a')
+                 && nParen==0
+                 && sqlite3_strnicmp("AND",&z[i],3)==0
+                 && !IsAlnum(z[i+3]) && z[i+3]!='_' ){
+            printSchemaLineN(p->out, z, j, "\n    ");
+            j = 0;
           }
           z[j++] = c;
           if( nParen==1 && cEnd==0
            && (c=='(' || c=='\n' || (c==',' && !wsToEol(z+i+1)))
+           && !isWhere
           ){
             if( c=='\n' ) j--;
             printSchemaLineN(p->out, z, j, "\n  ");
@@ -28333,6 +28373,7 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
   sqlite3_recover_config(p, SQLITE_RECOVER_ROWIDS, (void*)&bRowids);
   sqlite3_recover_config(p, SQLITE_RECOVER_FREELIST_CORRUPT,(void*)&bFreelist);
 
+  sqlite3_fprintf(pState->out, ".dbconfig defensive off\n");
   sqlite3_recover_run(p);
   if( sqlite3_recover_errcode(p)!=SQLITE_OK ){
     const char *zErr = sqlite3_recover_errmsg(p);
@@ -32424,7 +32465,7 @@ static int line_is_command_terminator(char *zLine){
 ** out of the build if compiling with SQLITE_OMIT_COMPLETE.
 */
 #ifdef SQLITE_OMIT_COMPLETE
-# error the CLI application is incompatable with SQLITE_OMIT_COMPLETE.
+# error the CLI application is incompatible with SQLITE_OMIT_COMPLETE.
 #endif
 
 /*

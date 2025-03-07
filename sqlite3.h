@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.50.0"
 #define SQLITE_VERSION_NUMBER 3050000
-#define SQLITE_SOURCE_ID      "2025-02-28 15:54:28 44bd44532d4a63b2f600427dc425bde618bcc21e4abffaa2ec19f27350e54732"
+#define SQLITE_SOURCE_ID      "2025-03-06 09:29:15 44adf8f38761a0d756c047f93fc76fc1d0aba8cc209970e3ba13e7040dd14b13"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -5175,7 +5175,7 @@ SQLITE_API const void *sqlite3_column_decltype16(sqlite3_stmt*,int);
 ** other than [SQLITE_ROW] before any subsequent invocation of
 ** sqlite3_step().  Failure to reset the prepared statement using
 ** [sqlite3_reset()] would result in an [SQLITE_MISUSE] return from
-** sqlite3_step().  But after [version 3.6.23.1] ([dateof:3.6.23.1],
+** sqlite3_step().  But after [version 3.6.23.1] ([dateof:3.6.23.1]),
 ** sqlite3_step() began
 ** calling [sqlite3_reset()] automatically in this circumstance rather
 ** than returning [SQLITE_MISUSE].  This is not considered a compatibility
