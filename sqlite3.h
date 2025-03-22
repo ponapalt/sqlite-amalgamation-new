@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.50.0"
 #define SQLITE_VERSION_NUMBER 3050000
-#define SQLITE_SOURCE_ID      "2025-03-12 15:17:13 6ec0c03b954cf705da076d035a1cc2e784233ae28857385379e44a59af6c5ec4"
+#define SQLITE_SOURCE_ID      "2025-03-22 19:07:54 f3c0071284fbe1c0a8c3fe73792a79f9df6be983e5c9bd1a7e2fe71ba7b2d400"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -7071,6 +7071,8 @@ SQLITE_API int sqlite3_autovacuum_pages(
 **
 ** ^The second argument is a pointer to the function to invoke when a
 ** row is updated, inserted or deleted in a rowid table.
+** ^The update hook is disabled by invoking sqlite3_update_hook()
+** with a NULL pointer as the second parameter.
 ** ^The first argument to the callback is a copy of the third argument
 ** to sqlite3_update_hook().
 ** ^The second callback argument is one of [SQLITE_INSERT], [SQLITE_DELETE],
