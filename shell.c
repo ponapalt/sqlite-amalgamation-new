@@ -18711,6 +18711,9 @@ static int sqlite3DbdataRegister(sqlite3 *db){
   return rc;
 }
 
+#ifdef _WIN32
+
+#endif
 int sqlite3_dbdata_init(
   sqlite3 *db, 
   char **pzErrMsg, 
