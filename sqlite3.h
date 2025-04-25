@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.50.0"
 #define SQLITE_VERSION_NUMBER 3050000
-#define SQLITE_SOURCE_ID      "2025-04-18 14:47:56 00313d15270b36fce44f7784c97ddc42517e23c209c1ccc4d814ef06b11528c0"
+#define SQLITE_SOURCE_ID      "2025-04-25 12:39:32 3e627d66ebdef8dfe41bd12a0474d1afca9f50051771774679d25bd1833e69ae"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -11555,9 +11555,10 @@ SQLITE_API void sqlite3session_table_filter(
 ** is inserted while a session object is enabled, then later deleted while
 ** the same session object is disabled, no INSERT record will appear in the
 ** changeset, even though the delete took place while the session was disabled.
-** Or, if one field of a row is updated while a session is disabled, and
-** another field of the same row is updated while the session is enabled, the
-** resulting changeset will contain an UPDATE change that updates both fields.
+** Or, if one field of a row is updated while a session is enabled, and
+** then another field of the same row is updated while the session is disabled,
+** the resulting changeset will contain an UPDATE change that updates both
+** fields.
 */
 SQLITE_API int sqlite3session_changeset(
   sqlite3_session *pSession,      /* Session object */
