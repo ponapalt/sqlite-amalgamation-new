@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.51.0"
 #define SQLITE_VERSION_NUMBER 3051000
-#define SQLITE_SOURCE_ID      "2025-07-31 12:25:23 1cccea0508f5c8b8ff751f407873713adc33f8642dcb6cdd495fd2d72ebcbdd3"
+#define SQLITE_SOURCE_ID      "2025-08-07 20:20:22 8c9db6237154d1c153916ed821f576f91b353bf988182127d2a619506707d6bd"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -10792,7 +10792,7 @@ typedef struct sqlite3_snapshot {
 ** The [sqlite3_snapshot_get()] interface is only available when the
 ** [SQLITE_ENABLE_SNAPSHOT] compile-time option is used.
 */
-SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_get(
+SQLITE_API int sqlite3_snapshot_get(
   sqlite3 *db,
   const char *zSchema,
   sqlite3_snapshot **ppSnapshot
@@ -10841,7 +10841,7 @@ SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_get(
 ** The [sqlite3_snapshot_open()] interface is only available when the
 ** [SQLITE_ENABLE_SNAPSHOT] compile-time option is used.
 */
-SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_open(
+SQLITE_API int sqlite3_snapshot_open(
   sqlite3 *db,
   const char *zSchema,
   sqlite3_snapshot *pSnapshot
@@ -10858,7 +10858,7 @@ SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_open(
 ** The [sqlite3_snapshot_free()] interface is only available when the
 ** [SQLITE_ENABLE_SNAPSHOT] compile-time option is used.
 */
-SQLITE_API SQLITE_EXPERIMENTAL void sqlite3_snapshot_free(sqlite3_snapshot*);
+SQLITE_API void sqlite3_snapshot_free(sqlite3_snapshot*);
 
 /*
 ** CAPI3REF: Compare the ages of two snapshot handles.
@@ -10885,7 +10885,7 @@ SQLITE_API SQLITE_EXPERIMENTAL void sqlite3_snapshot_free(sqlite3_snapshot*);
 ** This interface is only available if SQLite is compiled with the
 ** [SQLITE_ENABLE_SNAPSHOT] option.
 */
-SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_cmp(
+SQLITE_API int sqlite3_snapshot_cmp(
   sqlite3_snapshot *p1,
   sqlite3_snapshot *p2
 );
@@ -10913,7 +10913,7 @@ SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_cmp(
 ** This interface is only available if SQLite is compiled with the
 ** [SQLITE_ENABLE_SNAPSHOT] option.
 */
-SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_recover(sqlite3 *db, const char *zDb);
+SQLITE_API int sqlite3_snapshot_recover(sqlite3 *db, const char *zDb);
 
 /*
 ** CAPI3REF: Serialize a database
@@ -10985,14 +10985,15 @@ SQLITE_API unsigned char *sqlite3_serialize(
 /*
 ** CAPI3REF: Deserialize a database
 **
-** The sqlite3_deserialize(D,S,P,N,M,F) interface causes the
-** [database connection] D to disconnect from database S and then
-** reopen S as an in-memory database based on the serialization contained
-** in P.  The serialized database P is N bytes in size.  M is the size of
-** the buffer P, which might be larger than N.  If M is larger than N, and
-** the SQLITE_DESERIALIZE_READONLY bit is not set in F, then SQLite is
-** permitted to add content to the in-memory database as long as the total
-** size does not exceed M bytes.
+** The sqlite3_deserialize(D,S,P,N,M,F) interface causes the [database
+** connection] D to disconnect from database S and then reopen S as an
+** in-memory database based on the serialization contained in P.  If S
+** is a NULL pointer, the main database is used. The serialized
+** database P is N bytes in size.  M is the size of the buffer P,
+** which might be larger than N.  If M is larger than N, and the
+** SQLITE_DESERIALIZE_READONLY bit is not set in F, then SQLite is
+** permitted to add content to the in-memory database as long as the
+** total size does not exceed M bytes.
 **
 ** If the SQLITE_DESERIALIZE_FREEONCLOSE bit is set in F, then SQLite will
 ** invoke sqlite3_free() on the serialization buffer when the database
