@@ -148,7 +148,7 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.51.0"
 #define SQLITE_VERSION_NUMBER 3051000
-#define SQLITE_SOURCE_ID      "2025-08-14 19:36:59 309fdd496673bf58984fb16aef3d4cc2ad8c9f6dad7687509f4d708fed5ba41b"
+#define SQLITE_SOURCE_ID      "2025-08-21 18:47:01 9ada44eb6d26532e45cdd2ed8d5707f1734d0177a13b493ff9cf070e0a992522"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -6210,6 +6210,7 @@ SQLITE_API void sqlite3_set_auxdata(sqlite3_context*, int N, void*, void (*)(voi
 ** or a NULL pointer if there were no prior calls to
 ** sqlite3_set_clientdata() with the same values of D and N.
 ** Names are compared using strcmp() and are thus case sensitive.
+** It returns 0 on success and SQLITE_NOMEM on allocation failure.
 **
 ** If P and X are both non-NULL, then the destructor X is invoked with
 ** argument P on the first of the following occurrences:
