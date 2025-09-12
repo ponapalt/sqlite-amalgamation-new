@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.51.0"
 #define SQLITE_VERSION_NUMBER 3051000
-#define SQLITE_SOURCE_ID      "025-09-05 13:26:24 1bb7eaf784687cd877c5c0552bb511659767670259e64bc108e-experimental"
+#define SQLITE_SOURCE_ID      "025-09-12 17:36:23 ead8a3a94e0f349bcdced6a62af0349b0b7b731137c8d33e2ef-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2025-09-05T13:26:24.094Z"
+#define SQLITE_SCM_DATETIME   "2025-09-12T17:36:23.257Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -2343,17 +2343,20 @@ struct sqlite3_mem_methods {
 **
 ** [[SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER]]
 ** <dt>SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER</dt>
-** <dd> ^This option is used to enable or disable the
-** [fts3_tokenizer()] function which is part of the
-** [FTS3] full-text search engine extension.
-** There must be two additional arguments.
-** The first argument is an integer which is 0 to disable fts3_tokenizer() or
-** positive to enable fts3_tokenizer() or negative to leave the setting
-** unchanged.
-** The second parameter is a pointer to an integer into which
-** is written 0 or 1 to indicate whether fts3_tokenizer is disabled or enabled
-** following this call.  The second parameter may be a NULL pointer, in
-** which case the new setting is not reported back. </dd>
+** <dd> ^This option is used to enable or disable using the
+** [fts3_tokenizer()] function - part of the [FTS3] full-text search engine
+** extension - without using bound parameters as the parameters. Doing so
+** is disabled by default. There must be two additional arguments. The first
+** argument is an integer. If it is passed 0, then using fts3_tokenizer()
+** without bound parameters is disabled. If it is passed a positive value,
+** then calling fts3_tokenizer without bound parameters is enabled. If it
+** is passed a negative value, this setting is not modified - this can be
+** used to query for the current setting. The second parameter is a pointer
+** to an integer into which is written 0 or 1 to indicate the current value
+** of this setting (after it is modified, if applicable).  The second
+** parameter may be a NULL pointer, in which case the value of the setting
+** is not reported back. Refer to [FTS3] documentation for further details.
+** </dd>
 **
 ** [[SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION]]
 ** <dt>SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION</dt>
@@ -4202,6 +4205,34 @@ SQLITE_API const char *sqlite3_errmsg(sqlite3*);
 SQLITE_API const void *sqlite3_errmsg16(sqlite3*);
 SQLITE_API const char *sqlite3_errstr(int);
 SQLITE_API int sqlite3_error_offset(sqlite3 *db);
+
+/*
+** CAPI3REF: Set Error Codes And Message
+** METHOD: sqlite3
+**
+** Set the error code of the database handle passed as the first argument
+** to errcode, and the error message to a copy of nul-terminated string
+** zErrMsg. If zErrMsg is passed NULL, then the error message is set to
+** the default message associated with the supplied error code.  Subsequent
+** calls to [sqlite3_errcode()] and [sqlite3_errmsg()] and similar will
+** return the values set by this routine in place of what was previously
+** set by SQLite itself.
+**
+** This function returns SQLITE_OK if the error code and error message are
+** successfully set, SQLITE_NOMEM if an OOM occurs, and SQLITE_MISUSE if
+** the database handle is NULL or invalid.
+**
+** The error code and message set by this routine remains in effect until
+** they are changed, either by another call to this routine or until they are
+** changed to by SQLite itself to reflect the result of some subsquent
+** API call.
+**
+** This function is intended for use by SQLite extensions or wrappers.  The
+** idea is that an extension or wrapper can use this routine to set error
+** messages and error codes and thus behave more like a core SQLite
+** feature from the point of view of an application.
+*/
+SQLITE_API int sqlite3_set_errmsg(sqlite3 *db, int errcode, const char *zErrMsg);
 
 /*
 ** CAPI3REF: Prepared Statement Object
@@ -9913,6 +9944,11 @@ SQLITE_API int sqlite3_wal_checkpoint(sqlite3 *db, const char *zDb);
 **   ^This mode works the same way as SQLITE_CHECKPOINT_RESTART with the
 **   addition that it also truncates the log file to zero bytes just prior
 **   to a successful return.
+**
+** <dt>SQLITE_CHECKPOINT_NOOP<dd>
+**   ^This mode always checkpoints zero frames. The only reason to invoke
+**   a NOOP checkpoint is to access the values returned by
+**   sqlite3_wal_checkpoint_v2() via output parameters *pnLog and *pnCkpt.
 ** </dl>
 **
 ** ^If pnLog is not NULL, then *pnLog is set to the total number of frames in
@@ -9983,6 +10019,7 @@ SQLITE_API int sqlite3_wal_checkpoint_v2(
 ** See the [sqlite3_wal_checkpoint_v2()] documentation for details on the
 ** meaning of each of these checkpoint modes.
 */
+#define SQLITE_CHECKPOINT_NOOP    -1  /* Do no work at all */
 #define SQLITE_CHECKPOINT_PASSIVE  0  /* Do as much as possible w/o blocking */
 #define SQLITE_CHECKPOINT_FULL     1  /* Wait for writers, then checkpoint */
 #define SQLITE_CHECKPOINT_RESTART  2  /* Like FULL but wait for readers */
@@ -12337,6 +12374,15 @@ SQLITE_API void sqlite3changegroup_delete(sqlite3_changegroup*);
 ** update the "main" database attached to handle db with the changes found in
 ** the changeset passed via the second and third arguments.
 **
+** All changes made by these functions are enclosed in a savepoint transaction.
+** If any other error (aside from a constraint failure when attempting to
+** write to the target database) occurs, then the savepoint transaction is
+** rolled back, restoring the target database to its original state, and an
+** SQLite error code returned. Additionally, starting with version 3.51.0,
+** an error code and error message that may be accessed using the
+** [sqlite3_errcode()] and [sqlite3_errmsg()] APIs are left in the database
+** handle.
+**
 ** The fourth argument (xFilter) passed to these functions is the "filter
 ** callback". This may be passed NULL, in which case all changes in the
 ** changeset are applied to the database. For sqlite3changeset_apply() and
@@ -12473,12 +12519,6 @@ SQLITE_API void sqlite3changegroup_delete(sqlite3_changegroup*);
 ** table that the callback related to, from within the xConflict callback.
 ** This can be used to further customize the application's conflict
 ** resolution strategy.
-**
-** All changes made by these functions are enclosed in a savepoint transaction.
-** If any other error (aside from a constraint failure when attempting to
-** write to the target database) occurs, then the savepoint transaction is
-** rolled back, restoring the target database to its original state, and an
-** SQLite error code returned.
 **
 ** If the output parameters (ppRebase) and (pnRebase) are non-NULL and
 ** the input is a changeset (not a patchset), then sqlite3changeset_apply_v2()
