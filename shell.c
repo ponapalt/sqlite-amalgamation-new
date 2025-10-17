@@ -3726,7 +3726,8 @@ static Decimal *decimalNewFromText(const char *zIn, int n){
       }
     }
     if( iExp>0 ){   
-      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
+      p->a = sqlite3_realloc64(p->a, (sqlite3_int64)p->nDigit
+                                     + (sqlite3_int64)iExp + 1 );
       if( p->a==0 ) goto new_from_text_failed;
       memset(p->a+p->nDigit, 0, iExp);
       p->nDigit += iExp;
@@ -3745,7 +3746,8 @@ static Decimal *decimalNewFromText(const char *zIn, int n){
       }
     }
     if( iExp>0 ){
-      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
+      p->a = sqlite3_realloc64(p->a, (sqlite3_int64)p->nDigit
+                                     + (sqlite3_int64)iExp + 1 );
       if( p->a==0 ) goto new_from_text_failed;
       memmove(p->a+iExp, p->a, p->nDigit);
       memset(p->a, 0, iExp);
@@ -3849,7 +3851,7 @@ static void decimal_result(sqlite3_context *pCtx, Decimal *p){
     sqlite3_result_null(pCtx);
     return;
   }
-  z = sqlite3_malloc( p->nDigit+4 );
+  z = sqlite3_malloc64( (sqlite3_int64)p->nDigit+4 );
   if( z==0 ){
     sqlite3_result_error_nomem(pCtx);
     return;
@@ -3914,7 +3916,7 @@ static void decimal_result_sci(sqlite3_context *pCtx, Decimal *p){
   for(nZero=0; nZero<nDigit && p->a[nZero]==0; nZero++){}
   nFrac = p->nFrac + (nDigit - p->nDigit);
   nDigit -= nZero;
-  z = sqlite3_malloc( nDigit+20 );
+  z = sqlite3_malloc64( (sqlite3_int64)nDigit+20 );
   if( z==0 ){
     sqlite3_result_error_nomem(pCtx);
     return;
@@ -4135,7 +4137,8 @@ static void decimalMul(Decimal *pA, Decimal *pB){
   ){
     goto mul_end;
   }
-  acc = sqlite3_malloc64( pA->nDigit + pB->nDigit + 2 );
+  acc = sqlite3_malloc64( (sqlite3_int64)pA->nDigit +
+                          (sqlite3_int64)pB->nDigit + 2 );
   if( acc==0 ){
     pA->oom = 1;
     goto mul_end;
@@ -5953,6 +5956,45 @@ static sqlite3_uint64 seriesSteps(series_cursor *pCur){
   }
 }
 
+#if defined(SQLITE_ENABLE_MATH_FUNCTIONS) || defined(_WIN32)
+/*
+** Case 1 (the most common case):
+** The standard math library is available so use ceil() and floor() from there.
+*/
+static double seriesCeil(double r){ return ceil(r); }
+static double seriesFloor(double r){ return floor(r); }
+#elif defined(__GNUC__) && !defined(SQLITE_DISABLE_INTRINSIC)
+/*
+** Case 2 (2nd most common): Use GCC/Clang builtins
+*/
+static double seriesCeil(double r){ return __builtin_ceil(r); }
+static double seriesFloor(double r){ return __builtin_floor(r); }
+#else
+/*
+** Case 3 (rarely happens): Use home-grown ceil() and floor() routines.
+*/
+static double seriesCeil(double r){
+  sqlite3_int64 x;
+  if( r!=r ) return r;
+  if( r<=(-4503599627370496.0) ) return r;
+  if( r>=(+4503599627370496.0) ) return r;
+  x = (sqlite3_int64)r;
+  if( r==(double)x ) return r;
+  if( r>(double)x ) x++;
+  return (double)x;
+}
+static double seriesFloor(double r){
+  sqlite3_int64 x;
+  if( r!=r ) return r;
+  if( r<=(-4503599627370496.0) ) return r;
+  if( r>=(+4503599627370496.0) ) return r;
+  x = (sqlite3_int64)r;
+  if( r==(double)x ) return r;
+  if( r<(double)x ) x--;
+  return (double)x;
+}
+#endif
+
 /*
 ** This method is called to "rewind" the series_cursor object back
 ** to the first row of output.  This method is always called at least
@@ -6071,7 +6113,7 @@ static int seriesFilter(
     if( idxNum & 0x0080 ){    /* value=X */
       if( sqlite3_value_numeric_type(argv[iArg])==SQLITE_FLOAT ){
         double r = sqlite3_value_double(argv[iArg++]);
-        if( r==ceil(r)
+        if( r==seriesCeil(r)
          && r>=(double)SMALLEST_INT64
          && r<=(double)LARGEST_INT64
         ){
@@ -6088,10 +6130,10 @@ static int seriesFilter(
           double r = sqlite3_value_double(argv[iArg++]);
           if( r<(double)SMALLEST_INT64 ){
             iMin = SMALLEST_INT64;
-          }else if( (idxNum & 0x0200)!=0 && r==ceil(r) ){
-            iMin = (sqlite3_int64)ceil(r+1.0);
+          }else if( (idxNum & 0x0200)!=0 && r==seriesCeil(r) ){
+            iMin = (sqlite3_int64)seriesCeil(r+1.0);
           }else{
-            iMin = (sqlite3_int64)ceil(r);
+            iMin = (sqlite3_int64)seriesCeil(r);
           }
         }else{
           iMin = sqlite3_value_int64(argv[iArg++]);
@@ -6109,10 +6151,10 @@ static int seriesFilter(
           double r = sqlite3_value_double(argv[iArg++]);
           if( r>(double)LARGEST_INT64 ){
             iMax = LARGEST_INT64;
-          }else if( (idxNum & 0x2000)!=0 && r==floor(r) ){
+          }else if( (idxNum & 0x2000)!=0 && r==seriesFloor(r) ){
             iMax = (sqlite3_int64)(r-1.0);
           }else{
-            iMax = (sqlite3_int64)floor(r);
+            iMax = (sqlite3_int64)seriesFloor(r);
           }
         }else{
           iMax = sqlite3_value_int64(argv[iArg++]);
@@ -6195,7 +6237,6 @@ static int seriesFilter(
   /* Apply LIMIT and OFFSET constraints, if any */
   assert( pCur->iStep!=0 );
   if( idxNum & 0x20 ){
-    sqlite3_uint64 nStep;
     if( iOffset>0 ){
       if( seriesSteps(pCur) < (sqlite3_uint64)iOffset ){
         goto series_no_rows;
@@ -6205,7 +6246,7 @@ static int seriesFilter(
         pCur->iBase = add64(pCur->iBase, pCur->iStep*iOffset);
       }
     }
-    if( iLimit>=0 && (nStep = seriesSteps(pCur)) > (sqlite3_uint64)iLimit ){
+    if( iLimit>=0 && seriesSteps(pCur) > (sqlite3_uint64)iLimit ){
       pCur->iTerm = add64(pCur->iBase, (iLimit - 1)*pCur->iStep);
     }
   }
@@ -23158,8 +23199,8 @@ static int display_stats(
   ShellState *pArg,           /* Pointer to ShellState */
   int bReset                  /* True to reset the stats */
 ){
-  int iCur;
-  int iHiwtr;
+  int iCur, iHiwtr;
+  sqlite3_int64 iCur64, iHiwtr64;
   FILE *out;
   if( pArg==0 || pArg->out==0 ) return 0;
   out = pArg->out;
@@ -23248,6 +23289,9 @@ static int display_stats(
     sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &iCur, &iHiwtr, 1);
     sqlite3_fprintf(out,
            "Page cache misses:                   %d\n", iCur);
+    iHiwtr64 = iCur64 = -1;
+    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
+                        0);
     iHiwtr = iCur = -1;
     sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &iCur, &iHiwtr, 1);
     sqlite3_fprintf(out,
@@ -23256,6 +23300,10 @@ static int display_stats(
     sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, &iCur, &iHiwtr, 1);
     sqlite3_fprintf(out,
            "Page cache spills:                   %d\n", iCur);
+    sqlite3_fprintf(out,
+           "Temporary data spilled to disk:      %lld\n", iCur64);
+    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
+                        1);
     iHiwtr = iCur = -1;
     sqlite3_db_status(db, SQLITE_DBSTATUS_SCHEMA_USED, &iCur, &iHiwtr, bReset);
     sqlite3_fprintf(out,
@@ -24964,7 +25012,7 @@ static const char *(azHelp[]) = {
   "        input text.",
 #endif
 #ifndef SQLITE_OMIT_TEST_CONTROL
-  ",imposter INDEX TABLE    Create imposter table TABLE on index INDEX",
+  ".imposter INDEX TABLE    Create imposter table TABLE on index INDEX",
 #endif
   ".indexes ?TABLE?         Show names of indexes",
   "                           If TABLE is specified, only show indexes for",
@@ -27606,25 +27654,41 @@ static void arWhereClause(
   char **pzWhere                  /* OUT: New WHERE clause */
 ){
   char *zWhere = 0;
-  const char *zSameOp = (pAr->bGlob)? "GLOB" : "=";
   if( *pRc==SQLITE_OK ){
     if( pAr->nArg==0 ){
       zWhere = sqlite3_mprintf("1");
     }else{
+      char *z1 = sqlite3_mprintf(pAr->bGlob ? "" : "name IN(");
+      char *z2 = sqlite3_mprintf("");
+      const char *zSep1 = "";
+      const char *zSep2 = "";
+
       int i;
-      const char *zSep = "";
-      for(i=0; i<pAr->nArg; i++){
+      for(i=0; i<pAr->nArg && z1 && z2; i++){
         const char *z = pAr->azArg[i];
-        zWhere = sqlite3_mprintf(
-          "%z%s name %s '%q' OR substr(name,1,%d) %s '%q/'",
-          zWhere, zSep, zSameOp, z, strlen30(z)+1, zSameOp, z
-        );
-        if( zWhere==0 ){
-          *pRc = SQLITE_NOMEM;
-          break;
+        int n = strlen30(z);
+
+        if( pAr->bGlob ){
+          z1 = sqlite3_mprintf("%z%sname GLOB '%q'", z1, zSep2, z);
+          z2 = sqlite3_mprintf(
+              "%z%ssubstr(name,1,%d) GLOB '%q/'", z2, zSep2, n+1,z
+          );
+        }else{
+          z1 = sqlite3_mprintf("%z%s'%q'", z1, zSep1, z);
+          z2 = sqlite3_mprintf("%z%ssubstr(name,1,%d) = '%q/'",z2,zSep2,n+1,z);
         }
-        zSep = " OR ";
+        zSep1 = ", ";
+        zSep2 = " OR ";
       }
+      if( z1==0 || z2==0 ){
+        *pRc = SQLITE_NOMEM;
+      }else{
+        zWhere = sqlite3_mprintf("(%s%s OR (name GLOB '*/*' AND (%s))) ",
+            z1, pAr->bGlob==0 ? ")" : "", z2
+        );
+      }
+      sqlite3_free(z1);
+      sqlite3_free(z2);
     }
   }
   *pzWhere = zWhere;
@@ -30164,6 +30228,7 @@ static int do_meta_command(char *zLine, ShellState *p){
                           "ERROR: unknown option: \"%s\". Usage:\n", azArg[i]);
           showHelp(p->out, azArg[0]);
           rc = 1;
+          sqlite3_free(zFile);
           goto meta_command_exit;
         }
       }else if( zFile==0 && eMode==0 ){
@@ -31404,10 +31469,10 @@ static int do_meta_command(char *zLine, ShellState *p){
     while( sqlite3_step(pStmt)==SQLITE_ROW ){
       if( nRow>=nAlloc ){
         char **azNew;
-        int n2 = nAlloc*2 + 10;
+        sqlite3_int64 n2 = 2*(sqlite3_int64)nAlloc + 10;
         azNew = sqlite3_realloc64(azResult, sizeof(azResult[0])*n2);
         shell_check_oom(azNew);
-        nAlloc = n2;
+        nAlloc = (int)n2;
         azResult = azNew;
       }
       azResult[nRow] = sqlite3_mprintf("%s", sqlite3_column_text(pStmt, 0));
