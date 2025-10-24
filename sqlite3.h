@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.51.0"
 #define SQLITE_VERSION_NUMBER 3051000
-#define SQLITE_SOURCE_ID      "2025-10-17 10:06:44 d1044bc0616fd20c63ca3b627ad0a116256870a082a72da26f9-experimental"
+#define SQLITE_SOURCE_ID      "2025-10-24 17:16:00 62917cd4297e734477d3201481548ddb7f79ec977b9da7d9313-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2025-10-17T10:06:44.075Z"
+#define SQLITE_SCM_DATETIME   "2025-10-24T17:16:00.748Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4907,9 +4907,11 @@ typedef struct sqlite3_context sqlite3_context;
 ** associated with the pointer P of type T.  ^D is either a NULL pointer or
 ** a pointer to a destructor function for P. ^SQLite will invoke the
 ** destructor D with a single argument of P when it is finished using
-** P.  The T parameter should be a static string, preferably a string
-** literal. The sqlite3_bind_pointer() routine is part of the
-** [pointer passing interface] added for SQLite 3.20.0.
+** P, even if the call to sqlite3_bind_pointer() fails.  Due to a
+** historical design quirk, results are undefined if D is
+** SQLITE_TRANSIENT. The T parameter should be a static string,
+** preferably a string literal. The sqlite3_bind_pointer() routine is
+** part of the [pointer passing interface] added for SQLite 3.20.0.
 **
 ** ^If any of the sqlite3_bind_*() routines are called with a NULL pointer
 ** for the [prepared statement] or with a prepared statement for which
@@ -11153,9 +11155,11 @@ SQLITE_API int sqlite3_deserialize(
 ** [SQLITE_CARRAY_DOUBLE], [SQLITE_CARRAY_TEXT], or [SQLITE_CARRAY_BLOB] to
 ** indicate the datatype of the array being bound.  The X argument is not a
 ** NULL pointer, then SQLite will invoke the function X on the P parameter
-** after it has finished using P.
+** after it has finished using P, even if the call to
+** sqlite3_carray_bind() fails. The special-case finalizer
+** SQLITE_TRANSIENT has no effect here.
 */
-SQLITE_API SQLITE_API int sqlite3_carray_bind(
+SQLITE_API int sqlite3_carray_bind(
   sqlite3_stmt *pStmt,        /* Statement to be bound */
   int i,                      /* Parameter index */
   void *aData,                /* Pointer to array data */

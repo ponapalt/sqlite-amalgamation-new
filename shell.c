@@ -8204,7 +8204,7 @@ static int fsdirNext(sqlite3_vtab_cursor *cur){
     pCur->zPath = 0;
     pLvl->pDir = opendir(pLvl->zDir);
     if( pLvl->pDir==0 ){
-      fsdirSetErrmsg(pCur, "cannot read directory: %s", pCur->zPath);
+      fsdirSetErrmsg(pCur, "cannot read directory: %s", pLvl->zDir);
       return SQLITE_ERROR;
     }
   }
@@ -12533,11 +12533,11 @@ struct sqlite3expert {
 ** Allocate and return nByte bytes of zeroed memory using sqlite3_malloc(). 
 ** If the allocation fails, set *pRc to SQLITE_NOMEM and return NULL.
 */
-static void *idxMalloc(int *pRc, int nByte){
+static void *idxMalloc(int *pRc, i64 nByte){
   void *pRet;
   assert( *pRc==SQLITE_OK );
   assert( nByte>0 );
-  pRet = sqlite3_malloc(nByte);
+  pRet = sqlite3_malloc64(nByte);
   if( pRet ){
     memset(pRet, 0, nByte);
   }else{
@@ -12604,7 +12604,7 @@ static int idxHashAdd(
       return 1;
     }
   }
-  pEntry = idxMalloc(pRc, sizeof(IdxHashEntry) + nKey+1 + nVal+1);
+  pEntry = idxMalloc(pRc, sizeof(IdxHashEntry) + (i64)nKey+1 + (i64)nVal+1);
   if( pEntry ){
     pEntry->zKey = (char*)&pEntry[1];
     memcpy(pEntry->zKey, zKey, nKey);
@@ -12739,15 +12739,15 @@ struct ExpertCsr {
 };
 
 static char *expertDequote(const char *zIn){
-  int n = STRLEN(zIn);
-  char *zRet = sqlite3_malloc(n);
+  i64 n = STRLEN(zIn);
+  char *zRet = sqlite3_malloc64(n);
 
   assert( zIn[0]=='\'' );
   assert( zIn[n-1]=='\'' );
 
   if( zRet ){
-    int iOut = 0;
-    int iIn = 0;
+    i64 iOut = 0;
+    i64 iIn = 0;
     for(iIn=1; iIn<(n-1); iIn++){
       if( zIn[iIn]=='\'' ){
         assert( zIn[iIn+1]=='\'' );
@@ -13060,7 +13060,7 @@ static int idxGetTableInfo(
   sqlite3_stmt *p1 = 0;
   int nCol = 0;
   int nTab;
-  int nByte;
+  i64 nByte;
   IdxTable *pNew = 0;
   int rc, rc2;
   char *pCsr = 0;
@@ -13152,14 +13152,14 @@ static char *idxAppendText(int *pRc, char *zIn, const char *zFmt, ...){
   va_list ap;
   char *zAppend = 0;
   char *zRet = 0;
-  int nIn = zIn ? STRLEN(zIn) : 0;
-  int nAppend = 0;
+  i64 nIn = zIn ? STRLEN(zIn) : 0;
+  i64 nAppend = 0;
   va_start(ap, zFmt);
   if( *pRc==SQLITE_OK ){
     zAppend = sqlite3_vmprintf(zFmt, ap);
     if( zAppend ){
       nAppend = STRLEN(zAppend);
-      zRet = (char*)sqlite3_malloc(nIn + nAppend + 1);
+      zRet = (char*)sqlite3_malloc64(nIn + nAppend + 1);
     }
     if( zAppend && zRet ){
       if( nIn ) memcpy(zRet, zIn, nIn);
@@ -13923,8 +13923,8 @@ struct IdxRemCtx {
     int eType;                    /* SQLITE_NULL, INTEGER, REAL, TEXT, BLOB */
     i64 iVal;                     /* SQLITE_INTEGER value */
     double rVal;                  /* SQLITE_FLOAT value */
-    int nByte;                    /* Bytes of space allocated at z */
-    int n;                        /* Size of buffer z */
+    i64 nByte;                    /* Bytes of space allocated at z */
+    i64 n;                        /* Size of buffer z */
     char *z;                      /* SQLITE_TEXT/BLOB value */
   } aSlot[1];
 };
@@ -13960,11 +13960,13 @@ static void idxRemFunc(
       break;
 
     case SQLITE_BLOB:
-      sqlite3_result_blob(pCtx, pSlot->z, pSlot->n, SQLITE_TRANSIENT);
+      assert( pSlot->n <= 0x7fffffff );
+      sqlite3_result_blob(pCtx, pSlot->z, (int)pSlot->n, SQLITE_TRANSIENT);
       break;
 
     case SQLITE_TEXT:
-      sqlite3_result_text(pCtx, pSlot->z, pSlot->n, SQLITE_TRANSIENT);
+      assert( pSlot->n <= 0x7fffffff );
+      sqlite3_result_text(pCtx, pSlot->z, (int)pSlot->n, SQLITE_TRANSIENT);
       break;
   }
 
@@ -13984,10 +13986,10 @@ static void idxRemFunc(
 
     case SQLITE_BLOB:
     case SQLITE_TEXT: {
-      int nByte = sqlite3_value_bytes(argv[1]);
+      i64 nByte = sqlite3_value_bytes(argv[1]);
       const void *pData = 0;
       if( nByte>pSlot->nByte ){
-        char *zNew = (char*)sqlite3_realloc(pSlot->z, nByte*2);
+        char *zNew = (char*)sqlite3_realloc64(pSlot->z, nByte*2);
         if( zNew==0 ){
           sqlite3_result_error_nomem(pCtx);
           return;
@@ -14042,7 +14044,7 @@ static int idxPopulateOneStat1(
   int nCol = 0;
   int i;
   sqlite3_stmt *pQuery = 0;
-  int *aStat = 0;
+  i64 *aStat = 0;
   int rc = SQLITE_OK;
 
   assert( p->iSample>0 );
@@ -14088,7 +14090,7 @@ static int idxPopulateOneStat1(
   sqlite3_free(zQuery);
 
   if( rc==SQLITE_OK ){
-    aStat = (int*)idxMalloc(&rc, sizeof(int)*(nCol+1));
+    aStat = (i64*)idxMalloc(&rc, sizeof(i64)*(nCol+1));
   }
   if( rc==SQLITE_OK && SQLITE_ROW==sqlite3_step(pQuery) ){
     IdxHashEntry *pEntry;
@@ -14105,11 +14107,11 @@ static int idxPopulateOneStat1(
     }
 
     if( rc==SQLITE_OK ){
-      int s0 = aStat[0];
-      zStat = sqlite3_mprintf("%d", s0);
+      i64 s0 = aStat[0];
+      zStat = sqlite3_mprintf("%lld", s0);
       if( zStat==0 ) rc = SQLITE_NOMEM;
       for(i=1; rc==SQLITE_OK && i<=nCol; i++){
-        zStat = idxAppendText(&rc, zStat, " %d", (s0+aStat[i]/2) / aStat[i]);
+        zStat = idxAppendText(&rc, zStat, " %lld", (s0+aStat[i]/2) / aStat[i]);
       }
     }
 
@@ -14188,7 +14190,7 @@ static int idxPopulateStat1(sqlite3expert *p, char **pzErr){
   rc = sqlite3_exec(p->dbm, "ANALYZE; PRAGMA writable_schema=1", 0, 0, 0);
 
   if( rc==SQLITE_OK ){
-    int nByte = sizeof(struct IdxRemCtx) + (sizeof(struct IdxRemSlot) * nMax);
+    i64 nByte = sizeof(struct IdxRemCtx) + (sizeof(struct IdxRemSlot) * nMax);
     pCtx = (struct IdxRemCtx*)idxMalloc(&rc, nByte);
   }
 
@@ -14205,7 +14207,7 @@ static int idxPopulateStat1(sqlite3expert *p, char **pzErr){
   }
 
   if( rc==SQLITE_OK ){
-    pCtx->nSlot = nMax+1;
+    pCtx->nSlot = (i64)nMax+1;
     rc = idxPrepareStmt(p->dbm, &pAllIndex, pzErr, zAllIndex);
   }
   if( rc==SQLITE_OK ){
@@ -14472,7 +14474,7 @@ int sqlite3_expert_sql(
       if( pStmt ){
         IdxStatement *pNew;
         const char *z = sqlite3_sql(pStmt);
-        int n = STRLEN(z);
+        i64 n = STRLEN(z);
         pNew = (IdxStatement*)idxMalloc(&rc, sizeof(IdxStatement) + n+1);
         if( rc==SQLITE_OK ){
           pNew->zSql = (char*)&pNew[1];
@@ -25323,7 +25325,7 @@ static int showHelp(FILE *out, const char *zPattern){
 }
 
 /* Forward reference */
-static int process_input(ShellState *p);
+static int process_input(ShellState *p, const char*);
 
 /*
 ** Read the content of file zName into memory obtained from sqlite3_malloc64()
@@ -25512,6 +25514,10 @@ static unsigned char *readHexDb(ShellState *p, int *pnData){
   for(nLine++; sqlite3_fgets(zLine, sizeof(zLine), in)!=0; nLine++){
     int j = 0;                    /* Page number from "| page" line */
     int k = 0;                    /* Offset from "| page" line */
+    if( nLine>=2000000000 ){
+      sqlite3_fprintf(stderr, "input too big\n");
+      goto readHexDb_error;
+    }
     rc = sscanf(zLine, "| page %d offset %d", &j, &k);
     if( rc==2 ){
       iOffset = k;
@@ -30529,7 +30535,7 @@ static int do_meta_command(char *zLine, ShellState *p){
         sqlite3_fprintf(stderr,"Error: cannot open \"%s\"\n", azArg[1]);
         rc = 1;
       }else{
-        rc = process_input(p);
+        rc = process_input(p, "<pipe>");
         pclose(p->in);
       }
 #endif
@@ -30537,7 +30543,7 @@ static int do_meta_command(char *zLine, ShellState *p){
       sqlite3_fprintf(stderr,"Error: cannot open \"%s\"\n", azArg[1]);
       rc = 1;
     }else{
-      rc = process_input(p);
+      rc = process_input(p, azArg[1]);
       fclose(p->in);
     }
     p->in = inSaved;
@@ -32528,7 +32534,7 @@ static char *one_input_line(FILE *in, char *zPrior, int isContinuation){
 **
 ** Return the number of errors.
 */
-static int process_input(ShellState *p){
+static int process_input(ShellState *p, const char *zSrc){
   char *zLine = 0;          /* A single input line */
   char *zSql = 0;           /* Accumulated SQL text */
   i64 nLine;                /* Length of current line */
@@ -32541,8 +32547,8 @@ static int process_input(ShellState *p){
 
   if( p->inputNesting==MAX_INPUT_NESTING ){
     /* This will be more informative in a later version. */
-    sqlite3_fprintf(stderr,"Input nesting limit (%d) reached at line %d."
-          " Check recursion.\n", MAX_INPUT_NESTING, p->lineno);
+    sqlite3_fprintf(stderr,"%s: Input nesting limit (%d) reached at line %d."
+          " Check recursion.\n", zSrc, MAX_INPUT_NESTING, p->lineno);
     return 1;
   }
   ++p->inputNesting;
@@ -32607,7 +32613,15 @@ static int process_input(ShellState *p){
       memcpy(zSql+nSql, zLine, nLine+1);
       nSql += nLine;
     }
-    if( nSql && QSS_SEMITERM(qss) && sqlite3_complete(zSql) ){
+    if( nSql>0x7fff0000 ){
+      char zSize[100];
+      sqlite3_snprintf(sizeof(zSize),zSize,"%,lld",nSql);
+      sqlite3_fprintf(stderr, "%s:%lld: Input SQL is too big: %s bytes\n",
+                      zSrc, startline, zSize);
+      nSql = 0;
+      errCnt++;
+      break;
+    }else if( nSql && QSS_SEMITERM(qss) && sqlite3_complete(zSql) ){
       echo_group_input(p, zSql);
       errCnt += runOneSqlLine(p, zSql, p->in, startline);
       CONTINUE_PROMPT_RESET;
@@ -32797,7 +32811,7 @@ static void process_sqliterc(
     if( stdin_is_interactive ){
       sqlite3_fprintf(stderr,"-- Loading resources from %s\n", sqliterc);
     }
-    if( process_input(p) && bail_on_error ) exit(1);
+    if( process_input(p, sqliterc) && bail_on_error ) exit(1);
     fclose(p->in);
   }else if( sqliterc_override!=0 ){
     sqlite3_fprintf(stderr,"cannot open: \"%s\"\n", sqliterc);
@@ -33628,7 +33642,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       linenoiseSetCompletionCallback(linenoise_completion, NULL);
 #endif
       data.in = 0;
-      rc = process_input(&data);
+      rc = process_input(&data, "<stdin>");
       if( zHistory ){
         shell_stifle_history(2000);
         shell_write_history(zHistory);
@@ -33636,7 +33650,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       }
     }else{
       data.in = stdin;
-      rc = process_input(&data);
+      rc = process_input(&data, "<stdin>");
     }
   }
 #ifndef SQLITE_SHELL_FIDDLE
@@ -33818,7 +33832,7 @@ void fiddle_exec(const char * zSql){
     if('.'==*zSql) puts(zSql);
     shellState.wasm.zInput = zSql;
     shellState.wasm.zPos = zSql;
-    process_input(&shellState);
+    process_input(&shellState, "<stdin>");
     shellState.wasm.zInput = shellState.wasm.zPos = 0;
   }
 }
