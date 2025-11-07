@@ -8576,14 +8576,6 @@ int sqlite3_fileio_init(
   return rc;
 }
 
-#if defined(FILEIO_WIN32_DLL) && (defined(_WIN32) || defined(WIN32))
-/* To allow a standalone DLL, make test_windirent.c use the same
- * redefined SQLite API calls as the above extension code does.
- * Just pull in this .c to accomplish this. As a beneficial side
- * effect, this extension becomes a single translation unit. */
-#  include "test_windirent.c"
-#endif
-
 /************************* End ../ext/misc/fileio.c ********************/
 /************************* Begin ../ext/misc/completion.c ******************/
 /*
@@ -33586,6 +33578,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
         rc = shell_exec(&data, z, &zErrMsg);
         if( zErrMsg!=0 ){
           shellEmitError(zErrMsg);
+          sqlite3_free(zErrMsg);
           if( bail_on_error ) return rc!=0 ? rc : 1;
         }else if( rc!=0 ){
           sqlite3_fprintf(stderr,"Error: unable to process SQL \"%s\"\n", z);
