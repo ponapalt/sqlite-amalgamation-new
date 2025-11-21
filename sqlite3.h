@@ -146,12 +146,12 @@ extern "C" {
 ** [sqlite3_libversion_number()], [sqlite3_sourceid()],
 ** [sqlite_version()] and [sqlite_source_id()].
 */
-#define SQLITE_VERSION        "3.51.0"
-#define SQLITE_VERSION_NUMBER 3051000
-#define SQLITE_SOURCE_ID      "2025-11-14 17:27:20 e2b3f1a9480a9be3e06c2d79abcf39f399b5adf2ca882841b3b-experimental"
+#define SQLITE_VERSION        "3.52.0"
+#define SQLITE_VERSION_NUMBER 3052000
+#define SQLITE_SOURCE_ID      "2025-11-21 17:30:44 8a230e4da230a7b103749b069a99a58e4c220873c2f9576abdc-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2025-11-14T17:27:20.581Z"
+#define SQLITE_SCM_DATETIME   "2025-11-21T17:30:44.138Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4339,6 +4339,10 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 ** [[SQLITE_LIMIT_EXPR_DEPTH]] ^(<dt>SQLITE_LIMIT_EXPR_DEPTH</dt>
 ** <dd>The maximum depth of the parse tree on any expression.</dd>)^
 **
+** [[SQLITE_LIMIT_PARSER_DEPTH]] ^(<dt>SQLITE_LIMIT_PARSER_DEPTH</dt>
+** <dd>The maximum depth of the LALR(1) parser stack used to analyze
+** input SQL statements.</dd>)^
+**
 ** [[SQLITE_LIMIT_COMPOUND_SELECT]] ^(<dt>SQLITE_LIMIT_COMPOUND_SELECT</dt>
 ** <dd>The maximum number of terms in a compound SELECT statement.</dd>)^
 **
@@ -4383,6 +4387,7 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 #define SQLITE_LIMIT_VARIABLE_NUMBER           9
 #define SQLITE_LIMIT_TRIGGER_DEPTH            10
 #define SQLITE_LIMIT_WORKER_THREADS           11
+#define SQLITE_LIMIT_PARSER_DEPTH             12
 
 /*
 ** CAPI3REF: Prepare Flags
@@ -8727,15 +8732,20 @@ SQLITE_API sqlite3_str *sqlite3_str_new(sqlite3*);
 ** errors were encountered during construction of the string.  ^The
 ** [sqlite3_str_finish(X)] interface will also return a NULL pointer if the
 ** string in [sqlite3_str] object X is zero bytes long.
+**
+** ^The [sqlite3_str_free(X)] interface destroys both the sqlite3_str object
+** X and the string content it contains.  Calling sqlite3_str_free(X) is
+** the equivalent of calling [sqlite3_free](sqlite3_str_finish(X)).
 */
 SQLITE_API char *sqlite3_str_finish(sqlite3_str*);
+SQLITE_API void sqlite3_str_free(sqlite3_str*);
 
 /*
 ** CAPI3REF: Add Content To A Dynamic String
 ** METHOD: sqlite3_str
 **
-** These interfaces add content to an sqlite3_str object previously obtained
-** from [sqlite3_str_new()].
+** These interfaces add or remove content to an sqlite3_str object
+** previously obtained from [sqlite3_str_new()].
 **
 ** ^The [sqlite3_str_appendf(X,F,...)] and
 ** [sqlite3_str_vappendf(X,F,V)] interfaces uses the [built-in printf]
@@ -8758,6 +8768,10 @@ SQLITE_API char *sqlite3_str_finish(sqlite3_str*);
 ** ^The [sqlite3_str_reset(X)] method resets the string under construction
 ** inside [sqlite3_str] object X back to zero bytes in length.
 **
+** ^The [sqlite3_str_truncate(X,N)] method changes the length of the string
+** under construction to be N bytes are less.  This routine is a no-op if
+** N is negative or if the string is already N bytes or smaller in size.
+**
 ** These methods do not return a result code.  ^If an error occurs, that fact
 ** is recorded in the [sqlite3_str] object and can be recovered by a
 ** subsequent call to [sqlite3_str_errcode(X)].
@@ -8768,6 +8782,7 @@ SQLITE_API void sqlite3_str_append(sqlite3_str*, const char *zIn, int N);
 SQLITE_API void sqlite3_str_appendall(sqlite3_str*, const char *zIn);
 SQLITE_API void sqlite3_str_appendchar(sqlite3_str*, int N, char C);
 SQLITE_API void sqlite3_str_reset(sqlite3_str*);
+SQLITE_API void sqlite3_str_truncate(sqlite3_str*,int N);
 
 /*
 ** CAPI3REF: Status Of A Dynamic String
