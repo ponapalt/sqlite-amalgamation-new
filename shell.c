@@ -683,6 +683,9 @@ void sqlite3_fsetmode(FILE *fp, int mode){
 */
 #ifndef SQLITE_QRF_H
 #define SQLITE_QRF_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stdlib.h>
 /* #include "sqlite3.h" */
 
@@ -700,9 +703,10 @@ struct sqlite3_qrf_spec {
   unsigned char bTitles;      /* True to show column names */
   unsigned char bWordWrap;    /* Try to wrap on word boundaries */
   unsigned char bTextJsonb;   /* Render JSONB blobs as JSON text */
-  unsigned char bTextNull;    /* Apply eText encoding to zNull[] */
   unsigned char eDfltAlign;   /* Default alignment, no covered by aAlignment */
   unsigned char eTitleAlign;  /* Alignment for column headers */
+  unsigned char bSplitColumn; /* Wrap single-column output into many columns */
+  unsigned char bBorder;      /* Show outer border in Box and Table styles */
   short int nWrap;            /* Wrap columns wider than this */
   short int nScreenWidth;     /* Maximum overall table width */
   short int nLineLimit;       /* Maximum number of lines for any row */
@@ -785,6 +789,7 @@ int sqlite3_format_query_result(
 #define QRF_BLOB_Hex     3 /* Hexadecimal representation */
 #define QRF_BLOB_Tcl     4 /* "\000" notation */
 #define QRF_BLOB_Json    5 /* A JSON string */
+#define QRF_BLOB_Size    6 /* Display the blob size only */
 
 /*
 ** Control-character escape modes.
@@ -848,8 +853,9 @@ int sqlite3_format_query_result(
 int sqlite3_qrf_wcwidth(int c);
 
 
-
-
+#ifdef __cplusplus
+}
+#endif
 #endif /* !defined(SQLITE_QRF_H) */
 
 /************************* End ext/qrf/qrf.h ********************/
@@ -1839,6 +1845,11 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
           }
           break;
         }
+        case QRF_BLOB_Size: {
+          int nBlob = sqlite3_column_bytes(p->pStmt,iCol);
+          sqlite3_str_appendf(pOut, "(%d-byte blob)", nBlob);
+          break;
+        }
         default: {
           const char *zTxt = (const char*)sqlite3_column_text(p->pStmt,iCol);
           qrfEncodeText(p, pOut, zTxt);
@@ -1847,11 +1858,7 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
       break;
     }
     case SQLITE_NULL: {
-      if( p->spec.bTextNull==QRF_Yes ){
-        qrfEncodeText(p, pOut, p->spec.zNull);
-      }else{
-        sqlite3_str_appendall(pOut, p->spec.zNull);
-      }
+      sqlite3_str_appendall(pOut, p->spec.zNull);
       break;
     }
     case SQLITE_TEXT: {
@@ -1895,6 +1902,17 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
       sqlite3_str_append(pOut, "...", 3);
     }
   }
+#endif
+}
+
+/* Trim spaces of the end if pOut
+*/
+static void qrfRTrim(sqlite3_str *pOut){
+#if SQLITE_VERSION_NUMBER>=3052000
+  int nByte = sqlite3_str_length(pOut);
+  const char *zOut = sqlite3_str_value(pOut);
+  while( nByte>0 && zOut[nByte-1]==' ' ){ nByte--; }
+  sqlite3_str_truncate(pOut, nByte);
 #endif
 }
 
@@ -1975,15 +1993,15 @@ static void qrfWrapLine(
   const unsigned char *z = (const unsigned char*)zIn;
   unsigned char c = 0;
 
-  if( zIn[0]==0 ){
+  if( z[0]==0 ){
     *pnThis = 0;
     *pnWide = 0;
     *piNext = 0;
     return;
   }
   n = 0;
-  for(i=0; n<w; i++){
-    c = zIn[i];
+  for(i=0; n<=w; i++){
+    c = z[i];
     if( c>=0xc0 ){
       int u;
       int len = sqlite3_qrf_decode_utf8(&z[i], &u);
@@ -1994,11 +2012,12 @@ static void qrfWrapLine(
       continue;
     }
     if( c>=' ' ){
+      if( n==w ) break;
       n++;
       continue;
     }
     if( c==0 || c=='\n' ) break;
-    if( c=='\r' && zIn[i+1]=='\n' ){ c = zIn[++i]; break; }
+    if( c=='\r' && z[i+1]=='\n' ){ c = z[++i]; break; }
     if( c=='\t' ){
       int wcw = 8 - (n&7);
       if( n+wcw>w ) break;
@@ -2007,6 +2026,8 @@ static void qrfWrapLine(
     }
     if( c==0x1b && (k = qrfIsVt100(&z[i]))>0 ){
       i += k-1;
+    }else if( n==w ){
+      break;
     }else{
       n++;
     }
@@ -2107,36 +2128,6 @@ static void qrfAppendWithTabs(
 }    
 
 /*
-** Output horizontally justified text into pOut.  The text is the
-** first nVal bytes of zVal.  Include nWS bytes of whitespace, either
-** split between both sides, or on the left, or on the right, depending
-** on eAlign.
-*/
-static void qrfPrintAligned(
-  sqlite3_str *pOut,       /* Append text here */
-  const char *zVal,        /* Text to append */
-  int nVal,                /* Use only the first nVal bytes of zVal[] */
-  int nWS,                 /* Whitespace for horizonal alignment */
-  unsigned char eAlign     /* Alignment type */
-){
-  eAlign &= QRF_ALIGN_HMASK;
-  if( eAlign==QRF_ALIGN_Center ){
-    /* Center the text */
-    sqlite3_str_appendchar(pOut, nWS/2, ' ');
-    qrfAppendWithTabs(pOut, zVal, nVal);
-    sqlite3_str_appendchar(pOut, nWS - nWS/2, ' ');
-  }else if( eAlign==QRF_ALIGN_Right){
-    /* Right justify the text */
-    sqlite3_str_appendchar(pOut, nWS, ' ');
-    qrfAppendWithTabs(pOut, zVal, nVal);
-  }else{
-    /* Left justify the next */
-    qrfAppendWithTabs(pOut, zVal, nVal);
-    sqlite3_str_appendchar(pOut, nWS, ' ');
-  }
-}
-
-/*
 ** GCC does not define the offsetof() macro so we'll have to do it
 ** ourselves.
 */
@@ -2159,14 +2150,46 @@ struct qrfColData {
   sqlite3_int64 n;         /* Number of cells.  nCol*nRow */
   char **az;               /* Content of all cells */
   int *aiWth;              /* Width of each cell */
+  unsigned char *abNum;    /* True for each numeric cell */
   struct qrfPerCol {       /* Per-column data */
     char *z;                 /* Cache of text for current row */
     int w;                   /* Computed width of this column */
     int mxW;                 /* Maximum natural (unwrapped) width */
     unsigned char e;         /* Alignment */
     unsigned char fx;        /* Width is fixed */
+    unsigned char bNum;      /* True if is numeric */
   } *a;                    /* One per column */
 };
+
+/*
+** Output horizontally justified text into pOut.  The text is the
+** first nVal bytes of zVal.  Include nWS bytes of whitespace, either
+** split between both sides, or on the left, or on the right, depending
+** on eAlign.
+*/
+static void qrfPrintAligned(
+  sqlite3_str *pOut,       /* Append text here */
+  struct qrfPerCol *pCol,  /* Information about the text to print */
+  int nVal,                /* Use only the first nVal bytes of zVal[] */
+  int nWS                 /* Whitespace for horizonal alignment */
+){
+  unsigned char eAlign = pCol->e & QRF_ALIGN_HMASK;
+  if( eAlign==QRF_Auto && pCol->bNum ) eAlign = QRF_ALIGN_Right;
+  if( eAlign==QRF_ALIGN_Center ){
+    /* Center the text */
+    sqlite3_str_appendchar(pOut, nWS/2, ' ');
+    qrfAppendWithTabs(pOut, pCol->z, nVal);
+    sqlite3_str_appendchar(pOut, nWS - nWS/2, ' ');
+  }else if( eAlign==QRF_ALIGN_Right ){
+    /* Right justify the text */
+    sqlite3_str_appendchar(pOut, nWS, ' ');
+    qrfAppendWithTabs(pOut, pCol->z, nVal);
+  }else{
+    /* Left justify the text */
+    qrfAppendWithTabs(pOut, pCol->z, nVal);
+    sqlite3_str_appendchar(pOut, nWS, ' ');
+  }
+}
 
 /*
 ** Free all the memory allocates in the qrfColData object
@@ -2176,6 +2199,7 @@ static void qrfColDataFree(qrfColData *p){
   for(i=0; i<p->n; i++) sqlite3_free(p->az[i]);
   sqlite3_free(p->az);
   sqlite3_free(p->aiWth);
+  sqlite3_free(p->abNum);
   sqlite3_free(p->a);
   memset(p, 0, sizeof(*p));
 }
@@ -2187,6 +2211,7 @@ static void qrfColDataFree(qrfColData *p){
 static int qrfColDataEnlarge(qrfColData *p){
   char **azData;
   int *aiWth;
+  unsigned char *abNum;
   p->nAlloc = 2*p->nAlloc + 10*p->nCol;
   azData = sqlite3_realloc64(p->az, p->nAlloc*sizeof(char*));
   if( azData==0 ){
@@ -2202,6 +2227,13 @@ static int qrfColDataEnlarge(qrfColData *p){
     return 1;
   }
   p->aiWth = aiWth;
+  abNum = sqlite3_realloc64(p->abNum, p->nAlloc);
+  if( abNum==0 ){
+    qrfOom(p->p);
+    qrfColDataFree(p);
+    return 1;
+  }
+  p->abNum = abNum;
   return 0;
 }
 
@@ -2211,13 +2243,18 @@ static int qrfColDataEnlarge(qrfColData *p){
 static void qrfRowSeparator(sqlite3_str *pOut, qrfColData *p, char cSep){
   int i;
   if( p->nCol>0 ){
-    sqlite3_str_append(pOut, &cSep, 1);
+    int useBorder = p->p->spec.bBorder!=QRF_No;
+    if( useBorder ){
+      sqlite3_str_append(pOut, &cSep, 1);
+    }
     sqlite3_str_appendchar(pOut, p->a[0].w+p->nMargin, '-');
     for(i=1; i<p->nCol; i++){
       sqlite3_str_append(pOut, &cSep, 1);
       sqlite3_str_appendchar(pOut, p->a[i].w+p->nMargin, '-');
     }
-    sqlite3_str_append(pOut, &cSep, 1);
+    if( useBorder ){
+      sqlite3_str_append(pOut, &cSep, 1);
+    }
   }
   sqlite3_str_append(pOut, "\n", 1);
 }
@@ -2275,13 +2312,18 @@ static void qrfBoxSeparator(
 ){
   int i;
   if( p->nCol>0 ){
-    sqlite3_str_appendall(pOut, zSep1);
+    int useBorder = p->p->spec.bBorder!=QRF_No;
+    if( useBorder ){
+      sqlite3_str_appendall(pOut, zSep1);
+    }
     qrfBoxLine(pOut, p->a[0].w+p->nMargin);
     for(i=1; i<p->nCol; i++){
       sqlite3_str_appendall(pOut, zSep2);
       qrfBoxLine(pOut, p->a[i].w+p->nMargin);
     }
-    sqlite3_str_appendall(pOut, zSep3);
+    if( useBorder ){
+      sqlite3_str_appendall(pOut, zSep3);
+    }
   }
   sqlite3_str_append(pOut, "\n", 1);
 }
@@ -2309,6 +2351,144 @@ static void qrfLoadAlignment(qrfColData *pData, Qrf *p){
 }
 
 /*
+** If the single column in pData->a[] with pData->n entries can be
+** laid out as nCol columns with a 2-space gap between each such
+** that all columns fit within nSW, then return a pointer to an array
+** of integers which is the width of each column from left to right.
+**
+** If the layout is not possible, return a NULL pointer.
+**
+** Space to hold the returned array is from sqlite_malloc64().
+*/
+static int *qrfValidLayout(
+  qrfColData *pData,   /* Collected query results */
+  Qrf *p,              /* On which to report an OOM */
+  int nCol,            /* Attempt this many columns */
+  int nSW              /* Screen width */
+){
+  int i;        /* Loop counter */
+  int nr;       /* Number of rows */
+  int w = 0;    /* Width of the current column */
+  int t;        /* Total width of all columns */
+  int *aw;      /* Array of individual column widths */
+
+  aw = sqlite3_malloc64( sizeof(int)*nCol );
+  if( aw==0 ){
+    qrfOom(p);
+    return 0;
+  }
+  nr = (pData->n + nCol - 1)/nCol;
+  for(i=0; i<pData->n; i++){
+    if( (i%nr)==0 ){
+      if( i>0 ) aw[i/nr-1] = w;
+      w = pData->aiWth[i];
+    }else if( pData->aiWth[i]>w ){
+      w = pData->aiWth[i];
+    }
+  }
+  aw[nCol-1] = w;
+  for(t=i=0; i<nCol; i++) t += aw[i];
+  t += 2*(nCol-1);
+  if( t>nSW ){
+    sqlite3_free(aw);
+    return 0;
+  }
+  return aw;
+}
+
+/*
+** The output is single-column and the bSplitColumn flag is set.
+** Check to see if the single-column output can be split into multiple
+** columns that appear side-by-side.  Adjust pData appropriately.
+*/
+static void qrfSplitColumn(qrfColData *pData, Qrf *p){
+  int nCol = 1;
+  int *aw = 0;
+  char **az = 0;
+  int *aiWth = 0;
+  unsigned char *abNum = 0;
+  int nColNext = 2;
+  int w;
+  struct qrfPerCol *a = 0;
+  sqlite3_int64 nRow = 1;
+  sqlite3_int64 i;
+  while( 1/*exit-by-break*/ ){
+    int *awNew = qrfValidLayout(pData, p, nColNext, p->spec.nScreenWidth);
+    if( awNew==0 ) break;
+    sqlite3_free(aw);
+    aw = awNew;
+    nCol = nColNext;
+    nRow = (pData->n + nCol - 1)/nCol;
+    if( nRow==1 ) break;
+    nColNext++;
+    while( (pData->n + nColNext - 1)/nColNext == nRow ) nColNext++;
+  }
+  if( nCol==1 ){
+    sqlite3_free(aw);
+    return;  /* Cannot do better than 1 column */
+  }
+  az = sqlite3_malloc64( nRow*nCol*sizeof(char*) );
+  if( az==0 ){
+    qrfOom(p);
+    return;
+  }
+  aiWth = sqlite3_malloc64( nRow*nCol*sizeof(int) );
+  if( aiWth==0 ){
+    sqlite3_free(az);
+    qrfOom(p);
+    return;
+  }
+  a = sqlite3_malloc64( nCol*sizeof(struct qrfPerCol) );
+  if( a==0 ){
+    sqlite3_free(az);
+    sqlite3_free(aiWth);
+    qrfOom(p);
+    return;
+  }
+  abNum = sqlite3_malloc64( nRow*nCol );
+  if( abNum==0 ){
+    sqlite3_free(az);
+    sqlite3_free(aiWth);
+    sqlite3_free(a);
+    qrfOom(p);
+    return;
+  }
+  for(i=0; i<pData->n; i++){
+    sqlite3_int64 j = (i%nRow)*nCol + (i/nRow);
+    az[j] = pData->az[i];
+    abNum[j]= pData->abNum[i];
+    pData->az[i] = 0;
+    aiWth[j] = pData->aiWth[i];
+  }
+  while( i<nRow*nCol ){
+    sqlite3_int64 j = (i%nRow)*nCol + (i/nRow);
+    az[j] = sqlite3_mprintf("");
+    if( az[j]==0 ) qrfOom(p);
+    aiWth[j] = 0;
+    abNum[j] = 0;
+    i++;
+  }
+  for(i=0; i<nCol; i++){
+    a[i].fx = a[i].mxW = a[i].w = aw[i];
+    a[i].e = pData->a[0].e;
+  }
+  sqlite3_free(pData->az);
+  sqlite3_free(pData->aiWth);
+  sqlite3_free(pData->a);
+  sqlite3_free(pData->abNum);
+  sqlite3_free(aw);
+  pData->az = az;
+  pData->aiWth = aiWth;
+  pData->a = a;
+  pData->abNum = abNum;
+  pData->nCol = nCol;
+  pData->n = pData->nAlloc = nRow*nCol;
+  for(i=w=0; i<nCol; i++) w += a[i].w;
+  pData->nMargin = (p->spec.nScreenWidth - w)/(nCol - 1);
+  if( pData->nMargin>5 ) pData->nMargin = 5;
+}
+
+/*
 ** Adjust the layout for the screen width restriction
 */
 static void qrfRestrictScreenWidth(qrfColData *pData, Qrf *p){
@@ -2324,6 +2504,7 @@ static void qrfRestrictScreenWidth(qrfColData *pData, Qrf *p){
     sepW = pData->nCol*2 - 2;
   }else{
     sepW = pData->nCol*3 + 1;
+    if( p->spec.bBorder==QRF_No ) sepW -= 2;
   }
   nCol = pData->nCol;
   for(i=sumW=0; i<nCol; i++) sumW += pData->a[i].w;
@@ -2335,6 +2516,7 @@ static void qrfRestrictScreenWidth(qrfColData *pData, Qrf *p){
     sepW = pData->nCol - 1;
   }else{
     sepW = pData->nCol + 1;
+    if( p->spec.bBorder==QRF_No ) sepW -= 2;
   }
   targetW = p->spec.nScreenWidth - sepW;
 
@@ -2397,6 +2579,7 @@ static void qrfColumnar(Qrf *p){
   int bWW;                                /* True to do word-wrap */
   sqlite3_str *pStr;                      /* Temporary rendering */
   qrfColData data;                        /* Columnar layout data */
+  int bRTrim;                             /* Trim trailing space */
 
   rc = sqlite3_step(p->pStmt);
   if( rc!=SQLITE_ROW || nColumn==0 ){
@@ -2406,6 +2589,7 @@ static void qrfColumnar(Qrf *p){
   /* Initialize the data container */
   memset(&data, 0, sizeof(data));
   data.nCol = p->nCol;
+  data.p = p;
   data.a = sqlite3_malloc64( nColumn*sizeof(struct qrfPerCol) );
   if( data.a==0 ){
     qrfOom(p);
@@ -2419,6 +2603,7 @@ static void qrfColumnar(Qrf *p){
   if( p->spec.bTitles==QRF_Yes ){
     unsigned char saved_eText = p->spec.eText;
     p->spec.eText = p->spec.eTitle;
+    memset(data.abNum, 0, nColumn);
     for(i=0; i<nColumn; i++){
       const char *z = (const char*)sqlite3_column_name(p->pStmt,i);
       int nNL = 0;
@@ -2443,10 +2628,12 @@ static void qrfColumnar(Qrf *p){
       char *z;
       int nNL = 0;
       int n, w;
+      int eType = sqlite3_column_type(p->pStmt,i);
       pStr = sqlite3_str_new(p->db);
       qrfRenderValue(p, pStr, i);
       n = sqlite3_str_length(pStr);
       z = data.az[data.n] = sqlite3_str_finish(pStr);
+      data.abNum[data.n] = eType==SQLITE_INTEGER || eType==SQLITE_FLOAT;
       data.aiWth[data.n] = w = qrfDisplayWidth(z, n, &nNL);
       data.n++;
       if( w>data.a[i].mxW ) data.a[i].mxW = w;
@@ -2506,8 +2693,22 @@ static void qrfColumnar(Qrf *p){
     data.a[i].w = w;
   }
 
-  /* Adjust the column widths due to screen width restrictions */
-  qrfRestrictScreenWidth(&data, p);
+  if( nColumn==1
+   && data.n>1
+   && p->spec.bSplitColumn==QRF_Yes
+   && p->spec.eStyle==QRF_STYLE_Column
+   && p->spec.bTitles==QRF_No
+   && p->spec.nScreenWidth>data.a[0].w+3
+  ){
+    /* Attempt to convert single-column tables into multi-column by
+    ** verticle wrapping, if the screen is wide enough and if the
+    ** bSplitColumn flag is set. */
+    qrfSplitColumn(&data, p);
+    nColumn = data.nCol;
+  }else{
+    /* Adjust the column widths due to screen width restrictions */
+    qrfRestrictScreenWidth(&data, p);
+  }
 
   /* Draw the line across the top of the table.  Also initialize
   ** the row boundary and column separator texts. */
@@ -2522,7 +2723,12 @@ static void qrfColumnar(Qrf *p){
         colSep = BOX_13;
         rowSep = BOX_13 "\n";
       }
-      qrfBoxSeparator(p->pOut, &data, BOX_23, BOX_234, BOX_34);
+      if( p->spec.bBorder==QRF_No){
+        rowStart += 3;
+        rowSep = "\n";
+      }else{
+        qrfBoxSeparator(p->pOut, &data, BOX_23, BOX_234, BOX_34);
+      }
       break;
     case QRF_STYLE_Table:
       if( data.nMargin ){
@@ -2534,13 +2740,26 @@ static void qrfColumnar(Qrf *p){
         colSep = "|";
         rowSep = "|\n";
       }
-      qrfRowSeparator(p->pOut, &data, '+');
+      if( p->spec.bBorder==QRF_No ){
+        rowStart += 1;
+        rowSep = "\n";
+      }else{
+        qrfRowSeparator(p->pOut, &data, '+');
+      }
       break;
-    case QRF_STYLE_Column:
+    case QRF_STYLE_Column: {
+      static const char zSpace[] = "     ";
       rowStart = "";
-      colSep = data.nMargin ? "  " : " ";
+      if( data.nMargin<2 ){
+        colSep = " ";
+      }else if( data.nMargin<=5 ){
+        colSep = &zSpace[5-data.nMargin];
+      }else{
+        colSep = zSpace;
+      }
       rowSep = "\n";
       break;
+    }
     default:  /*case QRF_STYLE_Markdown:*/
       if( data.nMargin ){
         rowStart = "| ";
@@ -2558,6 +2777,15 @@ static void qrfColumnar(Qrf *p){
   szColSep = (int)strlen(colSep);
 
   bWW = (p->spec.bWordWrap==QRF_Yes && data.bMultiRow);
+  if( p->spec.eStyle==QRF_STYLE_Column
+   || (p->spec.bBorder==QRF_No
+       && (p->spec.eStyle==QRF_STYLE_Box || p->spec.eStyle==QRF_STYLE_Table)
+      )
+  ){
+    bRTrim = 1;
+  }else{
+    bRTrim = 0;
+  }
   for(i=0; i<data.n; i+=nColumn){
     int bMore;
     int nRow = 0;
@@ -2566,7 +2794,10 @@ static void qrfColumnar(Qrf *p){
     ** (if there is a title line) or a row in the body of the table.
     ** The column number will be j.  The row number is i/nColumn.
     */
-    for(j=0; j<nColumn; j++){ data.a[j].z = data.az[i+j]; }
+    for(j=0; j<nColumn; j++){
+      data.a[j].z = data.az[i+j];
+      data.a[j].bNum = data.abNum[i+j];
+    }
     do{
       sqlite3_str_append(p->pOut, rowStart, szRowStart);
       bMore = 0;
@@ -2577,12 +2808,15 @@ static void qrfColumnar(Qrf *p){
         int nWS;
         qrfWrapLine(data.a[j].z, data.a[j].w, bWW, &nThis, &nWide, &iNext);
         nWS = data.a[j].w - nWide;
-        qrfPrintAligned(p->pOut, data.a[j].z, nThis, nWS, data.a[j].e);
+        qrfPrintAligned(p->pOut, &data.a[j], nThis, nWS);
         data.a[j].z += iNext;
-        if( data.a[j].z[0]!=0 ) bMore = 1;
+        if( data.a[j].z[0]!=0 ){
+          bMore = 1;
+        }
         if( j<nColumn-1 ){
           sqlite3_str_append(p->pOut, colSep, szColSep);
         }else{
+          if( bRTrim ) qrfRTrim(p->pOut);
           sqlite3_str_append(p->pOut, rowSep, szRowSep);
         }
       }
@@ -2596,11 +2830,13 @@ static void qrfColumnar(Qrf *p){
         }else{
           int nE = 3;
           if( nE>data.a[j].w ) nE = data.a[j].w;
-          qrfPrintAligned(p->pOut, "...", nE, data.a[j].w-nE, data.a[j].e);
+          data.a[j].z = "...";
+          qrfPrintAligned(p->pOut, &data.a[j], nE, data.a[j].w-nE);
         }
         if( j<nColumn-1 ){
           sqlite3_str_append(p->pOut, colSep, szColSep);
         }else{
+          if( bRTrim ) qrfRTrim(p->pOut);
           sqlite3_str_append(p->pOut, rowSep, szRowSep);
         }
       }
@@ -2641,10 +2877,12 @@ static void qrfColumnar(Qrf *p){
               if( j<nColumn-1 ){
                 sqlite3_str_append(p->pOut, colSep, szColSep);
               }else{
+                qrfRTrim(p->pOut);
                 sqlite3_str_append(p->pOut, rowSep, szRowSep);
               }
             }
           }else if( data.bMultiRow ){
+            qrfRTrim(p->pOut);
             sqlite3_str_append(p->pOut, "\n", 1);
           }
           break;
@@ -2654,13 +2892,15 @@ static void qrfColumnar(Qrf *p){
   }
 
   /* Draw the line across the bottom of the table */
-  switch( p->spec.eStyle ){
-    case QRF_STYLE_Box:
-      qrfBoxSeparator(p->pOut, &data, BOX_12, BOX_124, BOX_14);
-      break;
-    case QRF_STYLE_Table:
-      qrfRowSeparator(p->pOut, &data, '+');
-      break;
+  if( p->spec.bBorder!=QRF_No ){
+    switch( p->spec.eStyle ){
+      case QRF_STYLE_Box:
+        qrfBoxSeparator(p->pOut, &data, BOX_12, BOX_124, BOX_14);
+        break;
+      case QRF_STYLE_Table:
+        qrfRowSeparator(p->pOut, &data, '+');
+        break;
+    }
   }
   qrfWrite(p);
 
@@ -3110,6 +3350,11 @@ static void qrfInitialize(
   if( p->mxWidth<=0 ) p->mxWidth = QRF_MAX_WIDTH;
   p->mxHeight = p->spec.nLineLimit;
   if( p->mxHeight<=0 ) p->mxHeight = 2147483647;
+  if( p->spec.eStyle>QRF_STYLE_Table ) p->spec.eStyle = QRF_Auto;
+  if( p->spec.eEsc>QRF_ESC_Symbol ) p->spec.eEsc = QRF_Auto;
+  if( p->spec.eText>QRF_TEXT_Json ) p->spec.eText = QRF_Auto;
+  if( p->spec.eTitle>QRF_TEXT_Json ) p->spec.eTitle = QRF_Auto;
+  if( p->spec.eBlob>QRF_BLOB_Size ) p->spec.eBlob = QRF_Auto;
 qrf_reinit:
   switch( p->spec.eStyle ){
     case QRF_Auto: {
@@ -3128,7 +3373,6 @@ qrf_reinit:
     case QRF_STYLE_JObject:
     case QRF_STYLE_Json: {
       p->spec.eText = QRF_TEXT_Json;
-      p->spec.eBlob = QRF_BLOB_Json;
       p->spec.zNull = "null";
       break;
     }
@@ -3139,7 +3383,6 @@ qrf_reinit:
     }
     case QRF_STYLE_Insert: {
       p->spec.eText = QRF_TEXT_Sql;
-      p->spec.eBlob = QRF_BLOB_Sql;
       p->spec.zNull = "NULL";
       if( p->spec.zTableName==0 || p->spec.zTableName[0]==0 ){
         p->spec.zTableName = "tab";
@@ -3149,7 +3392,6 @@ qrf_reinit:
     case QRF_STYLE_Csv: {
       p->spec.eStyle = QRF_STYLE_List;
       p->spec.eText = QRF_TEXT_Csv;
-      p->spec.eBlob = QRF_BLOB_Text;
       p->spec.zColumnSep = ",";
       p->spec.zRowSep = "\r\n";
       p->spec.zNull = "";
@@ -3157,7 +3399,6 @@ qrf_reinit:
     }
     case QRF_STYLE_Quote: {
       p->spec.eText = QRF_TEXT_Sql;
-      p->spec.eBlob = QRF_BLOB_Sql;
       p->spec.zNull = "NULL";
       p->spec.zColumnSep = ",";
       p->spec.zRowSep = "\n";
@@ -5839,13 +6080,16 @@ static void hash_finish(
 *****************************************************************************/
 
 /*
-** Implementation of the sha1(X) function.
+** Two SQL functions:  sha1(X) and sha1b(X).
 **
-** Return a lower-case hexadecimal rendering of the SHA1 hash of the
-** argument X.  If X is a BLOB, it is hashed as is.  For all other
+** sha1(X) returns a lower-case hexadecimal rendering of the SHA1 hash
+** of the argument X.  If X is a BLOB, it is hashed as is.  For all other
 ** types of input, X is converted into a UTF-8 string and the string
-** is hash without the trailing 0x00 terminator.  The hash of a NULL
+** is hashed without the trailing 0x00 terminator.  The hash of a NULL
 ** value is NULL.
+**
+** sha1b(X) is the same except that it returns a 20-byte BLOB containing
+** the binary hash instead of a hexadecimal string.
 */
 static void sha1Func(
   sqlite3_context *context,
@@ -5866,11 +6110,13 @@ static void sha1Func(
     hash_step(&cx, sqlite3_value_text(argv[0]), nByte);
   }
   if( sqlite3_user_data(context)!=0 ){
+    /* sha1b() - binary result */
     hash_finish(&cx, zOut, 1);
     sqlite3_result_blob(context, zOut, 20, SQLITE_TRANSIENT);
   }else{
+    /* sha1() - hexadecimal text result */
     hash_finish(&cx, zOut, 0);
-    sqlite3_result_blob(context, zOut, 40, SQLITE_TRANSIENT);
+    sqlite3_result_text(context, zOut, 40, SQLITE_TRANSIENT);
   }
 }
 
@@ -23946,14 +24192,16 @@ static const char *qrfQuoteNames[] =
 #define MODE_List     12  /* One record per line with a separator */
 #define MODE_Markdown 13  /* Markdown formatting */
 #define MODE_Off      14  /* No query output shown */
-#define MODE_QBox     15  /* BOX with SQL-quoted content */
-#define MODE_Quote    16  /* Quote values as for SQL */
-#define MODE_Table    17  /* MySQL-style table formatting */
-#define MODE_Tabs     18  /* Tab-separated values */
-#define MODE_Tcl      19  /* Space-separated list of TCL strings */
-#define MODE_Www      20  /* Full web-page output */
+#define MODE_Psql     15  /* Similar to psql */
+#define MODE_QBox     16  /* BOX with SQL-quoted content */
+#define MODE_Quote    17  /* Quote values as for SQL */
+#define MODE_Split    18  /* Split-column mode */
+#define MODE_Table    19  /* MySQL-style table formatting */
+#define MODE_Tabs     20  /* Tab-separated values */
+#define MODE_Tcl      21  /* Space-separated list of TCL strings */
+#define MODE_Www      22  /* Full web-page output */
 
-#define MODE_BUILTIN  20  /* Maximum built-in mode */
+#define MODE_BUILTIN  22  /* Maximum built-in mode */
 #define MODE_BATCH    50  /* Default mode for batch processing */
 #define MODE_TTY      51  /* Default mode for interactive processing */
 #define MODE_USER     75  /* First user-defined mode */
@@ -23974,6 +24222,7 @@ struct ModeInfo {
   unsigned char bHdr;    /* Show headers by default.  0: n/a, 1: no 2: yes */
   unsigned char eStyle;  /* Underlying QRF style */
   unsigned char eCx;     /* 0: other, 1: line, 2: columnar */
+  unsigned char mFlg;    /* Flags. 1=border-off 2=split-column */
 };
 
 /* String constants used by built-in modes */
@@ -23984,28 +24233,30 @@ static const char *aModeStr[] =
   /* 9    10      11      12                                            */
 
 static const ModeInfo aModeInfo[] = {
-/*   zName      eCSep  eRSep eNull eText eHdr eBlob bHdr eStyle eCx */
-  { "ascii",    7,     6,    9,    1,    1,    1,   1,   12,    0 },
-  { "box",      0,     0,    9,    1,    1,    1,   2,   1,     2 },
-  { "c",        4,     1,    10,   5,    5,    4,   1,   12,    0 },
-  { "column",   0,     0,    9,    1,    1,    1,   2,   2,     2 },
-  { "count",    0,     0,    0,    0,    0,    0,   0,   3,     0 },
-  { "csv",      4,     5,    9,    3,    3,    3,   1,   12,    0 },
-  { "html",     0,     0,    9,    4,    4,    1,   2,   7,     0 },
-  { "insert",   0,     0,    10,   2,    2,    2,   1,   8,     0 },
-  { "jatom",    4,     1,    11,   6,    6,    5,   1,   12,    0 },
-  { "jobject",  0,     1,    11,   6,    6,    5,   0,   10,    0 },
-  { "json",     0,     0,    11,   6,    6,    0,   0,   9,     0 },
-  { "line",     0,     1,    9,    1,    1,    0,   0,   11,    1 },
-  { "list",     2,     1,    9,    1,    1,    1,   1,   12,    0 },
-  { "markdown", 0,     0,    9,    1,    1,    1,   2,   13,    2 },
-  { "off",      0,     0,    0,    0,    0,    0,   0,   14,    0 },
-  { "qbox",     0,     0,    9,    2,    1,    2,   2,   1,     2 },
-  { "quote",    4,     1,    10,   2,    2,    2,   1,   12,    0 },
-  { "table",    0,     0,    9,    1,    1,    1,   2,   19,    2 },
-  { "tabs",     8,     1,    9,    3,    3,    1,   1,   12,    0 },
-  { "tcl",      3,     1,    12,   5,    5,    4,   1,   12,    0 },
-  { "www",      0,     0,    9,    4,    4,    1,   2,   7,     0 }
+/*   zName      eCSep  eRSep eNull eText eHdr eBlob bHdr eStyle eCx mFlg */
+  { "ascii",    7,     6,    9,    1,    1,    0,   1,   12,    0,  0 },
+  { "box",      0,     0,    9,    1,    1,    0,   2,   1,     2,  0 },
+  { "c",        4,     1,    10,   5,    5,    4,   1,   12,    0,  0 },
+  { "column",   0,     0,    9,    1,    1,    0,   2,   2,     2,  0 },
+  { "count",    0,     0,    0,    0,    0,    0,   0,   3,     0,  0 },
+  { "csv",      4,     5,    9,    3,    3,    0,   1,   12,    0,  0 },
+  { "html",     0,     0,    9,    4,    4,    0,   2,   7,     0,  0 },
+  { "insert",   0,     0,    10,   2,    2,    0,   1,   8,     0,  0 },
+  { "jatom",    4,     1,    11,   6,    6,    0,   1,   12,    0,  0 },
+  { "jobject",  0,     1,    11,   6,    6,    0,   0,   10,    0,  0 },
+  { "json",     0,     0,    11,   6,    6,    0,   0,   9,     0,  0 },
+  { "line",     0,     1,    9,    1,    1,    0,   0,   11,    1,  0 },
+  { "list",     2,     1,    9,    1,    1,    0,   1,   12,    0,  0 },
+  { "markdown", 0,     0,    9,    1,    1,    0,   2,   13,    2,  0 },
+  { "off",      0,     0,    0,    0,    0,    0,   0,   14,    0,  0 },
+  { "psql",     0,     0,    9,    1,    1,    0,   2,   19,    2,  1 },
+  { "qbox",     0,     0,    10,   2,    1,    0,   2,   1,     2,  0 },
+  { "quote",    4,     1,    10,   2,    2,    0,   1,   12,    0,  0 },
+  { "split",    0,     0,    9,    1,    1,    0,   1,   2,     2,  2 },
+  { "table",    0,     0,    9,    1,    1,    0,   2,   19,    2,  0 },
+  { "tabs",     8,     1,    9,    3,    3,    0,   1,   12,    0,  0 },
+  { "tcl",      3,     1,    12,   5,    5,    4,   1,   12,    0,  0 },
+  { "www",      0,     0,    9,    4,    4,    0,   2,   7,     0,  0 }
 };     /*       |     /     /      |     /    /     |    |       \
        **       |    /     /       |    /    /      |    |        \_ 2: columnar
        ** Index into aModeStr[]    |   /    /       |    |           1: line
@@ -24015,12 +24266,13 @@ static const ModeInfo aModeInfo[] = {
        **      v-------------------'      |   hdrs? |       The QRF style
        **      0: n/a                blob |   v-----'
        **      1: plain        v_---------'   0: n/a
-       **      2: sql          0: n/a         1: no         
+       **      2: sql          0: auto        1: no         
        **      3: csv          1: as-text     2: yes
        **      4: html         2: sql
        **      5: c            3: hex
        **      6: json         4: c
        **                      5: json
+       **                      6: size
        ******************************************************************/
 /*
 ** These are the column/row/line separators used by the various
@@ -24130,6 +24382,17 @@ static void modeChange(ShellState *p, unsigned char eMode){
     pM->spec.eBlob = pI->eBlob;
     pM->spec.bTitles = pI->bHdr;
     pM->spec.eTitle = pI->eHdr;
+    if( pI->mFlg & 0x01 ){
+      pM->spec.bBorder = QRF_No;
+    }else{
+      pM->spec.bBorder = QRF_Auto;
+    }
+    if( pI->mFlg & 0x02 ){
+      pM->spec.bSplitColumn = QRF_Yes;
+      pM->bAutoScreenWidth = 1;
+    }else{
+      pM->spec.bSplitColumn = QRF_No;
+    }
   }else if( eMode>=MODE_USER && eMode-MODE_USER<p->nSavedModes ){
     modeFree(&p->mode);
     modeDup(&p->mode, &p->aSavedModes[eMode-MODE_USER].mode);
@@ -25704,6 +25967,13 @@ static int shell_exec(
   if( pArg->mode.bAutoScreenWidth ){
     spec.nScreenWidth = shellScreenWidth();
   }
+  if( spec.eBlob==QRF_BLOB_Auto ){
+    switch( spec.eText ){
+      case QRF_TEXT_Sql:  spec.eBlob = QRF_BLOB_Sql;   break;
+      case QRF_TEXT_Json: spec.eBlob = QRF_BLOB_Json;  break;
+      default:            spec.eBlob = QRF_BLOB_Text;  break;
+    }
+  }
 
 #if !defined(SQLITE_OMIT_VIRTUALTABLE) && !defined(SQLITE_OMIT_AUTHORIZATION)
   if( pArg->expert.pExpert ){
@@ -26071,6 +26341,8 @@ static int dump_callback(void *pArg, int nArg, char **azArg, char **azNotUsed){
     savedMode = p->mode;
     p->mode.spec.zTableName = (char*)zTable;
     p->mode.eMode = MODE_Insert;
+    p->mode.spec.eText = QRF_TEXT_Sql;
+    p->mode.spec.eBlob = QRF_BLOB_Sql;
     p->mode.spec.bTitles = QRF_No;
     rc = shell_exec(p, sSelect.zTxt, 0);
     if( (rc&0xff)==SQLITE_CORRUPT ){
@@ -26421,9 +26693,9 @@ static const struct {
   { ".mode",
 "USAGE: .mode [MODE] [OPTIONS]\n"
 "\n"
-"Change the output mode to MODE and/or apply OPTIONS to the\n"
-"output mode.  If no arguments, show the current output mode\n"
-"and relevant options.\n"
+"Change the output mode to MODE and/or apply OPTIONS to the output mode.\n"
+"Arguments are processed from left to right.  If no arguments, show the\n"
+"current output mode and relevant options.\n"
 "\n"
 "Options:\n"
 "  --align STRING           Set the alignment of text in columnar modes\n"
@@ -26431,17 +26703,22 @@ static const struct {
 "                           meaning \"left\", \"centered\", and \"right\", with\n"
 "                           one letter per column starting from the left.\n"
 "                           Unspecified alignment defaults to 'L'.\n"
+"  --blob-quote ARG         ARG can be \"auto\", \"text\", \"sql\", \"hex\", \"tcl\",\n"
+"                           \"json\", or \"size\".  Default is \"auto\".\n"
+"  --border on|off          Show outer border on \"box\" and \"table\" modes.\n"
 "  --charlimit N            Set the maximum number of output characters to\n"
 "                           show for any single SQL value to N. Longer values\n"
 "                           truncated. Zero means \"no limit\".\n"
 "  --colsep STRING          Use STRING as the column separator\n"
 "  --escape ESC             Enable/disable escaping of control characters\n"
-"                           in output. ESC can be \"off\", \"ascii\", or\n"
-"                           \"symbol\".\n"
+"                           found in the output. ESC can be \"off\", \"ascii\",\n"
+"                           or \"symbol\".\n"
 "  --linelimit N            Set the maximum number of output lines to show for\n"
 "                           any single SQL value to N. Longer values are\n"
 "                           truncated. Zero means \"no limit\". Only works\n"
 "                           in \"line\" mode and in columnar modes.\n"
+"  --limits L,C             Shorthand for \"--linelimit L --charlimit C\".\n"
+"                           Or \"off\" to mean \"0,0\".  Or \"on\" for \"5,300\".\n"
 "  --list                   List available modes\n"
 "  --null STRING            Render SQL NULL values as the given string\n"
 "  --once                   Setting changes to the right are reverted after\n"
@@ -26449,10 +26726,10 @@ static const struct {
 "  --quote ARG              Enable/disable quoting of text. ARG can be\n"
 "                           \"off\", \"on\", \"sql\", \"csv\", \"html\", \"tcl\",\n"
 "                           or \"json\".  \"off\" means show the text as-is.\n"
-"                           \"on and \"sql\" are synonyms.\n"
+"                           \"on\" is an alias for \"sql\".\n"
 "  --reset                  Changes all mode settings back to their default.\n"
 "  --rowsep STRING          Use STRING as the row separator\n"
-"  --screenwidth N          Declare the screen width of the output device\n"
+"  --sw|--screenwidth N     Declare the screen width of the output device\n"
 "                           to be N characters.  An attempt may be made to\n"
 "                           wrap output text to fit within this limit. Zero\n"
 "                           means \"no limit\".  Or N can be \"auto\" to set the\n"
@@ -26460,7 +26737,7 @@ static const struct {
 "  --tablename NAME         Set the name of the table for \"insert\" mode.\n"
 "  --tag NAME               Save mode to the left as NAME.\n"
 "  --textjsonb BOOLEAN      If enabled, JSONB text is displayed as text JSON.\n"
-"  --title  ARG             Whether or not to show column headers, and if so\n"
+"  --title ARG              Whether or not to show column headers, and if so\n"
 "                           how to encode them.  ARG can be \"off\", \"on\",\n"
 "                           \"sql\", \"csv\", \"html\", \"tcl\", or \"json\".\n"
 "  -v|--verbose             Verbose output\n"
@@ -30300,9 +30577,9 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **
 ** USAGE: .mode [MODE] [OPTIONS]
 **
-** Change the output mode to MODE and/or apply OPTIONS to the
-** output mode.  If no arguments, show the current output mode
-** and relevant options.
+** Change the output mode to MODE and/or apply OPTIONS to the output mode.
+** Arguments are processed from left to right.  If no arguments, show the
+** current output mode and relevant options.
 **
 ** Options:
 **   --align STRING           Set the alignment of text in columnar modes
@@ -30310,17 +30587,22 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **                            meaning "left", "centered", and "right", with
 **                            one letter per column starting from the left.
 **                            Unspecified alignment defaults to 'L'.
+**   --blob-quote ARG         ARG can be "auto", "text", "sql", "hex", "tcl",
+**                            "json", or "size".  Default is "auto".
+**   --border on|off          Show outer border on "box" and "table" modes.
 **   --charlimit N            Set the maximum number of output characters to
 **                            show for any single SQL value to N. Longer values
 **                            truncated. Zero means "no limit".
 **   --colsep STRING          Use STRING as the column separator
 **   --escape ESC             Enable/disable escaping of control characters
-**                            in output. ESC can be "off", "ascii", or
-**                            "symbol".
+**                            found in the output. ESC can be "off", "ascii",
+**                            or "symbol".
 **   --linelimit N            Set the maximum number of output lines to show for
 **                            any single SQL value to N. Longer values are
 **                            truncated. Zero means "no limit". Only works
 **                            in "line" mode and in columnar modes.
+**   --limits L,C             Shorthand for "--linelimit L --charlimit C".
+**                            Or "off" to mean "0,0".  Or "on" for "5,300".
 **   --list                   List available modes
 **   --null STRING            Render SQL NULL values as the given string
 **   --once                   Setting changes to the right are reverted after
@@ -30328,10 +30610,10 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **   --quote ARG              Enable/disable quoting of text. ARG can be
 **                            "off", "on", "sql", "csv", "html", "tcl",
 **                            or "json".  "off" means show the text as-is.
-**                            "on and "sql" are synonyms.
+**                            "on" is an alias for "sql".
 **   --reset                  Changes all mode settings back to their default.
 **   --rowsep STRING          Use STRING as the row separator
-**   --screenwidth N          Declare the screen width of the output device
+**   --sw|--screenwidth N     Declare the screen width of the output device
 **                            to be N characters.  An attempt may be made to
 **                            wrap output text to fit within this limit. Zero
 **                            means "no limit".  Or N can be "auto" to set the
@@ -30339,7 +30621,7 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **   --tablename NAME         Set the name of the table for "insert" mode.
 **   --tag NAME               Save mode to the left as NAME.
 **   --textjsonb BOOLEAN      If enabled, JSONB text is displayed as text JSON.
-**   --title  ARG             Whether or not to show column headers, and if so
+**   --title ARG              Whether or not to show column headers, and if so
 **                            how to encode them.  ARG can be "off", "on",
 **                            "sql", "csv", "html", "tcl", or "json".
 **   -v|--verbose             Verbose output
@@ -30413,6 +30695,29 @@ static int dotCmdMode(ShellState *p){
              "Should contain only characters L, C, and R.");
         return 1;
       }
+    }else if( pickStr(z,0,"-blob","-blob-quote","")>=0 ){
+      if( (++i)>=nArg ){
+        dotCmdError(p, i-1, "missing argument", 0);
+        return 1;
+      }
+      k = pickStr(azArg[i], 0,
+                    "auto", "text", "sql", "hex", "tcl", "json", "size", "");
+        /*           0       1       2      3      4      5       6
+        ** Must match QRF_BLOB_xxxx values.  See also tag-20251124a */
+      if( k>=0 ){
+        p->mode.spec.eBlob = k & 0xff;
+      }
+      chng = 1;
+    }else if( optionMatch(z,"border") ){
+      if( (++i)>=nArg ){
+        dotCmdError(p, i-1, "missing argument", 0);
+        return 1;
+      }
+      k = pickStr(azArg[i], 0, "auto", "off", "on", "");
+      if( k>=0 ){
+        p->mode.spec.bBorder = k & 0x3;
+      }
+      chng = 1;
     }else if( 0<=(k=pickStr(z,0,"-charlimit","-linelimit","")) ){
       int w;                /*   0            1  */
       if( i+1>=nArg ){
@@ -30443,11 +30748,10 @@ static int dotCmdMode(ShellState *p){
     }else if( optionMatch(z,"escape") ){
       /* See similar code at tag-20250224-1 */
       char *zErr = 0;
-      if( i+1>=nArg ){
-        dotCmdError(p, i, "missing argument", 0);
+      if( (++i)>=nArg ){
+        dotCmdError(p, i-1, "missing argument", 0);
         return 1;
-      }
-      i++;                    /*  0     1       2  <-- One less than QRF_ESC_ */
+      }                       /*  0     1       2  <-- One less than QRF_ESC_ */
       k = pickStr(azArg[i],&zErr,"off","ascii","symbol","");
       if( k<0 ){
         dotCmdError(p, i, "unknown escape type", "%s", zErr);
@@ -30455,6 +30759,30 @@ static int dotCmdMode(ShellState *p){
         return 1;
       }
       p->mode.spec.eEsc = k+1;
+      chng = 1;
+    }else if( optionMatch(z,"limits") ){
+      if( (++i)>=nArg ){
+        dotCmdError(p, i-1, "missing argument", 0);
+        return 1;
+      }
+      k = pickStr(azArg[i],0,"on","off","");
+      if( k==0 ){
+        p->mode.spec.nLineLimit = 5;
+        p->mode.spec.nCharLimit = 300;
+      }else if( k==1 ){
+        p->mode.spec.nLineLimit = 0;
+        p->mode.spec.nCharLimit = 0;
+      }else{
+        int L, C;
+        int nNum = sscanf(azArg[i], "%d,%d", &L, &C);
+        if( nNum!=2 || L<0 || C<0 ){
+          dotCmdError(p, i, "bad argument", "Should be \"L,C\" where L and C"
+                            " are unsigned integers");
+          return 1;
+        }        
+        p->mode.spec.nLineLimit = L;
+        p->mode.spec.nCharLimit = C;
+      }
       chng = 1;
     }else if( optionMatch(z,"list") ){
       int ii;
@@ -30467,6 +30795,17 @@ static int dotCmdMode(ShellState *p){
         cli_printf(p->out, " %s", p->aSavedModes[ii].zTag);
       }
       cli_puts(" batch tty\n", p->out);
+      chng = 1;  /* Not really a change, but we still want to suppress the
+                 ** "current mode" output */
+    }else if( optionMatch(z,"once") ){
+      p->nPopMode = 0;
+      modePush(p);
+      p->nPopMode = 1;
+    }else if( optionMatch(z,"noquote") ){
+      /* (undocumented legacy) --noquote always turns quoting off */
+      p->mode.spec.eText = QRF_TEXT_Plain;
+      p->mode.spec.eBlob = QRF_BLOB_Auto;
+      chng = 1;
     }else if( optionMatch(z,"quote") ){
       if( i+1<nArg
        && azArg[i+1][0]!='-'
@@ -30493,64 +30832,50 @@ static int dotCmdMode(ShellState *p){
       }
       switch( k ){
         case 1:  /* on */
+          modeSetStr(&p->mode.spec.zNull, "NULL");
+          /* Fall through */
         case 2:  /* sql */
           p->mode.spec.eText = QRF_TEXT_Sql;
-          p->mode.spec.eBlob = QRF_BLOB_Sql;
           break;
         case 3:  /* csv */
           p->mode.spec.eText = QRF_TEXT_Csv;
-          p->mode.spec.eBlob = QRF_BLOB_Text;
           break;
         case 4:  /* html */
           p->mode.spec.eText = QRF_TEXT_Html;
-          p->mode.spec.eBlob = QRF_BLOB_Text;
           break;
         case 5:  /* tcl */
           p->mode.spec.eText = QRF_TEXT_Tcl;
-          p->mode.spec.eBlob = QRF_BLOB_Text;
           break;
         case 6:  /* json */
           p->mode.spec.eText = QRF_TEXT_Json;
-          p->mode.spec.eBlob = QRF_BLOB_Json;
           break;
-        default:  /* off */
+        default: /* off */
           p->mode.spec.eText = QRF_TEXT_Plain;
-          p->mode.spec.eBlob = QRF_BLOB_Text;
           break;
       }
-      chng = 1;
-    }else if( optionMatch(z,"once") ){
-      p->nPopMode = 0;
-      modePush(p);
-      p->nPopMode = 1;
-    }else if( optionMatch(z,"noquote") ){
-      /* (undocumented legacy) --noquote always turns quoting off */
-      p->mode.spec.eText = QRF_TEXT_Plain;
-      p->mode.spec.eBlob = QRF_BLOB_Text;
       chng = 1;
     }else if( optionMatch(z,"reset") ){
       int saved_eMode = p->mode.eMode;
       modeFree(&p->mode);
       modeChange(p, saved_eMode);
-    }else if( optionMatch(z,"screenwidth") ){
-      if( i+1>=nArg ){
-        dotCmdError(p, i, "missing argument", 0);
+    }else if( optionMatch(z,"screenwidth") || optionMatch(z,"sw") ){
+      if( (++i)>=nArg ){
+        dotCmdError(p, i-1, "missing argument", 0);
         return 1;
       }
-      k = pickStr(azArg[i+1],0,"off","auto","");
+      k = pickStr(azArg[i],0,"off","auto","");
       if( k==0 ){
         p->mode.bAutoScreenWidth = 0;
         p->mode.spec.nScreenWidth = 0;
       }else if( k==1 ){
         p->mode.bAutoScreenWidth = 1;
       }else{
-        i64 w = integerValue(azArg[i+1]);
+        i64 w = integerValue(azArg[i]);
         p->mode.bAutoScreenWidth = 0;
         if( w<0 ) w = 0;
         if( w>QRF_MAX_WIDTH ) w = QRF_MAX_WIDTH;
         p->mode.spec.nScreenWidth = w;
       }
-      i++;
       chng = 1;
     }else if( optionMatch(z,"tag") ){
       size_t nByte;
@@ -30614,12 +30939,12 @@ static int dotCmdMode(ShellState *p){
       ** specify, so strlen(zW) bytes should be plenty of space to hold the
       ** result. */
       aWidth = malloc( strlen(zW) );
-      while( isspace(zW[0]) ) zW++;
+      while( IsSpace(zW[0]) ) zW++;
       while( zW[0] ){
         int w = 0;
         int nDigit = 0;
-        k = zW[0]=='-' && isdigit(zW[1]);
-        while( isdigit(zW[k]) ){
+        k = zW[0]=='-' && IsDigit(zW[1]);
+        while( IsDigit(zW[k]) ){
           w = w*10 + zW[k] - '0';
           if( w>QRF_MAX_WIDTH ){
             dotCmdError(p,i+1,"width too big",
@@ -30640,7 +30965,7 @@ static int dotCmdMode(ShellState *p){
         aWidth[nWidth++] = w;
         zW += k;
         if( zW[0]==',' ) zW++;
-        while( isspace(zW[0]) ) zW++;
+        while( IsSpace(zW[0]) ) zW++;
       }
       free(p->mode.spec.aWidth);
       p->mode.spec.aWidth = aWidth;
@@ -30695,7 +31020,21 @@ static int dotCmdMode(ShellState *p){
       }
       sqlite3_str_append(pDesc, "\"", 1);
     }
-    if( bAll || p->mode.spec.nCharLimit>0 ){
+    if( bAll
+     || (p->mode.spec.bBorder==QRF_No) != ((pI->mFlg&1)!=0)
+    ){
+      sqlite3_str_appendf(pDesc," --border %s",
+             p->mode.spec.bBorder==QRF_No ? "off" : "on");
+    }
+    if( bAll || p->mode.spec.eBlob!=QRF_BLOB_Auto ){
+      const char *azBQuote[] =
+           { "auto", "text", "sql", "hex", "tcl", "json", "size" };
+      /*      0       1       2      3      4      5       6
+      ** Must match QRF_BLOB_xxxx values.  See all instances of tag-20251124a */
+      u8 e = p->mode.spec.eBlob;
+      sqlite3_str_appendf(pDesc, " --blob-quote %s", azBQuote[e]);
+    }
+    if( !bAll && p->mode.spec.nLineLimit==0 && p->mode.spec.nCharLimit>0 ){
       sqlite3_str_appendf(pDesc, " --charlimit %d",p->mode.spec.nCharLimit);
     }
     zSetting = aModeStr[pI->eCSep];
@@ -30706,7 +31045,15 @@ static int dotCmdMode(ShellState *p){
     if( bAll || p->mode.spec.eEsc!=QRF_Auto ){
       sqlite3_str_appendf(pDesc, " --escape %s",qrfEscNames[p->mode.spec.eEsc]);
     }
-    if( bAll || (p->mode.spec.nLineLimit>0 && pI->eCx>0) ){
+    if( bAll || (p->mode.spec.nLineLimit>0 && p->mode.spec.nCharLimit>0) ){
+      if( p->mode.spec.nLineLimit==0 && p->mode.spec.nCharLimit==0 ){
+        sqlite3_str_appendf(pDesc, " --limits off");
+      }else{
+        sqlite3_str_appendf(pDesc, " --limits %d,%d",
+           p->mode.spec.nLineLimit, p->mode.spec.nCharLimit);
+      }
+    }else 
+    if( p->mode.spec.nCharLimit==0 && p->mode.spec.nLineLimit>0 && pI->eCx>0 ){
       sqlite3_str_appendf(pDesc, " --linelimit %d",p->mode.spec.nLineLimit);
     }
     zSetting = aModeStr[pI->eNull];
@@ -31079,9 +31426,10 @@ dotCmdOutput_error:
   sqlite3_free(zFile);
   return 1;
 }
+
 /*
-** Parse input line zLine up into individual arguments.  Retain the
-** parse in the p->dot substructure.
+** Enlarge the space allocated in p->dot so that it can hold more
+** than nArg parsed command-line arguments.
 */
 static void parseDotRealloc(ShellState *p, int nArg){
   p->dot.nAlloc = nArg+22;
@@ -31092,15 +31440,29 @@ static void parseDotRealloc(ShellState *p, int nArg){
   p->dot.abQuot = realloc(p->dot.abQuot,p->dot.nAlloc);
   shell_check_oom(p->dot.abQuot);
 }
+
+
+/*
+** Parse input line zLine up into individual arguments.  Retain the
+** parse in the p->dot substructure.
+*/
 static void parseDotCmdArgs(const char *zLine, ShellState *p){
   char *z;
   int h = 1;
   int nArg = 0;
+  size_t szLine;
 
   p->dot.zOrig = zLine;
   free(p->dot.zCopy);
   z = p->dot.zCopy = strdup(zLine);
   shell_check_oom(z);
+  szLine = strlen(z);
+  while( szLine>0 && IsSpace(z[szLine-1]) ) szLine--;
+  if( szLine>0 && z[szLine-1]==';' && p->iCompat>=20251115 ){
+    szLine--;
+    while( szLine>0 && IsSpace(z[szLine-1]) ) szLine--;
+  }
+  z[szLine] = 0;
   parseDotRealloc(p, 2);
   while( z[h] ){
     while( IsSpace(z[h]) ){ h++; }
@@ -33409,11 +33771,9 @@ static int do_meta_command(const char *zLine, ShellState *p){
                  || cli_strncmp(azArg[0], "indexes", n)==0) )
   ){
     sqlite3_stmt *pStmt;
-    char **azResult;
-    int nRow, nAlloc;
-    int ii;
-    ShellText s;
-    initText(&s);
+    sqlite3_str *pSql;
+    const char *zPattern = nArg>1 ? azArg[1] : 0;
+
     open_db(p, 0);
     rc = sqlite3_prepare_v2(p->db, "PRAGMA database_list", -1, &pStmt, 0);
     if( rc ){
@@ -33430,86 +33790,46 @@ static int do_meta_command(const char *zLine, ShellState *p){
       sqlite3_finalize(pStmt);
       goto meta_command_exit;
     }
-    for(ii=0; sqlite3_step(pStmt)==SQLITE_ROW; ii++){
+    pSql = sqlite3_str_new(p->db);
+    while( sqlite3_step(pStmt)==SQLITE_ROW ){
       const char *zDbName = (const char*)sqlite3_column_text(pStmt, 1);
       if( zDbName==0 ) continue;
-      if( s.zTxt && s.zTxt[0] ) appendText(&s, " UNION ALL ", 0);
-      if( sqlite3_stricmp(zDbName, "main")==0 ){
-        appendText(&s, "SELECT name FROM ", 0);
-      }else{
-        appendText(&s, "SELECT ", 0);
-        appendText(&s, zDbName, '\'');
-        appendText(&s, "||'.'||name FROM ", 0);
+      if( sqlite3_str_length(pSql) ){
+        sqlite3_str_appendall(pSql, " UNION ALL ");
       }
-      appendText(&s, zDbName, '"');
-      appendText(&s, ".sqlite_schema ", 0);
-      if( c=='t' ){
-        appendText(&s," WHERE type IN ('table','view')"
-                      "   AND name NOT LIKE 'sqlite__%' ESCAPE '_'"
-                      "   AND name LIKE ?1", 0);
+      if( sqlite3_stricmp(zDbName, "main")==0 ){
+        sqlite3_str_appendall(pSql, "SELECT name FROM ");
       }else{
-        appendText(&s," WHERE type='index'"
-                      "   AND tbl_name LIKE ?1", 0);
+        sqlite3_str_appendf(pSql, "SELECT %Q||'.'||name FROM ", zDbName);
+      }
+      sqlite3_str_appendf(pSql, "\"%w\".sqlite_schema", zDbName);
+      if( c=='t' ){
+        sqlite3_str_appendf(pSql,
+            " WHERE type IN ('table','view')"
+            "   AND name NOT LIKE 'sqlite__%%' ESCAPE '_'"
+        );
+        if( zPattern ){
+          sqlite3_str_appendf(pSql," AND name LIKE %Q", zPattern);
+        }
+      }else{
+        sqlite3_str_appendf(pSql, " WHERE type='index'");
+        if( zPattern ){
+          sqlite3_str_appendf(pSql," AND tbl_name LIKE %Q", zPattern);
+        }
       }
     }
     rc = sqlite3_finalize(pStmt);
     if( rc==SQLITE_OK ){
-      appendText(&s, " ORDER BY 1", 0);
-      rc = sqlite3_prepare_v2(p->db, s.zTxt, -1, &pStmt, 0);
+      sqlite3_str_appendall(pSql, " ORDER BY 1");
     }
-    freeText(&s);
+
+    /* Run the SQL statement in "split" mode. */
+    modePush(p);
+    modeChange(p, MODE_Split);
+    shell_exec(p, sqlite3_str_value(pSql), 0);
+    sqlite3_str_free(pSql);
+    modePop(p);
     if( rc ) return shellDatabaseError(p->db);
-
-    /* Run the SQL statement prepared by the above block. Store the results
-    ** as an array of nul-terminated strings in azResult[].  */
-    nRow = nAlloc = 0;
-    azResult = 0;
-    if( nArg>1 ){
-      sqlite3_bind_text(pStmt, 1, azArg[1], -1, SQLITE_TRANSIENT);
-    }else{
-      sqlite3_bind_text(pStmt, 1, "%", -1, SQLITE_STATIC);
-    }
-    while( sqlite3_step(pStmt)==SQLITE_ROW ){
-      if( nRow>=nAlloc ){
-        char **azNew;
-        sqlite3_int64 n2 = 2*(sqlite3_int64)nAlloc + 10;
-        azNew = sqlite3_realloc64(azResult, sizeof(azResult[0])*n2);
-        shell_check_oom(azNew);
-        nAlloc = (int)n2;
-        azResult = azNew;
-      }
-      azResult[nRow] = sqlite3_mprintf("%s", sqlite3_column_text(pStmt, 0));
-      shell_check_oom(azResult[nRow]);
-      nRow++;
-    }
-    if( sqlite3_finalize(pStmt)!=SQLITE_OK ){
-      rc = shellDatabaseError(p->db);
-    }
-
-    /* Pretty-print the contents of array azResult[] to the output */
-    if( rc==0 && nRow>0 ){
-      int len, maxlen = 0;
-      int i, j;
-      int nPrintCol, nPrintRow;
-      for(i=0; i<nRow; i++){
-        len = strlen30(azResult[i]);
-        if( len>maxlen ) maxlen = len;
-      }
-      nPrintCol = shellScreenWidth()/(maxlen+2);
-      if( nPrintCol<1 ) nPrintCol = 1;
-      nPrintRow = (nRow + nPrintCol - 1)/nPrintCol;
-      for(i=0; i<nPrintRow; i++){
-        for(j=i; j<nRow; j+=nPrintRow){
-          char *zSp = j<nPrintRow ? "" : "  ";
-          cli_printf(p->out,
-               "%s%-*s", zSp, maxlen, azResult[j] ? azResult[j]:"");
-        }
-        cli_puts("\n", p->out);
-      }
-    }
-
-    for(ii=0; ii<nRow; ii++) sqlite3_free(azResult[ii]);
-    sqlite3_free(azResult);
   }else
 
 #ifndef SQLITE_SHELL_FIDDLE
@@ -35364,7 +35684,8 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
 #else
     cli_printf(stderr,
                     "%s: Error: no database filename specified\n", Argv0);
-    return 1;
+    rc = 1;
+    goto shell_main_exit;
 #endif
   }
   data.out = stdout;
@@ -35418,6 +35739,8 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       modeChange(&data, MODE_Markdown);
     }else if( cli_strcmp(z,"-table")==0 ){
       modeChange(&data, MODE_Table);
+    }else if( cli_strcmp(z,"-psql")==0 ){
+      modeChange(&data, MODE_Psql);
     }else if( cli_strcmp(z,"-box")==0 ){
       modeChange(&data, MODE_Box);
     }else if( cli_strcmp(z,"-csv")==0 ){
@@ -35504,7 +35827,8 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
     }else if( cli_strcmp(z,"-version")==0 ){
       cli_printf(stdout, "%s %s (%d-bit)\n",
             sqlite3_libversion(), sqlite3_sourceid(), 8*(int)sizeof(char*));
-      return 0;
+      rc = 0;
+      goto shell_main_exit;
     }else if( cli_strcmp(z,"-interactive")==0 ){
       /* Need to check for interactive override here to so that it can
       ** affect console setup (for Windows only) and testing thereof.
@@ -35561,25 +35885,29 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       z = cmdline_option_value(argc,argv,++i);
       if( z[0]=='.' ){
         rc = do_meta_command(z, &data);
-        if( rc && bail_on_error ) return rc==2 ? 0 : rc;
+        if( rc && bail_on_error ){
+          if( rc==2 ) rc = 0;
+          goto shell_main_exit;
+        }
       }else{
         open_db(&data, 0);
         rc = shell_exec(&data, z, &zErrMsg);
         if( zErrMsg!=0 ){
           shellEmitError(zErrMsg);
           sqlite3_free(zErrMsg);
-          if( bail_on_error ) return rc!=0 ? rc : 1;
+          if( !rc ) rc = 1;
         }else if( rc!=0 ){
           cli_printf(stderr,"Error: unable to process SQL \"%s\"\n", z);
-          if( bail_on_error ) return rc;
         }
+        if( bail_on_error ) goto shell_main_exit;
       }
 #if !defined(SQLITE_OMIT_VIRTUALTABLE) && defined(SQLITE_HAVE_ZLIB)
     }else if( cli_strncmp(z, "-A", 2)==0 ){
       if( nCmd>0 ){
         cli_printf(stderr,"Error: cannot mix regular SQL or dot-commands"
               " with \"%s\"\n", z);
-        return 1;
+        rc = 1;
+        goto shell_main_exit;
       }
       open_db(&data, OPEN_DB_ZIPFILE);
       if( z[2] ){
@@ -35599,7 +35927,8 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
     }else{
       cli_printf(stderr,"%s: Error: unknown option: %s\n", Argv0, z);
       eputz("Use -help for a list of options.\n");
-      return 1;
+      rc = 1;
+      goto shell_main_exit;
     }
   }
 
@@ -35637,6 +35966,16 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
           if( rc==0 ) rc = 1;
           goto shell_main_exit;
         }
+        if( data.nPopMode ){
+          modePop(&data);
+          data.nPopMode = 0;
+        }
+      }
+      if( data.nPopOutput ){
+        output_reset(&data);
+        data.nPopOutput = 0;
+      }else{
+        clearTempFile(&data);
       }
     }
   }else{
