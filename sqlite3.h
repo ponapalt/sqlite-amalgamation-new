@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.52.0"
 #define SQLITE_VERSION_NUMBER 3052000
-#define SQLITE_SOURCE_ID      "2025-11-28 16:23:24 66b0f28958311204270053ef1d5e66c0ad04e3a52f2570c543b-experimental"
+#define SQLITE_SOURCE_ID      "2025-12-05 16:06:34 c320c5585833e5e6460c61f88ba4d784613c4317b1e50eae0d5-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2025-11-28T16:23:24.108Z"
+#define SQLITE_SCM_DATETIME   "2025-12-05T16:06:34.367Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -1490,7 +1490,7 @@ typedef const char *sqlite3_filename;
 ** greater and the function pointer is not NULL) and will fall back
 ** to xCurrentTime() if xCurrentTimeInt64() is unavailable.
 **
-** ^The xSetSystemCall(), xGetSystemCall(), and xNestSystemCall() interfaces
+** ^The xSetSystemCall(), xGetSystemCall(), and xNextSystemCall() interfaces
 ** are not used by the SQLite core.  These optional interfaces are provided
 ** by some VFSes to facilitate testing of the VFS code. By overriding
 ** system calls with functions under its control, a test program can
@@ -4174,6 +4174,7 @@ SQLITE_API void sqlite3_free_filename(sqlite3_filename);
 ** <li> sqlite3_errmsg()
 ** <li> sqlite3_errmsg16()
 ** <li> sqlite3_error_offset()
+** <li> sqlite3_db_handle()
 ** </ul>
 **
 ** ^The sqlite3_errmsg() and sqlite3_errmsg16() return English-language
@@ -8730,7 +8731,7 @@ SQLITE_API sqlite3_str *sqlite3_str_new(sqlite3*);
 ** pass the returned value to [sqlite3_free()] to avoid a memory leak.
 ** ^The [sqlite3_str_finish(X)] interface may return a NULL pointer if any
 ** errors were encountered during construction of the string.  ^The
-** [sqlite3_str_finish(X)] interface will also return a NULL pointer if the
+** [sqlite3_str_finish(X)] interface might also return a NULL pointer if the
 ** string in [sqlite3_str] object X is zero bytes long.
 **
 ** ^The [sqlite3_str_free(X)] interface destroys both the sqlite3_str object
