@@ -37,7 +37,7 @@
 **
 ** To modify this program, get a copy of the canonical SQLite source tree,
 ** edit the src/shell.c.in file and/or some of the other files that are
-** listed above, then rerun the rerun "make shell.c".
+** listed above, then rerun the command "make shell.c".
 */
 /************************* Begin src/shell.c.in ******************/
 /*
@@ -51,7 +51,7 @@
 **    May you share freely, never taking more than you give.
 **
 *************************************************************************
-** This file contains code to implement the "sqlite" command line
+** This file contains code to implement the "sqlite3" command line
 ** utility for accessing SQLite databases.
 */
 #if (defined(_WIN32) || defined(WIN32)) && !defined(_CRT_SECURE_NO_WARNINGS)
@@ -8353,9 +8353,9 @@ static void ieee754func(
     }
 
     if( m<0 ){
+      if( m<(-9223372036854775807LL) ) return;
       isNeg = 1;
       m = -m;
-      if( m<0 ) return;
     }else if( m==0 && e>-1000 && e<1000 ){
       sqlite3_result_double(context, 0.0);
       return;
@@ -33452,8 +33452,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
                       ");\n", zName);
       }
     }
-    rc = sqlite3_prepare_v2(p->db, "SELECT name FROM pragma_database_list",
-                            -1, &pStmt, 0);
+    rc = sqlite3_prepare_v2(p->db, "PRAGMA database_list", -1, &pStmt, 0);
     if( rc ){
       shellDatabaseError(p->db);
       sqlite3_finalize(pStmt);
@@ -33465,7 +33464,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     sqlite3_str_appendf(pSql, "SELECT sql FROM", 0);
     iSchema = 0;
     while( sqlite3_step(pStmt)==SQLITE_ROW ){
-      const char *zDb = (const char*)sqlite3_column_text(pStmt, 0);
+      const char *zDb = (const char*)sqlite3_column_text(pStmt, 1);
       char zScNum[30];
       sqlite3_snprintf(sizeof(zScNum), zScNum, "%d", ++iSchema);
       sqlite3_str_appendall(pSql, zDiv);
@@ -33485,7 +33484,8 @@ static int do_meta_command(const char *zLine, ShellState *p){
       sqlite3_str_appendf(pSql," FROM \"%w\".sqlite_schema", zDb);
     }
     sqlite3_finalize(pStmt);
-#ifndef SQLITE_OMIT_INTROSPECTION_PRAGMAS
+#if !defined(SQLITE_OMIT_INTROSPECTION_PRAGMAS) \
+ && !defined(SQLITE_OMIT_VIRTUALTABLE)
     if( zName ){
       sqlite3_str_appendall(pSql,
          " UNION ALL SELECT shell_module_schema(name),"
