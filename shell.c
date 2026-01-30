@@ -26206,7 +26206,7 @@ static int shell_exec(
      
       /* Show the EXPLAIN QUERY PLAN if .eqp is on */
       isExplain = sqlite3_stmt_isexplain(pStmt);
-      if( pArg && pArg->mode.autoEQP && isExplain==0 ){
+      if( pArg && pArg->mode.autoEQP && isExplain==0 && pArg->dot.nArg==0 ){
         int triggerEQP = 0;
         disable_debug_trace_modes();
         sqlite3_db_config(db, SQLITE_DBCONFIG_TRIGGER_EQP, -1, &triggerEQP);
@@ -26899,6 +26899,8 @@ static const struct {
 "                  delimiters are specified using --colsep and/or --rowsep\n"
 "  --colsep CHAR   Use CHAR as the column separator.\n"
 "  --csv           Input is standard RFC-4180 CSV.\n"
+"  --esc CHAR      Use CHAR as an escape character in unquoted CSV inputs.\n"
+"  --qesc CHAR     Use CHAR as an escape character in quoted CSV inputs.\n"
 "  --rowsep CHAR   Use CHAR as the row separator.\n"
 "  --schema S      When creating TABLE, put it in schema S\n"
 "  --skip N        Ignore the first N rows of input\n"
@@ -28056,6 +28058,8 @@ struct ImportCtx {
   int cTerm;          /* Character that terminated the most recent field */
   int cColSep;        /* The column separator character.  (Usually ",") */
   int cRowSep;        /* The row separator character.  (Usually "\n") */
+  int cQEscape;       /* Escape character with "...".  0 for none */
+  int cUQEscape;      /* Escape character not with "...".  0 for none */
 };
 
 /* Clean up resourced used by an ImportCtx */
@@ -28124,10 +28128,17 @@ static char *SQLITE_CDECL csv_read_one_field(ImportCtx *p){
     int pc, ppc;
     int startLine = p->nLine;
     int cQuote = c;
+    int cEsc = (u8)p->cQEscape;
     pc = ppc = 0;
     while( 1 ){
       c = import_getc(p);
       if( c==rSep ) p->nLine++;
+      if( c==cEsc && cEsc!=0 ){
+        c = import_getc(p);
+        import_append_char(p, c);
+        ppc = pc = 0;
+        continue;
+      }
       if( c==cQuote ){
         if( pc==cQuote ){
           pc = 0;
@@ -28145,7 +28156,7 @@ static char *SQLITE_CDECL csv_read_one_field(ImportCtx *p){
       }
       if( pc==cQuote && c!='\r' ){
         cli_printf(stderr,"%s:%d: unescaped %c character\n", 
-                        p->zFile, p->nLine, cQuote);
+                   p->zFile, p->nLine, cQuote);
       }
       if( c==EOF ){
         cli_printf(stderr,"%s:%d: unterminated %c-quoted field\n",
@@ -28160,6 +28171,7 @@ static char *SQLITE_CDECL csv_read_one_field(ImportCtx *p){
   }else{
     /* If this is the first field being parsed and it begins with the
     ** UTF-8 BOM  (0xEF BB BF) then skip the BOM */
+    int cEsc = p->cUQEscape;
     if( (c&0xff)==0xef && p->bNotFirst==0 ){
       import_append_char(p, c);
       c = import_getc(p);
@@ -28174,6 +28186,7 @@ static char *SQLITE_CDECL csv_read_one_field(ImportCtx *p){
       }
     }
     while( c!=EOF && c!=cSep && c!=rSep ){
+      if( c==cEsc && cEsc!=0 ) c = import_getc(p);
       import_append_char(p, c);
       c = import_getc(p);
     }
@@ -30317,7 +30330,7 @@ SELECT CASE WHEN (nc < 10) THEN 1 WHEN (nc < 100) THEN 2 \
 SELECT\
  '('||x'0a'\
  || group_concat(\
-  cname||' TEXT',\
+  cname||' ANY',\
   ','||iif((cpos-1)%4>0, ' ', x'0a'||' '))\
  ||')' AS ColsSpec \
 FROM (\
@@ -30537,6 +30550,8 @@ static int pickStr(const char *zArg, char **pzErr, ...){
 **                   delimiters are specified using --colsep and/or --rowsep
 **   --colsep CHAR   Use CHAR as the column separator.
 **   --csv           Input is standard RFC-4180 CSV.
+**   --esc CHAR      Use CHAR as an escape character in unquoted CSV inputs.
+**   --qesc CHAR     Use CHAR as an escape character in quoted CSV inputs.
 **   --rowsep CHAR   Use CHAR as the row separator.
 **   --schema S      When creating TABLE, put it in schema S
 **   --skip N        Ignore the first N rows of input
@@ -30595,6 +30610,10 @@ static int dotCmdImport(ShellState *p){
       if( sCtx.cColSep==0 ) sCtx.cColSep = ',';
       if( sCtx.cRowSep==0 ) sCtx.cRowSep = '\n';
       xRead = csv_read_one_field;
+    }else if( cli_strcmp(z,"-esc")==0 ){
+      sCtx.cUQEscape = azArg[++i][0];
+    }else if( cli_strcmp(z,"-qesc")==0 ){
+      sCtx.cQEscape = azArg[++i][0];
     }else if( cli_strcmp(z,"-colsep")==0 ){
       if( i==nArg-1 ){
         dotCmdError(p, i, "missing argument", 0);
@@ -35026,6 +35045,7 @@ meta_command_exit:
     if( p->nPopOutput==0 ) output_reset(p);
   }
   p->bSafeMode = p->bSafeModePersist;
+  p->dot.nArg = 0;
   return rc;
 }
 
