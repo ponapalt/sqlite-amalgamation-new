@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.53.0"
 #define SQLITE_VERSION_NUMBER 3053000
-#define SQLITE_SOURCE_ID      "2026-03-20 11:35:15 078b3162d0d3d3035f4d3ad88664066d99c218a731ac481b9f1-experimental"
+#define SQLITE_SOURCE_ID      "2026-03-27 16:09:10 efb6212de4ca998546329b06b43122f0fffa3759e4615ca3357-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-03-20T11:35:15.730Z"
+#define SQLITE_SCM_DATETIME   "2026-03-27T16:09:10.848Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -1289,6 +1289,12 @@ struct sqlite3_io_methods {
 #define SQLITE_GET_LOCKPROXYFILE      SQLITE_FCNTL_GET_LOCKPROXYFILE
 #define SQLITE_SET_LOCKPROXYFILE      SQLITE_FCNTL_SET_LOCKPROXYFILE
 #define SQLITE_LAST_ERRNO             SQLITE_FCNTL_LAST_ERRNO
+
+/* reserved file-control numbers:
+**                                         101
+**                                         102
+**                                         103
+*/
 
 
 /*
@@ -8357,13 +8363,6 @@ SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs*);
 ** SQLITE_MUTEX_W32 implementations are appropriate for use on Unix
 ** and Windows.
 **
-** If SQLite is compiled with the SQLITE_MUTEX_APPDEF preprocessor
-** macro defined (with "-DSQLITE_MUTEX_APPDEF=1"), then no mutex
-** implementation is included with the library. In this case the
-** application must supply a custom mutex implementation using the
-** [SQLITE_CONFIG_MUTEX] option of the sqlite3_config() function
-** before calling sqlite3_initialize() or any other public sqlite3_
-** function that calls sqlite3_initialize().
 **
 ** ^The sqlite3_mutex_alloc() routine allocates a new
 ** mutex and returns a pointer to it. ^The sqlite3_mutex_alloc()
@@ -8718,6 +8717,7 @@ SQLITE_API int sqlite3_test_control(int op, ...);
 #define SQLITE_TESTCTRL_TUNE                    32
 #define SQLITE_TESTCTRL_LOGEST                  33
 #define SQLITE_TESTCTRL_USELONGDOUBLE           34  /* NOT USED */
+#define SQLITE_TESTCTRL_ATOF                    34
 #define SQLITE_TESTCTRL_LAST                    34  /* Largest TESTCTRL */
 
 /*
