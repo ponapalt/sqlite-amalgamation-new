@@ -146,12 +146,12 @@ extern "C" {
 ** [sqlite3_libversion_number()], [sqlite3_sourceid()],
 ** [sqlite_version()] and [sqlite_source_id()].
 */
-#define SQLITE_VERSION        "3.53.0"
-#define SQLITE_VERSION_NUMBER 3053000
-#define SQLITE_SOURCE_ID      "2026-04-03 13:54:48 2be1c5a3e47f1276b9f0a4771f2d5fb0bc1ccb907c855caa04d-experimental"
+#define SQLITE_VERSION        "3.54.0"
+#define SQLITE_VERSION_NUMBER 3054000
+#define SQLITE_SOURCE_ID      "2026-04-10 17:11:16 a2f84c56316ea746c134aa6e5a2b46021f67c6642161beae812-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-04-03T13:54:48.361Z"
+#define SQLITE_SCM_DATETIME   "2026-04-10T17:11:16.628Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -7615,7 +7615,7 @@ SQLITE_API int sqlite3_enable_load_extension(sqlite3 *db, int onoff);
 ** <blockquote><pre>
 ** &nbsp;  int xEntryPoint(
 ** &nbsp;    sqlite3 *db,
-** &nbsp;    const char **pzErrMsg,
+** &nbsp;    char **pzErrMsg,
 ** &nbsp;    const struct sqlite3_api_routines *pThunk
 ** &nbsp;  );
 ** </pre></blockquote>)^

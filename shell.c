@@ -684,8 +684,8 @@ void sqlite3_fsetmode(FILE *fp, int mode){
 **    May you share freely, never taking more than you give.
 **
 *************************************************************************
-** Header file for the Result-Format or "resfmt" utility library for SQLite.
-** See the resfmt.md documentation for additional information.
+** Header file for the Query Result-Format or "qrf" utility library for
+** SQLite.  See the README.md documentation for additional information.
 */
 #ifndef SQLITE_QRF_H
 #define SQLITE_QRF_H
@@ -888,8 +888,8 @@ size_t sqlite3_qrf_wcswidth(const char*);
 **    May you share freely, never taking more than you give.
 **
 *************************************************************************
-** Implementation of the Result-Format or "qrf" utility library for SQLite.
-** See the qrf.md documentation for additional information.
+** Implementation of the Query Result-Format or "qrf" utility library for
+** SQLite.  See the README.md documentation for additional information.
 */
 #ifndef SQLITE_QRF_H
 #include "qrf.h"
@@ -898,7 +898,9 @@ size_t sqlite3_qrf_wcswidth(const char*);
 #include <assert.h>
 #include <stdint.h>
 
+#ifndef SQLITE_AMALGAMATION
 /* typedef sqlite3_int64 i64; */
+#endif
 
 /* A single line in the EQP output */
 typedef struct qrfEQPGraphRow qrfEQPGraphRow;
@@ -36329,6 +36331,22 @@ static int vfstraceOut(const char *z, void *pArg){
   return 1;
 }
 
+#if defined(SQLITE_DEBUG) && !defined(SQLITE_SHELL_FIDDLE)
+/* Ensure that sqlite3_reset_auto_extension() clears auto-extension
+** memory. https://sqlite.org/forum/forumpost/310cb231b07c80d1.
+** Testing this: if we (inadvertently) remove the
+** sqlite3_reset_auto_extension() call from main(), most shell tests
+** will fail because of a leak message in their output. */
+static int auto_ext_leak_tester(
+  sqlite3 *db,
+  char **pzErrMsg,
+  const struct sqlite3_api_routines *pThunk
+){
+  (void)db; (void)pzErrMsg; (void)pThunk;
+  return SQLITE_OK;
+}
+#endif
+
 /* Alternative name to the entry point for Fiddle */
 #ifdef SQLITE_SHELL_FIDDLE
 #  define main fiddle_main
@@ -36731,6 +36749,9 @@ int SQLITE_CDECL main(int argc, char **argv){
   }
 #ifndef SQLITE_SHELL_FIDDLE
   sqlite3_appendvfs_init(0,0,0);
+#ifdef SQLITE_DEBUG
+  sqlite3_auto_extension( (void (*)())auto_ext_leak_tester );
+#endif
 #endif
   modeDefault(&data);
 
@@ -36996,6 +37017,10 @@ int SQLITE_CDECL main(int argc, char **argv){
           modePop(&data);
           data.nPopMode = 0;
         }
+        if( rc ){
+          goto shell_main_exit;
+        }
+
       }
       if( data.nPopOutput && azCmd[i][0]!='.' ){
         output_reset(&data);
@@ -37108,6 +37133,7 @@ int SQLITE_CDECL main(int argc, char **argv){
   if( bEnableVfstrace ){
     vfstrace_unregister("trace");
   }
+  sqlite3_reset_auto_extension();
 #ifdef SQLITE_DEBUG
   if( sqlite3_memory_used()>mem_main_enter ){
     cli_printf(stderr,"Memory leaked: %u bytes\n",
