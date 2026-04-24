@@ -1308,7 +1308,6 @@ static void qrfEqpStats(Qrf *p){
       if( nRow>=0 ){
         if( nSp ) sqlite3_str_appendchar(pStats, nSp, ' ');
         qrfApproxInt64(pStats, nRow);
-        nSp = 2;
         if( p->spec.eStyle==QRF_STYLE_StatsEst ){
           sqlite3_str_appendf(pStats, "  ");
           qrfApproxInt64(pStats, (i64)rEstCum);
@@ -1598,19 +1597,16 @@ static int qrfDisplayWidth(const char *zIn, sqlite3_int64 nByte, int *pnNL){
 }
 
 /*
-** Escape the input string if it is needed and in accordance with
-** eEsc, which is either QRF_ESC_Ascii or QRF_ESC_Symbol.
+** Escape the text starting at byte iStart of pStr, if needed, using the
+** escape encoding of eEsc, which is either QRF_ESC_Ascii or QRF_ESC_Symbol.
+** The pStr string is modified appropriately.
 **
 ** Escaping is needed if the string contains any control characters
 ** other than \t, \n, and \r\n
 **
-** If no escaping is needed (the common case) then set *ppOut to NULL
-** and return 0.  If escaping is needed, write the escaped string into
-** memory obtained from sqlite3_malloc64() and make *ppOut point to that
-** memory and return 0.  If an error occurs, return non-zero.
-**
-** The caller is responsible for freeing *ppFree if it is non-NULL in order
-** to reclaim memory.
+** If no escaping is needed (the common case) then pStr is unchanged.
+** If escaping is required, then pStr is expanded and modified to hold
+** an escaped representation of the text.
 */
 static void qrfEscape(
   int eEsc,            /* QRF_ESC_Ascii or QRF_ESC_Symbol */
@@ -1618,20 +1614,22 @@ static void qrfEscape(
   int iStart              /* Begin escapding on this byte of pStr */
 ){
   sqlite3_int64 i, j;     /* Loop counters */
-  sqlite3_int64 sz;       /* Size of the string prior to escaping */
   sqlite3_int64 nCtrl = 0;/* Number of control characters to escape */
   unsigned char *zIn;     /* Text to be escaped */
+  unsigned int nIn;       /* Bytes of text to be escaped */
   unsigned char c;        /* A single character of the text */
   unsigned char *zOut;    /* Where to write the results */
 
   /* Find the text to be escaped */
   zIn = (unsigned char*)sqlite3_str_value(pStr);
+  nIn = sqlite3_str_length(pStr);
   if( zIn==0 ) return;
   zIn += iStart;
+  nIn -= iStart;
 
   /* Count the control characters */
-  for(i=0; (c = zIn[i])!=0; i++){
-    if( c<=0x1f
+  for(i=0; i<nIn; i++){
+    if( (c = zIn[i])<=0x1f
      && c!='\t'
      && c!='\n'
      && (c!='\r' || zIn[i+1]!='\n')
@@ -1643,18 +1641,17 @@ static void qrfEscape(
 
   /* Make space to hold the escapes.  Copy the original text to the end
   ** of the available space. */
-  sz = sqlite3_str_length(pStr) - iStart;
   if( eEsc==QRF_ESC_Symbol ) nCtrl *= 2;
   sqlite3_str_appendchar(pStr, nCtrl, ' ');
   zOut = (unsigned char*)sqlite3_str_value(pStr);
   if( zOut==0 ) return;
   zOut += iStart;
   zIn = zOut + nCtrl;
-  memmove(zIn,zOut,sz);
+  memmove(zIn,zOut,nIn);
 
   /* Convert the control characters */
-  for(i=j=0; (c = zIn[i])!=0; i++){
-    if( c>0x1f
+  for(i=j=0; i<nIn; i++){
+    if( (c = zIn[i])>0x1f
      || c=='\t'
      || c=='\n'
      || (c=='\r' && zIn[i+1]=='\n')
@@ -1666,6 +1663,7 @@ static void qrfEscape(
       j += i;
     }
     zIn += i+1;
+    nIn -= i+1;
     i = -1;
     if( eEsc==QRF_ESC_Symbol ){
       zOut[j++] = 0xe2;
@@ -2068,8 +2066,22 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
           break;
         }
         default: {
-          const char *zTxt = (const char*)sqlite3_column_text(p->pStmt,iCol);
-          qrfEncodeText(p, pOut, zTxt);
+          const void *pBlob = sqlite3_column_blob(p->pStmt,iCol);
+          int nBlob = sqlite3_column_bytes(p->pStmt,iCol);
+          int rc;
+          qrfWrite(p);
+          if( nBlob==0 ){
+            /* no-op */
+          }else if( p->spec.eEsc==QRF_ESC_Off ){
+            rc = p->spec.xWrite(p->spec.pWriteArg,pBlob,nBlob);
+            if( rc ){
+              qrfError(p, rc, "Failed to write %d bytes of BLOB output", nBlob);
+            }
+          }else{
+            sqlite3_str_append(pOut, pBlob, nBlob);
+            qrfEscape(p->spec.eEsc, pOut, 0);
+            qrfWrite(p);
+          }
         }
       }
       break;
@@ -6008,7 +6020,7 @@ static void decimal_result(sqlite3_context *pCtx, Decimal *p){
     sqlite3_result_null(pCtx);
     return;
   }
-  z = sqlite3_malloc64( (sqlite3_int64)p->nDigit+4 );
+  z = sqlite3_malloc64( (sqlite3_int64)p->nDigit+8 );
   if( z==0 ){
     sqlite3_result_error_nomem(pCtx);
     return;
@@ -9792,8 +9804,6 @@ SQLITE_EXTENSION_INIT1
 #  define STRUCT_STAT struct _stat
 #  define chmod(path,mode) fileio_chmod(path,mode)
 #  define mkdir(path,mode) fileio_mkdir(path)
-   extern LPWSTR sqlite3_win32_utf8_to_unicode(const char*);
-   extern char *sqlite3_win32_unicode_to_utf8(LPCWSTR);
 #endif
 #include <time.h>
 #include <errno.h>
@@ -9820,13 +9830,69 @@ SQLITE_EXTENSION_INIT1
 #define FSDIR_COLUMN_PATH     5     /* Path to top of search */
 #define FSDIR_COLUMN_DIR      6     /* Path is relative to this directory */
 
+#ifdef _WIN32
+/*
+** Convert a UTF-8 string to Microsoft Unicode.
+**
+** Space to hold the returned string is obtained from sqlite3_malloc().
+*/
+static wchar_t *winUtf8To16(const char *zText){
+  int nChar;
+  wchar_t *zWideText;
+
+  nChar = MultiByteToWideChar(CP_UTF8, 0, zText, -1, NULL, 0);
+  if( nChar==0 ){
+    return 0;
+  }
+  zWideText = sqlite3_malloc64(nChar*sizeof(WCHAR) );
+  if( zWideText==0 ){
+    return 0;
+  }
+  nChar = MultiByteToWideChar(CP_UTF8, 0, zText, -1, zWideText,
+                                nChar);
+  if( nChar==0 ){
+    sqlite3_free(zWideText);
+    zWideText = 0;
+  }
+  return zWideText;
+}
+#endif /* _WIN32 */
+
+#ifdef _WIN32
+/*
+** Convert a Microsoft Unicode string to UTF-8.
+**
+** Space to hold the returned string is obtained from sqlite3_malloc().
+*/
+static char *winUtf16To8(wchar_t *zWideText){
+  int nByte;
+  char *zText;
+
+  nByte = WideCharToMultiByte(CP_UTF8, 0, zWideText, -1, 0, 0, 0, 0);
+  if( nByte == 0 ){
+    return 0;
+  }
+  zText = sqlite3_malloc64( nByte );
+  if( zText==0 ){
+    return 0;
+  }
+  nByte = WideCharToMultiByte(CP_UTF8, 0, zWideText, -1, zText, nByte,
+                                0, 0);
+  if( nByte == 0 ){
+    sqlite3_free(zText);
+    zText = 0;
+  }
+  return zText;
+}
+#endif /* _WIN32 */
+
 /*
 ** UTF8 chmod() function for Windows
 */
 #if defined(_WIN32) || defined(WIN32)
 static int fileio_chmod(const char *zPath, int pmode){
   int rc;
-  wchar_t *b1 = sqlite3_win32_utf8_to_unicode(zPath);
+  wchar_t *b1 = winUtf8To16(zPath);
   if( b1==0 ) return -1;
   rc = _wchmod(b1, pmode);
   sqlite3_free(b1);
@@ -9840,7 +9906,7 @@ static int fileio_chmod(const char *zPath, int pmode){
 #if defined(_WIN32) || defined(WIN32)
 static int fileio_mkdir(const char *zPath){
   int rc;
-  wchar_t *b1 = sqlite3_win32_utf8_to_unicode(zPath);
+  wchar_t *b1 = winUtf8To16(zPath);
   if( b1==0 ) return -1;
   rc = _wmkdir(b1);
   sqlite3_free(b1);
@@ -9967,7 +10033,7 @@ static int fileStat(
 ){
 #if defined(_WIN32)
   int rc;
-  wchar_t *b1 = sqlite3_win32_utf8_to_unicode(zPath);
+  wchar_t *b1 = winUtf8To16(zPath);
   if( b1==0 ) return 1;
   rc = _wstat(b1, pStatBuf);
   if( rc==0 ){
@@ -10120,14 +10186,13 @@ static int writeFile(
     LONGLONG intervals;
     HANDLE hFile;
     LPWSTR zUnicodeName;
-    extern LPWSTR sqlite3_win32_utf8_to_unicode(const char*);
 
     GetSystemTime(&currentTime);
     SystemTimeToFileTime(&currentTime, &lastAccess);
     intervals = (mtime*10000000) + 116444736000000000;
     lastWrite.dwLowDateTime = (DWORD)intervals;
     lastWrite.dwHighDateTime = intervals >> 32;
-    zUnicodeName = sqlite3_win32_utf8_to_unicode(zFile);
+    zUnicodeName = winUtf8To16(zFile);
     if( zUnicodeName==0 ){
       return 1;
     }
@@ -10785,12 +10850,12 @@ static char *portable_realpath(const char *zPath){
 
   if( zPath==0 ) return 0;
 
-  zPath16 = sqlite3_win32_utf8_to_unicode(zPath);
+  zPath16 = winUtf8To16(zPath);
   if( zPath16==0 ) return 0;
   z = _wfullpath(NULL, zPath16, 0);
   sqlite3_free(zPath16);
   if( z ){
-    zOut = sqlite3_win32_unicode_to_utf8(z);
+    zOut = winUtf16To8(z);
     free(z);
   }
   return zOut;
@@ -19823,7 +19888,7 @@ static void analyzeFunc(
   int rc;
   sqlite3_stmt *pStmt;
   int n;
-  sqlite3_int64 i64;
+  sqlite3_int64 ii;
   sqlite3_int64 pgsz;
   sqlite3_int64 nPage;
   sqlite3_int64 nPageInUse;
@@ -19833,6 +19898,7 @@ static void analyzeFunc(
   Analysis s;
   sqlite3_uint64 r[2];
 
+  (void)argc;
   memset(&s, 0, sizeof(s));
   s.db = sqlite3_context_db_handle(context);
   s.context = context;
@@ -19849,10 +19915,10 @@ static void analyzeFunc(
     sqlite3_result_text(context, "cannot analyze \"temp\"",-1,SQLITE_STATIC);
     return;
   }
-  i64 = 0;
-  rc = analysisSqlInt(&s,&i64,"SELECT 1 FROM pragma_database_list"
+  ii = 0;
+  rc = analysisSqlInt(&s,&ii,"SELECT 1 FROM pragma_database_list"
                              " WHERE name=%Q COLLATE nocase",s.zSchema);
-  if( rc || i64==0 ){
+  if( rc || ii==0 ){
     analysisReset(&s);
     sqlite3_result_text(context,"no such database",-1,SQLITE_STATIC);
     return;
@@ -19974,25 +20040,25 @@ static void analyzeFunc(
   analysisLine(&s, "Pages on the freelist", "%-11lld ", nFreeList);
   analysisPercent(&s, (nFreeList*100.0)/(double)nPage);
 
-  i64 = 0;
-  rc = analysisSqlInt(&s, &i64, "PRAGMA \"%w\".auto_vacuum", s.zSchema);
+  ii = 0;
+  rc = analysisSqlInt(&s, &ii, "PRAGMA \"%w\".auto_vacuum", s.zSchema);
   if( rc ) return;
-  if( i64==0 || nPage<=1 ){
-    i64 = 0;
+  if( ii==0 || nPage<=1 ){
+    ii = 0;
   }else{
     double rPtrsPerPage = pgsz/5;
     double rAvPage = (nPage-1.0)/(rPtrsPerPage+1.0);
-    i64 = (sqlite3_int64)ceil(rAvPage);
+    ii = (sqlite3_int64)ceil(rAvPage);
   }
-  analysisLine(&s, "Pages of auto-vacuum overhead", "%-11lld ", i64);
-  analysisPercent(&s, (i64*100.0)/(double)nPage);
+  analysisLine(&s, "Pages of auto-vacuum overhead", "%-11lld ", ii);
+  analysisPercent(&s, (ii*100.0)/(double)nPage);
 
-  i64 = 0;
-  rc = analysisSqlInt(&s, &i64, 
+  ii = 0;
+  rc = analysisSqlInt(&s, &ii, 
        "SELECT count(*)+1 FROM \"%w\".sqlite_schema WHERE type='table'",
        s.zSchema);
   if( rc ) return;
-  analysisLine(&s, "Number of tables", "%lld\n", i64);
+  analysisLine(&s, "Number of tables", "%lld\n", ii);
   nWORowid = 0;
   rc = analysisSqlInt(&s, &nWORowid,
        "SELECT count(*) FROM \"%w\".pragma_table_list WHERE wr",
@@ -20000,7 +20066,7 @@ static void analyzeFunc(
   if( rc ) return;
   if( nWORowid>0 ){
     analysisLine(&s, "Number of WITHOUT ROWID tables", "%lld\n", nWORowid);
-    analysisLine(&s, "Number of rowid tables", "%lld\n", i64 - nWORowid);
+    analysisLine(&s, "Number of rowid tables", "%lld\n", ii - nWORowid);
   }
   nIndex = 0;
   rc = analysisSqlInt(&s, &nIndex, 
@@ -20008,23 +20074,23 @@ static void analyzeFunc(
        s.zSchema);
   if( rc ) return;
   analysisLine(&s, "Number of indexes", "%lld\n", nIndex);
-  i64 = 0;
-  rc = analysisSqlInt(&s, &i64, 
+  ii = 0;
+  rc = analysisSqlInt(&s, &ii, 
        "SELECT count(*) FROM \"%w\".sqlite_schema"
        " WHERE name GLOB 'sqlite_autoindex_*' AND type='index'",
        s.zSchema);
   if( rc ) return;
-  analysisLine(&s, "Number of defined indexes", "%lld\n", nIndex - i64);
-  analysisLine(&s, "Number of implied indexes", "%lld\n", i64);
+  analysisLine(&s, "Number of defined indexes", "%lld\n", nIndex - ii);
+  analysisLine(&s, "Number of implied indexes", "%lld\n", ii);
   analysisLine(&s, "Size of the database in bytes", "%lld\n", pgsz*nPage);
-  i64 = 0;
-  rc = analysisSqlInt(&s, &i64, 
+  ii = 0;
+  rc = analysisSqlInt(&s, &ii, 
        "SELECT sum(payload) FROM temp.%s"
        " WHERE NOT is_index AND name NOT LIKE 'sqlite_schema'",
        s.zSU);
   if( rc ) return;
-  analysisLine(&s, "Bytes of payload", "%-11lld ", i64);
-  analysisPercent(&s, i64*100.0/(double)(pgsz*nPage));
+  analysisLine(&s, "Bytes of payload", "%-11lld ", ii);
+  analysisPercent(&s, ii*100.0/(double)(pgsz*nPage));
 
   analysisTitle(&s, "Page counts for all tables with their indexes");
   pStmt = analysisPrepare(&s,
@@ -24807,6 +24873,7 @@ static FILE *iotrace = 0;
 **                                                Works like.
 **                                                --------------
 **   cli_printf(FILE*, const char*, ...);         fprintf()
+**   cli_write(FILE*, const char*, int);          write()
 **   cli_puts(const char*, FILE*);                fputs()
 **   cli_vprintf(FILE*, const char*, va_list);    vfprintf()
 **
@@ -24832,6 +24899,18 @@ static int cli_printf(FILE *out, const char *zFormat, ...){
   }
   va_end(ap);
   return rc;
+}
+static int cli_write(FILE *out, const char *zData, int nData){
+  if( cli_output_capture && (out==stdout || out==stderr) ){
+    sqlite3_str_append(cli_output_capture, zData, nData);
+#ifdef _WIN32
+  }else if( out==stdout || out==stderr ){
+    nData = sqlite3_fprintf(out, "%.*s", nData, zData);
+#endif
+  }else{
+    nData = (int)fwrite(zData, 1, nData, out);
+  }
+  return nData;
 }
 static int cli_puts(const char *zText, FILE *out){
   if( cli_output_capture && (out==stdout || out==stderr) ){
@@ -25027,14 +25106,76 @@ static char *local_getline(char *zLine, FILE *in){
 }
 
 /*
-** The default prompts.
+** The SQLITE_PS_APPDEF macro should be set to the name of a function
+** that accepts a single "int" argument and returns a "const char *"
+** that is guaranteed to be non-NULL.  The value returned depends on the
+** argument:
+**
+**    1      Default main prompt.
+**    2      Default continuation prompt.
+**    3      Environment variable to override main prompt ("SQLITE_PS1")
+**    4      Environment variable to override continuatio ("SQLITE_PS2")
+**    'A'    The name of the application.  (Nominally "SQLite")
+**    'V'    Version number including patch.  (ex: "3.54.1")
+**    'v'    Version number without patch.  (ex: "3.54")
+**
 */
-#ifndef SQLITE_PS1
-# define SQLITE_PS1 "SQLite /f> "
+#ifdef SQLITE_PS_APPDEF
+extern const char *SQLITE_PS_APPDEF(int);
+#else
+# define SQLITE_PS_APPDEF shellPromptAppDef
+static const char *shellPromptAppDef(int c){
+  switch( c ){
+    /* The default main prompt string */
+    case 1:
+#if   defined(SQLITE_PS1)
+      return SQLITE_PS1;
+#elif defined(SQLITE_PS_NOANSI)
+      return "/A-/v /~> ";
+#else
+      return "/e[1;32m/A-/v /e[1;/x33/:36/;m/f/e[0m-> ";
 #endif
-#ifndef SQLITE_PS2
-# define SQLITE_PS2 "/B.../H> "
+
+    /* The default continuation prompt string */
+    case 2:
+#if   defined(SQLITE_PS2)
+      return SQLITE_PS2;
+#elif defined(SQLITE_PS_NOANSI)
+      return "/B/C> ";
+#else
+      return "/B/e[1;/x33/:36/;m/C/e[0m-> ";
 #endif
+
+    /* Name of environment variables that override the prompt strings
+    ** of cases 1 and 2 */
+    case 3:   return "SQLITE_PS1";
+    case 4:   return "SQLITE_PS2";
+
+    /* Name of the application */
+    case 'A': return "SQLite";
+
+    /* Full version number of the application, including patch level */
+    case 'V': return sqlite3_libversion();
+
+    /* Version number without the patch level */
+    case 'v': {
+      static char zRel[16];
+      const char *zF = sqlite3_libversion();
+      const char *zD = strrchr(zF,'.');
+      if( zD && (size_t)(zD-zF)<sizeof(zRel)-1 ){
+        memcpy(zRel,zF,(size_t)(zD-zF));
+        zRel[(size_t)(zD-zF)] = 0;
+        return zRel;
+      }else{
+        return zF;
+      }
+    }
+  }
+  return "";
+}
+#endif /* !defined(SQLITE_PS_APPDEF) */
+
+
 
 /*
 ** Return the raw (unexpanded) prompt string.  This will be the
@@ -25054,14 +25195,10 @@ static const char *prompt_string(ShellState *p, int bContinue){
     return p->azPrompt[bContinue];
   }
 #ifndef SQLITE_SHELL_FIDDLE
-  zPS = getenv(bContinue ? "SQLITE_PS2" : "SQLITE_PS1");
+  zPS = getenv(SQLITE_PS_APPDEF(3+bContinue));
   if( zPS ) return zPS;
 #endif
-  if( bContinue ){
-    return SQLITE_PS2;
-  }else{
-    return SQLITE_PS1;
-  }
+  return SQLITE_PS_APPDEF(1+bContinue);
 }
 
 /*
@@ -25086,6 +25223,45 @@ static const char *prompt_filename(ShellState *p){
 }
 
 /*
+** Return the name of the computer on which we are running.
+*/
+static const char *prompt_hostname(int bFull){
+#ifdef _WIN32
+  const char *z = getenv("COMPUTERNAME");
+  if( z==0 || z[0]==0 ) z = "?";
+  return z;
+#else
+  static char zHost[256];
+  if( gethostname(zHost, sizeof(zHost)) ){
+    zHost[0] = '?';
+    zHost[1] = 0;
+  }
+  if( !bFull ){
+    char *p = strchr(zHost,'.');
+    if( p ) p[0] = 0;
+  }
+  return zHost;
+#endif
+}
+
+/*
+** Return the username.  This is taken from an environment variable
+** and can thus be forged.  Do not depend on it.
+*/
+static const char *prompt_user(void){
+  const char *z;
+#ifdef _WIN32
+  z = getenv("USERNAME");
+  if( z==0 || z[0]==0 ) z = "?";
+#else
+  z = getenv("USER");
+  if( z==0 || z[0]==0 ) z = getenv("LOGNAME");
+  if( z==0 || z[0]==0 ) z = "?";
+#endif
+  return z;
+}
+
+/*
 ** Expand escapes in the given input prompt string.  Return the
 ** expanded prompt in memory obtained from sqlite3_malloc().  The
 ** caller is responsible for freeing the memory.
@@ -25106,12 +25282,13 @@ static char *expand_prompt(
   sqlite3_str *pOut = sqlite3_str_new(0);
   int i;
   char c;
-  int onoff = 1;
+  unsigned int mOff = 0;    /* Bitmask of FALSE for if/then/else */
   int idxSpace = -1;
+  int iDate = -1;
   for(i=0; zPrompt[i]; i++){
     if( zPrompt[i]!='/' ) continue;
     if( i>0 ){
-      if( onoff ) sqlite3_str_append(pOut, zPrompt, i);
+      if( !mOff ) sqlite3_str_append(pOut, zPrompt, i);
       zPrompt += i;
       i = 0;
     }
@@ -25134,14 +25311,23 @@ static char *expand_prompt(
       while( i<=2 && zPrompt[i+1]>='0' && zPrompt[i+1]<='7' ){
         v = v*8 + zPrompt[++i] - '0';
       }
-      if( onoff ) sqlite3_str_appendchar(pOut, 1, v);
+      if( !mOff ) sqlite3_str_appendchar(pOut, 1, v);
       zPrompt += i+1;
       i = -1;
       continue;
     }
     if( c=='e' ){
       /* /e is shorthand for /033 which is U+001B "Escape" */
-      if( onoff ) sqlite3_str_append(pOut, "\033", 1);
+      if( !mOff ) sqlite3_str_append(pOut, "\033", 1);
+      zPrompt += 2;
+      i = -1;
+      continue;
+    }
+    if( c=='A' || c=='V' || c=='v' ){
+      /* /A expands to the application name */
+      /* /V expands to the version number with patch level */
+      /* /v expands to the version number without the patch level */
+      if( !mOff ) sqlite3_str_appendall(pOut, SQLITE_PS_APPDEF(c));
       zPrompt += 2;
       i = -1;
       continue;
@@ -25161,22 +25347,29 @@ static char *expand_prompt(
     **         .prompt '/e[1;/x31/:34/;m~f>/e[0m '
     */
     if( c==':' ){
-      /* toggle display on/off */
-      onoff = !onoff;
+      /* ELSE: toggle display on/off */
+      mOff ^= 1;
       zPrompt += 2;
       i = -1;
       continue;
     }
     if( c==';' ){
-      /* Turn display on */
-      onoff = 1;
+      /* ENDIF: Turn display on */
+      mOff >>= 1;
       zPrompt += 2;
       i = -1;
       continue;
     }
     if( c=='x' ){
       /* /x turns display off not in a transaction, on if in txn */
-      onoff = p->db && !sqlite3_get_autocommit(p->db);
+      mOff = (mOff<<1) | (p->db==0 || sqlite3_get_autocommit(p->db)!=0);
+      zPrompt += 2;
+      i = -1;
+      continue;
+    }
+    if( c=='r' ){
+      /* /r turns display off if database is read/write, on if read-only */
+      mOff = (mOff<<1) | (p->db==0 || sqlite3_db_readonly(p->db,0)==0);
       zPrompt += 2;
       i = -1;
       continue;
@@ -25186,7 +25379,7 @@ static char *expand_prompt(
       /* /f becomes the tail of the database filename */
       /* /F becomes the full pathname */
       /* /~ becomes the full pathname relative to $HOME */
-      if( onoff ){
+      if( !mOff ){
         const char *zFN = prompt_filename(p);
         if( c=='f' ){
 #ifdef _WIN32
@@ -25213,9 +25406,29 @@ static char *expand_prompt(
       continue;
     }
 
-    if( c=='H' ){
-      /* /H becomes text needed to terminate current input */
-      if( onoff ){
+    if( c=='h' || c=='H' ){
+      /* /h becomes hostname up to the first '.' */
+      /* /H is the full hostname */
+      if( !mOff ){
+        sqlite3_str_appendall(pOut, prompt_hostname(c=='H'));
+      }
+      zPrompt += 2;
+      i = -1;
+      continue;
+    }
+    if( c=='u' ){
+      /* /u becomes the username (taken from environment variables) */
+      if( !mOff ){
+        sqlite3_str_appendall(pOut, prompt_user());
+      }
+      zPrompt += 2;
+      i = -1;
+      continue;
+    }
+
+    if( c=='C' ){
+      /* /C becomes text needed to terminate current input */
+      if( !mOff ){
         sqlite3_int64 R = zPrior ? sqlite3_incomplete(zPrior) : 0;
         int cc = (R>>16)&0xff;
         int nParen = R>>32;
@@ -25249,18 +25462,44 @@ static char *expand_prompt(
       /* /B is a no-op for the main prompt.  For the continuation prompt,
       ** /B expands to zero or more spaces to make the continuation prompt
       ** at least as wide as the main prompt. */
-      if( onoff ) idxSpace = sqlite3_str_length(pOut);
+      if( !mOff ) idxSpace = sqlite3_str_length(pOut);
       zPrompt += 2;
       i = -1;
       continue;
     }
 
-    /* No match to a known escape.  Generate an error. */
-    if( onoff ) sqlite3_str_appendf(pOut,"UNKNOWN(\"/%c\")",c);
+    if( c=='D' ){
+      /* /D.../D replaces all of the text between the two /D escapes with
+      ** the result from strftime(). */
+      if( iDate<0 ){
+        iDate = sqlite3_str_length(pOut);
+      }else{
+        if( !mOff ){
+          time_t now;
+          char zBuf[200];
+          zBuf[0] = 0;
+          time(&now);
+          strftime(zBuf, sizeof(zBuf)-1, sqlite3_str_value(pOut)+iDate, 
+                   localtime(&now));
+          zBuf[199] = 0;
+          sqlite3_str_truncate(pOut, iDate);
+          sqlite3_str_appendall(pOut, zBuf);
+        }
+        iDate = -1;
+      }
+      zPrompt += 2;
+      i = -1;
+      continue;
+    }
+
+    /* No match to a known escape.  Generate an error. The mOff flag
+    ** is ignored for this output, so that errors appear even if they
+    ** are in an unused branch. */
+    sqlite3_str_appendf(pOut,"UNKNOWN(\"/%c\")",c);
     zPrompt += 2;
     i = -1;
   }
-  if( i>0 && onoff ){
+  if( i>0 && !mOff ){
     sqlite3_str_append(pOut, zPrompt, i);
   }
 
@@ -25284,7 +25523,11 @@ static char *expand_prompt(
       }
     }
   }
-  
+
+  if( 0==sqlite3_str_length(pOut) ){
+    /* Avoid a bogus OOM */
+    sqlite3_str_appendchar(pOut, 1, '\0');
+  }
   return sqlite3_str_finish(pOut);
 }
 
@@ -27532,7 +27775,7 @@ static int expertDotCommand(
 */
 static int shellWriteQR(void *pX, const char *z, sqlite3_int64 n){
   ShellState *pArg = (ShellState*)pX;
-  cli_printf(pArg->out, "%.*s", (int)n, z);
+  cli_write(pArg->out, z, (int)n);
   return SQLITE_OK;
 }
 
@@ -37821,7 +38064,7 @@ int SQLITE_CDECL main(int argc, char **argv){
 #ifndef SQLITE_SHELL_FIDDLE
   sqlite3_appendvfs_init(0,0,0);
 #ifdef SQLITE_DEBUG
-  sqlite3_auto_extension( (void (*)())auto_ext_leak_tester );
+  sqlite3_auto_extension( (void(*)(void))auto_ext_leak_tester );
 #endif
 #endif
   modeDefault(&data);
@@ -38137,6 +38380,7 @@ int SQLITE_CDECL main(int argc, char **argv){
       linenoiseSetCompletionCallback(linenoise_completion, NULL);
 #endif
       data.in = 0;
+      open_db(&data, 0);
       rc = process_input(&data, "<stdin>");
       if( zHistory ){
         shell_stifle_history(2000);
