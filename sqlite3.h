@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-05-07 20:45:57 5a8497dbec80b55a2dedc8a6f9ee823243e01a08d37ceeed1f8-experimental"
+#define SQLITE_SOURCE_ID      "2026-05-15 17:24:34 350152d5124b71b3dd640c109dbac5f05a3a9583a335fbe25f7-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-05-07T20:45:57.859Z"
+#define SQLITE_SCM_DATETIME   "2026-05-15T17:24:34.926Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4054,8 +4054,7 @@ SQLITE_API int sqlite3_open_v2(
 **
 ** The sqlite3_uri_int64(F,P,D) routine converts the value of P into a
 ** 64-bit signed integer and returns that integer, or D if P does not
-** exist.  If the value of P is something other than an integer, then
-** zero is returned.
+** exist or ff the value of P is something other than an integer.
 **
 ** The sqlite3_uri_key(F,N) returns a pointer to the name (not
 ** the value) of the N-th query parameter for filename F, or a NULL

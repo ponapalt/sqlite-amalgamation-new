@@ -193,9 +193,10 @@ typedef unsigned char u8;
 #if HAVE_READLINE
 # include <readline/readline.h>
 # include <readline/history.h>
-#endif
-
-#if HAVE_EDITLINE
+#elif HAVE_EDITLINE
+/* If both HAVE_READLINE and HAVE_EDITLINE are true, assume that this
+** libedit installation does not have its own headers, instead using
+** those from libreadline. */
 # include <editline/readline.h>
 #endif
 
@@ -747,8 +748,7 @@ int sqlite3_format_query_result(
 );
 
 /*
-** Range of values for sqlite3_qrf_spec.aWidth[] entries and for
-** sqlite3_qrf_spec.mxColWidth and .nScreenWidth
+** Range of values for sqlite3_qrf_spec.aWidth[] entries.
 */
 #define QRF_MAX_WIDTH    10000
 #define QRF_MIN_WIDTH    0
@@ -1133,6 +1133,10 @@ static void qrfApproxInt64(sqlite3_str *pOut, i64 N){
     sqlite3_str_appendf(pOut, "%4lld ", N);
     return;
   }
+  if( N>=9223372036854775800LL ){
+    sqlite3_str_appendf(pOut, "%.2fE", 1e-18*(double)N);
+    return;
+  }
   for(i=1; i<=18; i++){
     N = (N+5)/10;
     if( N<10000 ){
@@ -1292,8 +1296,8 @@ static void qrfEqpStats(Qrf *p){
       sqlite3_str_reset(pStats);
       if( nCycle>=0 && nTotal>0 ){
         qrfApproxInt64(pStats, nCycle);
-        sqlite3_str_appendf(pStats, " %3d%%",
-            ((nCycle*100)+nTotal/2) / nTotal
+        sqlite3_str_appendf(pStats, " %3.0f%%",
+            ((100.0*(double)nCycle)+nTotal/2.0) / (double)nTotal
         );
         nSp = 2;
       }
@@ -2535,12 +2539,12 @@ static void qrfBoxLine(sqlite3_str *pOut, int N, int bDbl){
       DBL_24 DBL_24 DBL_24 DBL_24 DBL_24   DBL_24 DBL_24 DBL_24 DBL_24 DBL_24
   };/*  0       1      2     3      4        5      6      7      8      9   */
   const int nDash = 30;
-  N *= 3;
-  while( N>nDash ){
+  i64 nn = 3*(i64)N;
+  while( nn>nDash ){
     sqlite3_str_append(pOut, azDash[bDbl], nDash);
-    N -= nDash;
+    nn -= nDash;
   }
-  sqlite3_str_append(pOut, azDash[bDbl], N);
+  sqlite3_str_append(pOut, azDash[bDbl], (int)nn);
 }
 
 /*
@@ -2613,7 +2617,7 @@ static int *qrfValidLayout(
   int i;        /* Loop counter */
   int nr;       /* Number of rows */
   int w = 0;    /* Width of the current column */
-  int t;        /* Total width of all columns */
+  i64 t;        /* Total width of all columns */
   int *aw;      /* Array of individual column widths */
 
   aw = sqlite3_malloc64( sizeof(int)*nCol );
@@ -2751,8 +2755,11 @@ static void qrfRestrictScreenWidth(qrfColData *pData, Qrf *p){
     if( p->spec.bBorder==QRF_No ) sepW -= 2;
   }
   nCol = pData->nCol;
-  for(i=sumW=0; i<nCol; i++) sumW += pData->a[i].w;
-  if( p->spec.nScreenWidth >= sumW+sepW ) return;
+  for(i=0, sumW=0; i<nCol; i++){
+    if( sumW > 2147483647 - pData->a[i].w ) return;
+    sumW += pData->a[i].w;
+  }
+  if( p->spec.nScreenWidth >= (i64)sumW + sepW ) return;
 
   /* First thing to do is reduce the separation between columns */
   pData->nMargin = 0;
@@ -3627,7 +3634,7 @@ static void qrfInitialize(
   memcpy(&p->spec, pSpec, sz);
   if( p->spec.zNull==0 ) p->spec.zNull = "";
   p->mxWidth = p->spec.nScreenWidth;
-  if( p->mxWidth<=0 ) p->mxWidth = QRF_MAX_WIDTH;
+  if( p->mxWidth<=0 ) p->mxWidth = 2147483647;
   p->mxHeight = p->spec.nLineLimit;
   if( p->mxHeight<=0 ) p->mxHeight = 2147483647;
   if( p->spec.eStyle>QRF_STYLE_Table ) p->spec.eStyle = QRF_Auto;
@@ -5275,6 +5282,10 @@ SQLITE_EXTENSION_INIT1
 /******************************************************************************
 ** The Hash Engine
 */
+#if defined(__GNUC__) && __GNUC__>=11
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wstringop-overread"
+#endif
 /* Context for the SHA1 hash */
 typedef struct SHA1Context SHA1Context;
 struct SHA1Context {
@@ -5470,6 +5481,9 @@ static void hash_finish(
     zOut[i*2]= 0;
   }
 }
+#if defined(__GNUC__) && __GNUC__>=11
+# pragma GCC diagnostic pop
+#endif
 /* End of the hashing logic
 *****************************************************************************/
 
@@ -8372,7 +8386,7 @@ static int seriesFilter(
           if( r<(double)SMALLEST_INT64 ){
             iMin = SMALLEST_INT64;
           }else if( (idxNum & 0x0200)!=0 && r==seriesCeil(r) ){
-            iMin = (sqlite3_int64)seriesCeil(r+1.0);
+            iMin = (sqlite3_int64)seriesCeil(r)+1;
           }else{
             iMin = (sqlite3_int64)seriesCeil(r);
           }
@@ -8393,7 +8407,7 @@ static int seriesFilter(
           if( r>(double)LARGEST_INT64 ){
             iMax = LARGEST_INT64;
           }else if( (idxNum & 0x2000)!=0 && r==seriesFloor(r) ){
-            iMax = (sqlite3_int64)(r-1.0);
+            iMax = ((sqlite3_int64)r)-1;
           }else{
             iMax = (sqlite3_int64)seriesFloor(r);
           }
@@ -9641,7 +9655,6 @@ static void re_bytecode_func(
     return;
   }
   pStr = sqlite3_str_new(0);
-  if( pStr==0 ) goto re_bytecode_func_err;
   if( pRe->nInit>0 ){
     sqlite3_str_appendf(pStr, "INIT     ");
     for(i=0; i<pRe->nInit; i++){
@@ -9653,15 +9666,15 @@ static void re_bytecode_func(
     sqlite3_str_appendf(pStr, "%-8s %4d\n",
          ReOpName[(unsigned char)pRe->aOp[i]], pRe->aArg[i]);
   }
+  if( sqlite3_str_errcode(pStr)==SQLITE_NOMEM ){
+    sqlite3_str_finish(pStr);
+    re_free(pRe);
+    sqlite3_result_error_nomem(context);
+    return;
+  }
   n = sqlite3_str_length(pStr);
   z = sqlite3_str_finish(pStr);
-  if( n==0 ){
-    sqlite3_free(z);
-  }else{
-    sqlite3_result_text(context, z, n-1, sqlite3_free);
-  }
-
-re_bytecode_func_err:
+  sqlite3_result_text(context, z, n-1, sqlite3_free);
   re_free(pRe);
 }
 
@@ -37823,6 +37836,19 @@ static void verify_uninitialized(void){
   }
 }
 
+#if HAVE_EDITLINE
+/*
+** https://sqlite.org/forum/forumpost/aad7a634916ff050:
+**
+** Calling setlocale(LC_ALL,"") is required to get libedit to accept
+** non-ASCII input.
+*/
+#define DO_SET_LOCALE 1
+#include <locale.h>
+#else
+#define DO_SET_LOCALE 0
+#endif
+
 /*
 ** Initialize the state information in data
 */
@@ -37847,6 +37873,10 @@ static void main_init(ShellState *p) {
   ** command-line editing library */
   p->bDelimitNonprint = 0;
 #endif
+#if DO_SET_LOCALE
+  setlocale(LC_CTYPE,"");
+#endif
+#undef DO_SET_LOCALE
 }
 
 /*
