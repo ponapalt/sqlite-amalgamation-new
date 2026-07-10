@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 0d70a15c3b35e9af3052042cd5332db1b38a with changes in files:
+** 4ff362a4c2897e2b438d3d8fc88a01226452 with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-07-02 09:52:03 0d70a15c3b35e9af3052042cd5332db1b38a66416f1c3c8a50d-experimental"
+#define SQLITE_SOURCE_ID      "2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-07-02T09:52:03.709Z"
+#define SQLITE_SCM_DATETIME   "2026-07-10T15:06:05.593Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4753,6 +4753,10 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 ** [[SQLITE_LIMIT_WORKER_THREADS]] ^(<dt>SQLITE_LIMIT_WORKER_THREADS</dt>
 ** <dd>The maximum number of auxiliary worker threads that a single
 ** [prepared statement] may start.</dd>)^
+**
+** [[SQLITE_LIMIT_SCHEMA]] ^(<dt>SQLITE_LIMIT_SCHEMA</dt>
+** <dd>The maximum number of objects (tables, indexes, triggers, and views)
+** defined by the database schema.</dd>)^
 ** </dl>
 */
 #define SQLITE_LIMIT_LENGTH                    0
@@ -4768,6 +4772,7 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 #define SQLITE_LIMIT_TRIGGER_DEPTH            10
 #define SQLITE_LIMIT_WORKER_THREADS           11
 #define SQLITE_LIMIT_PARSER_DEPTH             12
+#define SQLITE_LIMIT_SCHEMA                   13
 
 /*
 ** CAPI3REF: Prepare Flags
@@ -15033,6 +15038,33 @@ struct fts5_api {
 # define SQLITE_MAX_TRIGGER_DEPTH 1000
 #endif
 
+/*
+** Maximum number of objects defined by a single database schema.
+** Objects include:
+**
+**   *  tables (including the sqlite_schema table)
+**   *  virtual tables
+**   *  named indexes
+**   *  indexes created automatically by UNIQUE and PRIMARY KEY constraints
+**   *  triggers
+**   *  views
+**
+** The total of all of the above is the number of objects in the schema,
+** and that number may not exceed this value.
+**
+** The maximum number of objects is restricted to forestall theoretical
+** signed integer overflow attacks using databases with billions of
+** schema objects.  Such attacks are "theoretical" because memory and
+** disk space constraints would be reached long before billions of schema
+** objects could be created.  Even so, it seems good to have a well defined
+** upper limit on the complexity of the schema, for defense in depth.
+** No real-world application should ever get anywhere close to hitting
+** this limit.
+*/
+#ifndef SQLITE_MAX_SCHEMA
+# define SQLITE_MAX_SCHEMA 10000000
+#endif
+
 /************** End of sqliteLimit.h *****************************************/
 /************** Continuing where we left off in sqliteInt.h ******************/
 
@@ -18638,7 +18670,7 @@ struct Schema {
 ** The number of different kinds of things that can be limited
 ** using the sqlite3_limit() interface.
 */
-#define SQLITE_N_LIMIT (SQLITE_LIMIT_PARSER_DEPTH+1)
+#define SQLITE_N_LIMIT (SQLITE_LIMIT_SCHEMA+1)
 
 /*
 ** Lookaside malloc is a set of fixed-size buffers that can be used
@@ -23647,6 +23679,9 @@ static const char * const sqlite3azCompileOpt[] = {
 #endif
 #ifdef SQLITE_MAX_PAGE_SIZE
   "MAX_PAGE_SIZE=" CTIMEOPT_VAL(SQLITE_MAX_PAGE_SIZE),
+#endif
+#ifdef SQLITE_MAX_SCHEMA
+  "MAX_SCHEMA=" CTIMEOPT_VAL(SQLITE_MAX_SCHEMA),
 #endif
 #ifdef SQLITE_MAX_SCHEMA_RETRY
   "MAX_SCHEMA_RETRY=" CTIMEOPT_VAL(SQLITE_MAX_SCHEMA_RETRY),
@@ -110679,13 +110714,16 @@ lookupname_end:
 #ifndef SQLITE_OMIT_AUTHORIZATION
     if( db->xAuth ){
       if( pFJMatch ){
+        int ii;
         assert( pExpr->op==TK_FUNCTION );
         assert( sqlite3_stricmp(pExpr->u.zToken,"coalesce")==0 );
         assert( pExpr->x.pList==pFJMatch );
         assert( pFJMatch->nExpr>0 );
-        pExpr = pFJMatch->a[0].pExpr;
-      }
-      if( pExpr->op==TK_COLUMN || pExpr->op==TK_TRIGGER ){
+        for(ii=0; ii<pFJMatch->nExpr; ii++){
+          assert( pFJMatch->a[0].pExpr->op==TK_COLUMN );
+          sqlite3AuthRead(pParse, pFJMatch->a[0].pExpr, pSchema, pNC->pSrcList);
+        }
+      }else if( pExpr->op==TK_COLUMN || pExpr->op==TK_TRIGGER ){
         sqlite3AuthRead(pParse, pExpr, pSchema, pNC->pSrcList);
       }
     }
@@ -122343,15 +122381,37 @@ static int getWhitespace(const u8 *z){
 /*
 ** Argument z points into the body of a constraint - specifically the
 ** second token of the constraint definition.  For a named constraint,
-** z points to the first token past the CONSTRAINT keyword.  For an
+** z points to the second token of the constraint definition. For an
 ** unnamed NOT NULL constraint, z points to the first byte past the NOT
 ** keyword.
 **
+** Argument eTok may be the token value of the first token of the constraint
+** (e.g. TK_CHECK or TK_REFERENCES) or zero. If it is either TK_REFERENCES
+** or TK_FOREIGN, special parsing is enabled to find the end of the foreign-key
+** constraint definition.
+**
 ** Return the number of bytes until the end of the constraint.
 */
-static int getConstraint(const u8 *z){
+static int getConstraint(const u8 *z, int eTok){
   int iOff = 0;
   int t = 0;
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+  if( eTok==TK_FOREIGN ){
+    /* For a FOREIGN KEY constraint, use getConstraint() to parse everything
+    ** up to the REFERENCES keyword. Then getConstraintToken() to consume
+    ** the TK_REFERENCES token itself. Then fall through to the special
+    ** handling for TK_REFERENCES below.  */
+    iOff = getConstraint(z, 0);
+    iOff += getConstraintToken(&z[iOff], &eTok);
+  }
+
+  if( eTok==TK_REFERENCES ){
+    /* REFERENCES is followed by a table name. Gobble this up here in
+    ** case the table name is a fallback token like TK_GENERATED. */
+    iOff += getConstraintToken(&z[iOff], &t);
+  }
+#endif
 
   /* Now, the current constraint proceeds until the next occurence of one
   ** of the following tokens:
@@ -122524,11 +122584,11 @@ static void dropConstraintFunc(
           t = TK_CHECK;
         }else{
           iOff += nTok;
-          iOff += getConstraint(&zSql[iOff]);
+          iOff += getConstraint(&zSql[iOff], t);
         }
 
         if( cmp==0 || (iNotNull>=0 && t==TK_NOT) ){
-          if( t!=TK_NOT && t!=TK_CHECK ){
+          if( t!=TK_NOT && t!=TK_CHECK && t!=TK_REFERENCES && t!=TK_FOREIGN ){
             errorMPrintf(ctx, "constraint may not be dropped: %s", zCons);
             return;
           }
@@ -122537,7 +122597,7 @@ static void dropConstraintFunc(
         }
 
       }else if( t==TK_NOT && iNotNull==ii ){
-        iEnd = iOff + getConstraint(&zSql[iOff]);
+        iEnd = iOff + getConstraint(&zSql[iOff], 0);
         break;
       }else if( t==TK_RP || t==TK_ILLEGAL ){
         iEnd = -1;
@@ -147539,6 +147599,7 @@ SQLITE_PRIVATE int sqlite3InitCallback(void *pInit, int argc, char **argv, char 
   }
 
   assert( iDb>=0 && iDb<db->nDb );
+  assert( db->aDb[iDb].pSchema!=0 );
   if( argv[3]==0 ){
     corruptSchema(pData, argv, 0);
   }else if( argv[4]
@@ -147612,6 +147673,16 @@ SQLITE_PRIVATE int sqlite3InitCallback(void *pInit, int argc, char **argv, char 
       if( sqlite3Config.bExtraSchemaChecks ){
         corruptSchema(pData, argv, "invalid rootpage");
       }
+    }
+  }
+  if( pData->pzErrMsg[0]==0 ){
+    Schema *pX = db->aDb[iDb].pSchema;
+    if( pX->tblHash.count + pX->idxHash.count + pX->trigHash.count
+                   > (u32)db->aLimit[SQLITE_LIMIT_SCHEMA]
+    ){
+      *pData->pzErrMsg = sqlite3MPrintf(db, "too many schema objects");
+      pData->rc = SQLITE_ERROR;
+      return 1;
     }
   }
   return 0;
@@ -189998,6 +190069,7 @@ static const int aHardLimit[] = {
   SQLITE_MAX_TRIGGER_DEPTH,
   SQLITE_MAX_WORKER_THREADS,
   SQLITE_MAX_PARSER_DEPTH,
+  SQLITE_MAX_SCHEMA,
 };
 
 /*
@@ -190080,7 +190152,8 @@ SQLITE_API int sqlite3_limit(sqlite3 *db, int limitId, int newLimit){
   assert( aHardLimit[SQLITE_LIMIT_VARIABLE_NUMBER]==SQLITE_MAX_VARIABLE_NUMBER);
   assert( aHardLimit[SQLITE_LIMIT_TRIGGER_DEPTH]==SQLITE_MAX_TRIGGER_DEPTH );
   assert( aHardLimit[SQLITE_LIMIT_WORKER_THREADS]==SQLITE_MAX_WORKER_THREADS );
-  assert( SQLITE_LIMIT_PARSER_DEPTH==(SQLITE_N_LIMIT-1) );
+  assert( aHardLimit[SQLITE_LIMIT_SCHEMA]==SQLITE_MAX_SCHEMA );
+  assert( SQLITE_LIMIT_SCHEMA==(SQLITE_N_LIMIT-1) );
 
 
   if( limitId<0 || limitId>=SQLITE_N_LIMIT ){
@@ -210437,8 +210510,8 @@ static int fts3StringAppend(
   ** to grow the buffer until so that it is big enough to accommodate the
   ** appended data.
   */
-  if( pStr->n+nAppend+1>=pStr->nAlloc ){
-    sqlite3_int64 nAlloc = pStr->nAlloc+(sqlite3_int64)nAppend+100;
+  if( (i64)pStr->n+(i64)nAppend+1>=(i64)pStr->nAlloc ){
+    i64 nAlloc = pStr->nAlloc+(i64)nAppend+100;
     char *zNew = sqlite3_realloc64(pStr->z, nAlloc);
     if( !zNew ){
       return SQLITE_NOMEM;
@@ -214642,7 +214715,8 @@ static u32 jsonTranslateBlobToText(
       if( sz==0 ) goto malformed_jsonb;
       if( zIn[0]=='-' ){
         jsonAppendChar(pOut, '-');
-        k++;
+        if( sz<=1 ) goto malformed_jsonb;
+        k = 1;
       }
       if( zIn[k]=='.' ){
         jsonAppendChar(pOut, '0');
@@ -217605,7 +217679,9 @@ static int jsonSkipLabel(JsonEachCursor *p){
   if( p->eType==JSONB_OBJECT ){
     u32 sz = 0;
     u32 n = jsonbPayloadSize(&p->sParse, p->i, &sz);
-    return p->i + n + sz;
+    sz += p->i + n;
+    if( sz >= p->sParse.nBlob ) sz = p->i;
+    return sz;
   }else{
     return p->i;
   }
@@ -226575,8 +226651,8 @@ static int rbuDeltaApply(
   int lenDelta,          /* Length of the delta */
   char *zOut             /* Write the output into this preallocated buffer */
 ){
-  unsigned int limit;
-  unsigned int total = 0;
+  sqlite3_uint64 limit;
+  sqlite3_uint64 total = 0;
 #if RBU_ENABLE_DELTA_CKSUM
   char *zOrigOut = zOut;
 #endif
@@ -226586,8 +226662,8 @@ static int rbuDeltaApply(
     /* ERROR: size integer not terminated by "\n" */
     return -1;
   }
-  zDelta++; lenDelta--;
-  while( *zDelta && lenDelta>0 ){
+  zDelta++; lenDelta--; /* Skip the \n */
+  while( lenDelta>0 && zDelta[0] ){
     unsigned int cnt, ofst;
     cnt = rbuDeltaGetInt(&zDelta, &lenDelta);
     if( lenDelta<=0 ) return -1;
@@ -226595,7 +226671,7 @@ static int rbuDeltaApply(
       case '@': {
         zDelta++; lenDelta--;
         ofst = rbuDeltaGetInt(&zDelta, &lenDelta);
-        if( lenDelta>0 || zDelta[0]!=',' ){
+        if( lenDelta>0 && zDelta[0]!=',' ){
           /* ERROR: copy command not terminated by ',' */
           return -1;
         }
@@ -226620,7 +226696,7 @@ static int rbuDeltaApply(
           /* ERROR:  insert command gives an output larger than predicted */
           return -1;
         }
-        if( (i64)cnt>(i64)lenDelta ){
+        if( cnt>lenDelta ){
           /* ERROR: insert count exceeds size of delta */
           return -1;
         }
@@ -228633,13 +228709,13 @@ static int rbuGetUpdateStmt(
     char *zUpdate = 0;
 
     pUp->zMask = (char*)&pUp[1];
-    memcpy(pUp->zMask, zMask, pIter->nTblCol);
     pUp->pNext = pIter->pRbuUpdate;
     pIter->pRbuUpdate = pUp;
 
     if( zSet ){
       const char *zPrefix = "";
-
+      assert( p->rc==SQLITE_OK );
+      memcpy(pUp->zMask, zMask, pIter->nTblCol);
       if( pIter->eType!=RBU_PK_VTAB ) zPrefix = "rbu_imp_";
       zUpdate = sqlite3_mprintf("UPDATE \"%s%w\" SET %s WHERE %s",
           zPrefix, pIter->zTbl, zSet, zWhere
@@ -228729,6 +228805,9 @@ static RbuState *rbuLoadState(sqlite3rbu *p){
 
       case RBU_STATE_ROW:
         pRet->nRow = sqlite3_column_int(pStmt, 1);
+        if( pRet->nRow<0 ){
+          rc = SQLITE_CORRUPT;
+        }
         break;
 
       case RBU_STATE_PROGRESS:
@@ -239978,7 +240057,12 @@ static int sessionChangesetToHash(
 
   pIter->in.bNoDiscard = 1;
   while( SQLITE_ROW==(sessionChangesetNext(pIter, &aRec, &nRec, 0)) ){
-    rc = sessionOneChangeIterToHash(pGrp, pIter, bRebase);
+    if( bRebase && pIter->bPatchset ){
+      /* A patchset may not be used as a rebase */
+      rc = SQLITE_ERROR;
+    }else{
+      rc = sessionOneChangeIterToHash(pGrp, pIter, bRebase);
+    }
     if( rc!=SQLITE_OK ) break;
   }
 
@@ -240355,13 +240439,14 @@ static void sessionAppendPartialUpdate(
     int i;
     u8 *a1 = aRec;
     u8 *a2 = aChange;
+    u8 *a2Eof = &a2[nChange];
 
     *pOut++ = SQLITE_UPDATE;
     *pOut++ = pIter->bIndirect;
     for(i=0; i<pIter->nCol; i++){
       int n1 = sessionSerialLen(a1);
-      int n2 = sessionSerialLen(a2);
-      if( pIter->abPK[i] || a2[0]==0 ){
+      int n2 = (a2>=a2Eof) ? 0 : sessionSerialLen(a2);
+      if( n2<=0 || pIter->abPK[i] || a2[0]==0 ){
         if( !pIter->abPK[i] && a1[0] ) bData = 1;
         memcpy(pOut, a1, n1);
         pOut += n1;
@@ -240562,8 +240647,8 @@ SQLITE_API int sqlite3rebaser_configure(
   sqlite3_rebaser *p,
   int nRebase, const void *pRebase
 ){
-  sqlite3_changeset_iter *pIter = 0;   /* Iterator opened on pData/nData */
   int rc;                              /* Return code */
+  sqlite3_changeset_iter *pIter = 0;   /* Iterator opened on pData/nData */
   rc = sqlite3changeset_start(&pIter, nRebase, (void*)pRebase);
   if( rc==SQLITE_OK ){
     rc = sessionChangesetToHash(pIter, &p->grp, 1);
@@ -251389,6 +251474,7 @@ static Fts5Data *fts5DataRead(Fts5Index *p, i64 iRowid){
       pRet = (Fts5Data*)sqlite3_malloc64(nAlloc);
       if( pRet ){
         pRet->nn = nByte;
+        pRet->szLeaf = 0;
         aOut = pRet->p = (u8*)pRet + szData;
       }else{
         rc = SQLITE_NOMEM;
@@ -251401,10 +251487,8 @@ static Fts5Data *fts5DataRead(Fts5Index *p, i64 iRowid){
         sqlite3_free(pRet);
         pRet = 0;
       }else{
-        /* TODO1: Fix this */
         pRet->p[nByte] = 0x00;
         pRet->p[nByte+1] = 0x00;
-        pRet->szLeaf = fts5GetU16(&pRet->p[2]);
       }
     }
     p->rc = rc;
@@ -251425,9 +251509,17 @@ static void fts5DataRelease(Fts5Data *pData){
   sqlite3_free(pData);
 }
 
+/*
+** Read a leaf-page record. This is similar to fts5DataRead(), except that
+** it fills in the Fts5Data.szLeaf value before returning.
+*/
 static Fts5Data *fts5LeafRead(Fts5Index *p, i64 iRowid){
   Fts5Data *pRet = fts5DataRead(p, iRowid);
   if( pRet ){
+    assert( pRet->szLeaf==0 );
+    if( pRet->nn>=4 ){
+      pRet->szLeaf = fts5GetU16(&pRet->p[2]);
+    }
     if( pRet->szLeaf<4 || pRet->szLeaf>pRet->nn ){
       FTS5_CORRUPT_ROWID(p, iRowid);
       fts5DataRelease(pRet);
@@ -255668,7 +255760,7 @@ static void fts5SecureDeleteOverflow(
     int iNext = 0;
     u8 *aPg = 0;
 
-    pLeaf = fts5DataRead(p, iRowid);
+    pLeaf = fts5LeafRead(p, iRowid);
     if( pLeaf==0 ) break;
     aPg = pLeaf->p;
 
@@ -255676,7 +255768,7 @@ static void fts5SecureDeleteOverflow(
     if( iNext!=0 ){
       *pbLastInDoclist = 0;
     }
-    if( iNext==0 && pLeaf->szLeaf!=pLeaf->nn ){
+    if( iNext==0 && pLeaf->szLeaf<pLeaf->nn ){
       fts5GetVarint32(&aPg[pLeaf->szLeaf], iNext);
     }
 
@@ -255963,7 +256055,7 @@ static void fts5DoSecureDelete(
     /* The entry being removed may be the only position list in
     ** its doclist. */
     for(iPgno=pSeg->iLeafPgno-1; iPgno>pSeg->iTermLeafPgno; iPgno-- ){
-      Fts5Data *pPg = fts5DataRead(p, FTS5_SEGMENT_ROWID(iSegid, iPgno));
+      Fts5Data *pPg = fts5LeafRead(p, FTS5_SEGMENT_ROWID(iSegid, iPgno));
       int bEmpty = (pPg && pPg->nn==4);
       fts5DataRelease(pPg);
       if( bEmpty==0 ) break;
@@ -255971,7 +256063,7 @@ static void fts5DoSecureDelete(
 
     if( iPgno==pSeg->iTermLeafPgno ){
       i64 iId = FTS5_SEGMENT_ROWID(iSegid, pSeg->iTermLeafPgno);
-      Fts5Data *pTerm = fts5DataRead(p, iId);
+      Fts5Data *pTerm = fts5LeafRead(p, iId);
       if( pTerm && pTerm->szLeaf==pSeg->iTermLeafOffset ){
         u8 *aTermIdx = &pTerm->p[pTerm->szLeaf];
         int nTermIdx = pTerm->nn - pTerm->szLeaf;
@@ -258923,7 +259015,7 @@ static void fts5IndexIntegrityCheckEmpty(
   /* Now check that the iter.nEmpty leaves following the current leaf
   ** (a) exist and (b) contain no terms. */
   for(i=iFirst; p->rc==SQLITE_OK && i<=iLast; i++){
-    Fts5Data *pLeaf = fts5DataRead(p, FTS5_SEGMENT_ROWID(pSeg->iSegid, i));
+    Fts5Data *pLeaf = fts5LeafRead(p, FTS5_SEGMENT_ROWID(pSeg->iSegid, i));
     if( pLeaf ){
       if( !fts5LeafIsTermless(pLeaf)
        || (i>=iNoRowid && 0!=fts5LeafFirstRowidOff(pLeaf))
@@ -262779,19 +262871,23 @@ static int fts5ApiPhraseFirstColumn(
 
   if( pConfig->eDetail==FTS5_DETAIL_COLUMNS ){
     Fts5Sorter *pSorter = pCsr->pSorter;
-    int n;
-    if( pSorter ){
-      int i1 = (iPhrase==0 ? 0 : pSorter->aIdx[iPhrase-1]);
-      n = pSorter->aIdx[iPhrase] - i1;
-      pIter->a = &pSorter->aPoslist[i1];
+    if( iPhrase<0 || iPhrase>=sqlite3Fts5ExprPhraseCount(pCsr->pExpr) ){
+      rc = SQLITE_RANGE;
     }else{
-      rc = sqlite3Fts5ExprPhraseCollist(pCsr->pExpr, iPhrase, &pIter->a, &n);
-    }
-    if( rc==SQLITE_OK ){
-      assert( pIter->a || n==0 );
-      pIter->b = (pIter->a ? &pIter->a[n] : 0);
-      *piCol = 0;
-      fts5ApiPhraseNextColumn(pCtx, pIter, piCol);
+      int n;
+      if( pSorter ){
+        int i1 = (iPhrase==0 ? 0 : pSorter->aIdx[iPhrase-1]);
+        n = pSorter->aIdx[iPhrase] - i1;
+        pIter->a = &pSorter->aPoslist[i1];
+      }else{
+        rc = sqlite3Fts5ExprPhraseCollist(pCsr->pExpr, iPhrase, &pIter->a, &n);
+      }
+      if( rc==SQLITE_OK ){
+        assert( pIter->a || n==0 );
+        pIter->b = (pIter->a ? &pIter->a[n] : 0);
+        *piCol = 0;
+        fts5ApiPhraseNextColumn(pCtx, pIter, piCol);
+      }
     }
   }else{
     int n;
@@ -263699,7 +263795,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-07-02 09:52:03 0d70a15c3b35e9af3052042cd5332db1b38a66416f1c3c8a50d342395bf22c01", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2d596c42d2e8a4", -1, SQLITE_TRANSIENT);
 }
 
 /*

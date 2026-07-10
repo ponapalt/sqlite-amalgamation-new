@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-07-02 09:52:03 0d70a15c3b35e9af3052042cd5332db1b38a66416f1c3c8a50d-experimental"
+#define SQLITE_SOURCE_ID      "2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-07-02T09:52:03.709Z"
+#define SQLITE_SCM_DATETIME   "2026-07-10T15:06:05.593Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -4432,6 +4432,10 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 ** [[SQLITE_LIMIT_WORKER_THREADS]] ^(<dt>SQLITE_LIMIT_WORKER_THREADS</dt>
 ** <dd>The maximum number of auxiliary worker threads that a single
 ** [prepared statement] may start.</dd>)^
+**
+** [[SQLITE_LIMIT_SCHEMA]] ^(<dt>SQLITE_LIMIT_SCHEMA</dt>
+** <dd>The maximum number of objects (tables, indexes, triggers, and views)
+** defined by the database schema.</dd>)^
 ** </dl>
 */
 #define SQLITE_LIMIT_LENGTH                    0
@@ -4447,6 +4451,7 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 #define SQLITE_LIMIT_TRIGGER_DEPTH            10
 #define SQLITE_LIMIT_WORKER_THREADS           11
 #define SQLITE_LIMIT_PARSER_DEPTH             12
+#define SQLITE_LIMIT_SCHEMA                   13
 
 /*
 ** CAPI3REF: Prepare Flags
