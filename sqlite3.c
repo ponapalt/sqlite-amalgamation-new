@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 4ff362a4c2897e2b438d3d8fc88a01226452 with changes in files:
+** 6924895d2cbc50971d8da1810423ad15c638 with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2-experimental"
+#define SQLITE_SOURCE_ID      "2026-07-16 23:55:15 6924895d2cbc50971d8da1810423ad15c638dabc31b4f1083dd-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-07-10T15:06:05.593Z"
+#define SQLITE_SCM_DATETIME   "2026-07-16T23:55:15.551Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -6805,7 +6805,11 @@ typedef void (*sqlite3_destructor_type)(void*);
 **
 ** ^The sqlite3_result_zeroblob(C,N) and sqlite3_result_zeroblob64(C,N)
 ** interfaces set the result of the application-defined function to be
-** a BLOB containing all zero bytes and N bytes in size.
+** a BLOB containing all zero bytes and N bytes in size.  The
+** zeroblob64(C,N) interface returns a [result code], which is normally
+** [SQLITE_OK] but might be some other value if the requested operation
+** could not be complete, for example if insufficient memory is available
+** or if the value of N is out of range.
 **
 ** ^The sqlite3_result_double() interface sets the result from
 ** an application-defined function to be a floating point value specified
@@ -15323,7 +15327,9 @@ struct fts5_api {
 ** where multiple cases go to the same block of code, testcase()
 ** can insure that all cases are evaluated.
 */
-#if defined(SQLITE_COVERAGE_TEST) || defined(SQLITE_DEBUG)
+#if defined(SQLITE_MUTATION_TEST)
+# define testcase(X)
+#elif defined(SQLITE_COVERAGE_TEST) || defined(SQLITE_DEBUG)
 # ifndef SQLITE_AMALGAMATION
     extern unsigned int sqlite3CoverageCounter;
 # endif
@@ -26568,7 +26574,7 @@ static int parseModifier(
       if( sqlite3_strnicmp(z, "weekday ", 8)==0
        && sqlite3AtoF(&z[8], &r)>0
        && r>=-6.0 && r<=6.0
-       && (n=(int)r)==r
+       && sqlite3RealSameAsInt(r,(i64)(n=(int)r))
       ){
         sqlite3_int64 Z;
         computeYMD_HMS(p);
@@ -93685,10 +93691,11 @@ SQLITE_API void sqlite3_result_str(sqlite3_context *pCtx, sqlite3_str *pStr, int
   if( pCtx==0 ) return;
   if( pStr==0 ) return;
 #endif
+  testcase( pStr==(sqlite3_str*)&sqlite3OomStr );
   if( pStr->accError==0 ){
     if( pStr->nChar==0 ){
       setResultStrOrError(pCtx, "", 0, SQLITE_UTF8_ZT, SQLITE_STATIC);
-      if( eOwn ) sqlite3_str_reset(pStr);
+      sqlite3_str_reset(pStr);
     }else{
       const char *zText = sqlite3_str_value(pStr);
       /* Only internal code has the ability to capture a pointer to
@@ -93703,6 +93710,7 @@ SQLITE_API void sqlite3_result_str(sqlite3_context *pCtx, sqlite3_str *pStr, int
       }else{
         setResultStrOrError(pCtx, zText, pStr->nChar,
                             SQLITE_UTF8_ZT, SQLITE_DYNAMIC);
+        sqlite3StrAccumInit(pStr, pStr->db, 0, 0, pStr->mxAlloc);
       }
     }
   }else if( pStr->accError==SQLITE_NOMEM ){
@@ -93711,14 +93719,8 @@ SQLITE_API void sqlite3_result_str(sqlite3_context *pCtx, sqlite3_str *pStr, int
     assert( pStr->accError==SQLITE_TOOBIG );
     sqlite3_result_error_toobig(pCtx);
   }
-  if( eOwn ){
-    testcase( pStr==(sqlite3_str*)&sqlite3OomStr );
-    if( pStr->accError==0 ){
-      sqlite3StrAccumInit(pStr, pStr->db, 0, 0, pStr->mxAlloc);
-    }
-    if( eOwn==SQLITE_FINISH ){
-      sqlite3_str_free(pStr);
-    }
+  if( eOwn==SQLITE_FINISH ){
+    sqlite3_str_free(pStr);
   }
 }
 
@@ -136363,13 +136365,17 @@ static void percentSort(
   unsigned int n,                 /* Number of elements in array a[] */
   int iReq                        /* Element caller cares about (or -ve) */
 ){
-  int iLt;  /* Entries before a[iLt] are less than rPivot */
-  int iGt;  /* Entries at or after a[iGt] are greater than rPivot */
+  int iLt;       /* Entries before a[iLt] are less than or equal to rPivot */
+  int iGt;       /* Entries a[iGt] and after are greater or equal to rPivot */
   int i;         /* Loop counter */
   double rPivot; /* The pivot value */
 
   assert( n>=2 );
   do{
+    /* Put the first, middle, and last elements in sorted order.
+    ** After doing so, return immediately if the array contains
+    ** three or fewer elements as there is nothing more to do.
+    */
     if( a[0]>a[n-1] ){
       SWAP_DOUBLE(a[0],a[n-1])
     }
@@ -136382,6 +136388,11 @@ static void percentSort(
       SWAP_DOUBLE(a[i],a[iGt])
     }
     if( n==3 ) return;
+
+    /* Take the value of the middle element as the pivot.  Shuffle
+    ** values around so that all elements less than the pivot come
+    ** before all elements greater than the pivot.
+    */
     rPivot = a[i];
     iLt = i = 1;
     do{
@@ -136399,8 +136410,12 @@ static void percentSort(
       }
     }while( i<iGt );
 
+    assert( iLt>0 && iLt<iGt && iGt<n );
+    testcase( iGt>iLt+1 );
     assert( a[iLt]==rPivot );
-    assert( iGt>iLt );
+    assert( a[iLt-1]<=rPivot );
+    assert( a[iGt]>=rPivot );
+    assert( a[iLt+1]>=rPivot );
 
     if( iReq>=0 ){
       /* In this case, the only elements that the caller requires sorted into
@@ -173497,7 +173512,7 @@ static int whereLoopAddAll(WhereLoopBuilder *pBuilder){
     if( IsVirtual(pItem->pSTab) ){
       SrcItem *p;
       for(p=&pItem[1]; p<pEnd; p++){
-        if( mUnusable || (p->fg.jointype & (JT_OUTER|JT_CROSS)) ){
+        if( (p->fg.jointype & (JT_OUTER|JT_CROSS)) ){
           mUnusable |= sqlite3WhereGetMask(&pWInfo->sMaskSet, p->iCursor);
         }
       }
@@ -263795,7 +263810,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2d596c42d2e8a4", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-07-16 23:55:15 6924895d2cbc50971d8da1810423ad15c638dabc31b4f1083dd6076e20492ef4", -1, SQLITE_TRANSIENT);
 }
 
 /*

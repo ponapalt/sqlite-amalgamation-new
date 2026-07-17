@@ -766,7 +766,7 @@ int sqlite3_format_query_result(
 #define QRF_STYLE_Csv       4 /* Comma-separated-value */
 #define QRF_STYLE_Eqp       5 /* Format EXPLAIN QUERY PLAN output */
 #define QRF_STYLE_Explain   6 /* EXPLAIN output */
-#define QRF_STYLE_Html      7 /* Generate an XHTML table */
+#define QRF_STYLE_Html      7 /* Generate HTML-style <tr><td> output */
 #define QRF_STYLE_Insert    8 /* Generate SQL "insert" statements */
 #define QRF_STYLE_Json      9 /* Output is a list of JSON objects */
 #define QRF_STYLE_JObject  10 /* Independent JSON objects for each row */
@@ -3493,13 +3493,13 @@ static void qrfSimpleTitle(Qrf *p){
   switch( p->spec.eStyle ){
     case QRF_STYLE_Html: {
       int i;
-      sqlite3_str_append(p->pOut, "<TR>", 4);
+      sqlite3_str_append(p->pOut, "<tr>", 4);
       for(i=0; i<p->nCol; i++){
         const char *zCName = sqlite3_column_name(p->pStmt, i);
-        sqlite3_str_append(p->pOut, "\n<TH>", 5);
+        sqlite3_str_append(p->pOut, "\n<th>", 5);
         qrfEncodeText(p, p->pOut, zCName);
       }
-      sqlite3_str_append(p->pOut, "\n</TR>\n", 7);
+      sqlite3_str_append(p->pOut, "\n</tr>\n", 7);
       break;
     }
     case QRF_STYLE_Quote:
@@ -3555,12 +3555,12 @@ static void qrfOneSimpleRow(Qrf *p){
       if( p->nRow==0 && p->spec.bTitles>=QRF_Yes ){
         qrfSimpleTitle(p);
       }
-      sqlite3_str_append(p->pOut, "<TR>", 4);
+      sqlite3_str_append(p->pOut, "<tr>", 4);
       for(i=0; i<p->nCol; i++){
-        sqlite3_str_append(p->pOut, "\n<TD>", 5);
+        sqlite3_str_append(p->pOut, "\n<td>", 5);
         qrfRenderValue(p, p->pOut, i);
       }
-      sqlite3_str_append(p->pOut, "\n</TR>\n", 7);
+      sqlite3_str_append(p->pOut, "\n</tr>\n", 7);
       qrfWrite(p);
       break;
     }
@@ -24841,6 +24841,16 @@ int sqlite3_recover_finish(sqlite3_recover *p){
 # include SHELL_STRINGIFY(SQLITE_SHELL_EXTSRC)
 #endif
 
+/*
+** Set the SQLITE_SHELL_EDITION to a YYYYMMDD date string and the
+** code will attempt to use defaults for the prompt and for the
+** initial output mode (and maybe other feature) that were for
+** the most recent version not newer than the specified date.
+*/
+#ifndef SQLITE_SHELL_EDITION
+# define SQLITE_SHELL_EDITION 99991231  /* Use the latest if unspecified */
+#endif
+
 #if defined(SQLITE_ENABLE_SESSION)
 /*
 ** State information for a single open session
@@ -25486,7 +25496,9 @@ static const char *shellPromptAppDef(int c){
   switch( c ){
     /* The default main prompt string */
     case 1:
-#if   defined(SQLITE_PS1)
+#if   SQLITE_SHELL_EDITION<20260423
+      return "sqlite> ";  /* Legacy prompt for backwards compatibility */
+#elif defined(SQLITE_PS1)
       return SQLITE_PS1;
 #else
       if( shellNoColor() ){
@@ -25498,7 +25510,9 @@ static const char *shellPromptAppDef(int c){
 
     /* The default continuation prompt string */
     case 2:
-#if   defined(SQLITE_PS2)
+#if   SQLITE_SHELL_EDITION<20260423
+      return "   ...> ";  /* Legacy continuation prompt */
+#elif defined(SQLITE_PS2)
       return SQLITE_PS2;
 #else
       if( shellNoColor() ){
@@ -26728,7 +26742,9 @@ static void modeChange(ShellState *p, unsigned char eMode){
 static void modeDefault(ShellState *p){
   p->mode.spec.iVersion = 2;
   p->mode.autoExplain = 1;
-  if( stdin_is_interactive || stdout_is_console ){
+  if( (stdin_is_interactive || stdout_is_console)
+   && SQLITE_SHELL_EDITION>=20260409
+  ){
     modeChange(p, MODE_TTY);
   }else{
     modeChange(p, MODE_BATCH);

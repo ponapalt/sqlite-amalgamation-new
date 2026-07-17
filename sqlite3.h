@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-07-10 15:06:05 4ff362a4c2897e2b438d3d8fc88a012264526fa617f058be5a2-experimental"
+#define SQLITE_SOURCE_ID      "2026-07-16 23:55:15 6924895d2cbc50971d8da1810423ad15c638dabc31b4f1083dd-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-07-10T15:06:05.593Z"
+#define SQLITE_SCM_DATETIME   "2026-07-16T23:55:15.551Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -6484,7 +6484,11 @@ typedef void (*sqlite3_destructor_type)(void*);
 **
 ** ^The sqlite3_result_zeroblob(C,N) and sqlite3_result_zeroblob64(C,N)
 ** interfaces set the result of the application-defined function to be
-** a BLOB containing all zero bytes and N bytes in size.
+** a BLOB containing all zero bytes and N bytes in size.  The
+** zeroblob64(C,N) interface returns a [result code], which is normally
+** [SQLITE_OK] but might be some other value if the requested operation
+** could not be complete, for example if insufficient memory is available
+** or if the value of N is out of range.
 **
 ** ^The sqlite3_result_double() interface sets the result from
 ** an application-defined function to be a floating point value specified
