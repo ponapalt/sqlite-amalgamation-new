@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 180e75e07630b4fa7abdd28ad889e2703107 with changes in files:
+** 8b3da5d6cea2e3b31784f5e8f05c4801a3d8 with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-07-29 23:47:55 180e75e07630b4fa7abdd28ad889e27031071555078989c40a8-experimental"
+#define SQLITE_SOURCE_ID      "2026-08-07 13:33:54 8b3da5d6cea2e3b31784f5e8f05c4801a3d881039aa26ecadf3-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-07-29T23:47:55.133Z"
+#define SQLITE_SCM_DATETIME   "2026-08-07T13:33:54.415Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -57864,8 +57864,11 @@ static PgHdr1 *pcache1FetchNoMutex(
   PCache1 *pCache = (PCache1 *)p;
   PgHdr1 *pPage = 0;
 
-  /* Step 1: Search the hash table for an existing entry. */
-  pPage = pCache->apHash[iKey % pCache->nHash];
+  /* Step 1: Search the hash table for an existing entry.  nHash is always
+  ** a power of two when the cache is in use (see pcache1ResizeHash()), so
+  ** the modulo reduces to a mask, avoiding a hardware divide. */
+  assert( pCache->nHash>0 && (pCache->nHash & (pCache->nHash-1))==0 );
+  pPage = pCache->apHash[iKey & (pCache->nHash-1u)];
   while( pPage && pPage->iKey!=iKey ){ pPage = pPage->pNext; }
 
   /* Step 2: If the page was found in the hash table, then return it.
@@ -96612,7 +96615,7 @@ static u64 filterHash(const Mem *aMem, const Op *pOp){
     }else if( p->flags & MEM_Str ){
       u64 x;
       h += p->n;
-      if( p->n >= sizeof(x) ){
+      if( p->n >= (int)sizeof(x) ){
         memcpy(&x, p->z, sizeof(x));
         h += x;
         memcpy(&x, p->z + p->n - sizeof(x), sizeof(x));
@@ -96626,7 +96629,7 @@ static u64 filterHash(const Mem *aMem, const Op *pOp){
       int n = p->n;
       u64 x = 0;
       if( n ){
-        memcpy(&x, p->z, MIN(n, sizeof(x)));
+        memcpy(&x, p->z, MIN(n, (int)sizeof(x)));
         h += x;
       }
       h += n;
@@ -106274,6 +106277,7 @@ struct VdbeSorter {
 
 #define SORTER_TYPE_INTEGER 0x01
 #define SORTER_TYPE_TEXT    0x02
+#define SORTER_TYPE_REAL    0x04
 
 /*
 ** An instance of the following object is used to read records out of a
@@ -106847,6 +106851,185 @@ static int vdbeSorterCompareInt(
   return res;
 }
 
+/* Helper function for vdbeSorterCompareReal().
+**
+** The first elements of both pKey1 and pKey2 have been decoded into double
+** values r1 and r2.  Do the comparison between those keys and return the
+** result.  If r1==r2, break the tie with a comparison of subsequent elements
+** from each key.
+*/
+static int vdbeSorterFinishRealCompare(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2,   /* Right side of comparison */
+  double r1,                      /* REAL value of first element of pKey1 */
+  double r2                       /* REAL value of first element of pKey2 */
+){
+  int res;
+  if( r1<r2 ){
+    res = -1;
+  }else if( r1>r2 ){
+    res = +1;
+  }else{
+    res = 0;
+  }
+  assert( pTask->pSorter->pKeyInfo->aSortFlags!=0 );
+  if( res==0 ){
+    if( pTask->pSorter->pKeyInfo->nKeyField>1 ){
+      res = vdbeSorterCompareTail(
+          pTask, pbKey2Cached, pKey1, nKey1, pKey2, nKey2
+      );
+    }
+  }else if( pTask->pSorter->pKeyInfo->aSortFlags[0] ){
+    assert( !(pTask->pSorter->pKeyInfo->aSortFlags[0]&KEYINFO_ORDER_BIGNULL) );
+    res = res * -1;
+  }
+  return res;
+}
+
+/* Helper function for vdbeSorterCompareReal().
+**
+** Read the bits of an 8-byte big-endian IEEE-754 value and store them
+** into a u64.  Do any necessary byte-swapping so that the bits are in
+** the right order for the host machine.
+**
+** Copied and slightly modified from the readInt64() routine in rtree.c
+*/
+static u64 vdbeSorterDecodeU64(const u8 *p){
+#if SQLITE_BYTEORDER==1234 && MSVC_VERSION>=1300
+  u64 x;
+  memcpy(&x, p, 8);
+  return _byteswap_uint64(x);
+#elif SQLITE_BYTEORDER==1234 && GCC_VERSION>=4003000
+  u64 x;
+  memcpy(&x, p, 8);
+  return __builtin_bswap64(x);
+#elif SQLITE_BYTEORDER==4321
+  i64 x;
+  memcpy(&x, p, 8);
+  return x;
+#else
+  return (i64)(
+    (((u64)p[0]) << 56) +
+    (((u64)p[1]) << 48) +
+    (((u64)p[2]) << 40) +
+    (((u64)p[3]) << 32) +
+    (((u64)p[4]) << 24) +
+    (((u64)p[5]) << 16) +
+    (((u64)p[6]) <<  8) +
+    (((u64)p[7]) <<  0)
+  );
+#endif
+}
+
+/* Helper function for vdbeSorterCompareReal().
+**
+** Buffer p[] is a record where the first term is guaranteed to be either
+** a floating-point value, or an integer stand-in for a floating point
+** value (a MEM_IntReal).  Whatever its format, extract the value and
+** return it.
+*/
+static double vdbeSorterGetReal(const u8 *p){
+  double r;                    /* the return value */
+
+  assert( p[0]<0x80 );         /* 1-byte headers: nAllField<13 */
+  assert( p[1]>0 && p[1]<10 ); /* first fields proven numeric */
+
+  if( p[1]==7 ){
+    u64 x = vdbeSorterDecodeU64(p + p[0]);
+    swapMixedEndianFloat(x);
+    assert( !IsNaN(x) );
+    memcpy(&r, &x, sizeof(r));
+  }else{
+    Mem m;
+    m.u.i = 0;
+    sqlite3VdbeSerialGet(p + p[0], p[1], &m);
+    assert( m.flags==MEM_Int );
+    r = (double)m.u.i;
+  }
+  return r;
+}
+
+/* Helper function for vdbeSorterCompareReal()
+**
+** This routine handles the case of comparing two floating-point values
+** where one or both of the floating-point are represented by integers.
+** In other words, where one both is an MEM_RealInt.
+**
+** This subroutine is factored out from vdbeSorterCompareReal() for
+** efficiency.  If inlined into vdbeSorterCompareReal(), this routine
+** will use extra stack space and consume CPU cycles setting up and
+** breaking down that stack space, even if in the common case where
+** this path is not used.
+*/
+static SQLITE_NOINLINE int vdbeSorterCompareRealInt(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  const u8 * const p1 = (const u8 * const)pKey1;
+  const u8 * const p2 = (const u8 * const)pKey2;
+  if( p1[1]==6 || p2[1]==6 ){
+    /* 64-bit integer values cannot be represented exactly by a double so
+    ** must be handled by the generalized comparison function. */
+    return vdbeSorterCompare(pTask,
+       pbKey2Cached, pKey1,nKey1, pKey2,nKey2);
+  }else{
+    double r1 = vdbeSorterGetReal(p1);
+    double r2 = vdbeSorterGetReal(p2);
+    return vdbeSorterFinishRealCompare(pTask,pbKey2Cached,
+                  pKey1,nKey1,pKey2,nKey2,r1,r2);
+  }
+}
+
+/*
+** Comparison function optimized for the case where the first term
+** of both keys are either MEM_Real or MEM_RealInt.
+**
+** See also vdbeSorterCompareInt() for MEM_Int values and
+** vdbeSorterCompareText() for MEM_Str values.  The general
+** case is vdbeSorterCompare() which handles anything, but is slower.
+*/
+static int vdbeSorterCompareReal(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  const u8*const p1 = (const u8*const)pKey1;  /* Left key record */
+  const u8*const p2 = (const u8*const)pKey2;  /* Right key record */
+  u64 x;                   /* A real value stored as an integer */
+  double r1;               /* First element of pKey1 */
+  double r2;               /* First element of pKey2 */
+
+  assert( p1[0]<0x80 && p2[0]<0x80 );  /* 1-byte headers: nAllField<13 */
+  assert( p1[1]>0 && p1[1]<10 );       /* first field guaranteed numeric */
+  assert( p2[1]>0 && p2[1]<10 );       /* first field guaranteed numeric */
+
+  if( p1[1]!=7 || p2[1]!=7 ){
+    /* One or both floating point values are stored as INTEGER.  This might
+    ** be because of the MEM_RealInt encoding.  Try to optimize that case. */
+    return vdbeSorterCompareRealInt(pTask,
+       pbKey2Cached, pKey1,nKey1, pKey2,nKey2
+    );
+  }
+  assert( p1[0]<=nKey1-8 && p2[0]<=nKey2-8 );
+
+  x = vdbeSorterDecodeU64(p1 + *p1);
+  swapMixedEndianFloat(x);
+  assert( !IsNaN(x) );
+  memcpy(&r1, &x, sizeof(r1));
+  x = vdbeSorterDecodeU64(p2 + *p2);
+  swapMixedEndianFloat(x);
+  assert( !IsNaN(x) );
+  memcpy(&r2, &x, sizeof(r2));
+  return vdbeSorterFinishRealCompare(pTask,
+      pbKey2Cached, pKey1,nKey1,  pKey2,nKey2, r1, r2
+  );
+}
+
 /*
 ** Initialize the temporary index cursor just opened as a sorter cursor.
 **
@@ -106969,7 +107152,7 @@ SQLITE_PRIVATE int sqlite3VdbeSorterInit(
      && (pKeyInfo->aColl[0]==0 || pKeyInfo->aColl[0]==db->pDfltColl)
      && (pKeyInfo->aSortFlags[0] & KEYINFO_ORDER_BIGNULL)==0
     ){
-      pSorter->typeMask = SORTER_TYPE_INTEGER | SORTER_TYPE_TEXT;
+      pSorter->typeMask = SORTER_TYPE_INTEGER|SORTER_TYPE_TEXT|SORTER_TYPE_REAL;
     }
   }
 
@@ -107341,10 +107524,12 @@ static SorterRecord *vdbeSorterMerge(
 ** sorter object passed as the only argument.
 */
 static SorterCompare vdbeSorterGetCompare(VdbeSorter *p){
-  if( p->typeMask==SORTER_TYPE_INTEGER ){
+  if( p->typeMask & SORTER_TYPE_INTEGER ){
     return vdbeSorterCompareInt;
-  }else if( p->typeMask==SORTER_TYPE_TEXT ){
+  }else if( p->typeMask & SORTER_TYPE_TEXT ){
     return vdbeSorterCompareText;
+  }else if( p->typeMask & SORTER_TYPE_REAL ){
+    return vdbeSorterCompareReal;
   }
   return vdbeSorterCompare;
 }
@@ -107742,8 +107927,12 @@ SQLITE_PRIVATE int sqlite3VdbeSorterWrite(
   assert( pCsr->eCurType==CURTYPE_SORTER );
   pSorter = pCsr->uc.pSorter;
   getVarint32NR((const u8*)&pVal->z[1], t);
-  if( t>0 && t<10 && t!=7 ){
-    pSorter->typeMask &= SORTER_TYPE_INTEGER;
+  if( t>0 && t<10 ){
+    if( t==7 ){
+      pSorter->typeMask &= SORTER_TYPE_REAL;
+    }else{
+      pSorter->typeMask &= (SORTER_TYPE_INTEGER|SORTER_TYPE_REAL);
+    }
   }else if( t>10 && (t & 0x01) ){
     pSorter->typeMask &= SORTER_TYPE_TEXT;
   }else{
@@ -136464,7 +136653,7 @@ static void percentSort(
       }
     }while( i<iGt );
 
-    assert( iLt>0 && iLt<iGt && iGt<n );
+    assert( iLt>0 && iLt<iGt && (unsigned)iGt<n );
     testcase( iGt>iLt+1 );
     assert( a[iLt]==rPivot );
     assert( a[iLt-1]<=rPivot );
@@ -168197,6 +168386,7 @@ exprAnalyze_restart:
 #ifndef SQLITE_OMIT_WINDOWFUNC
    && pExpr->x.pSelect->pWin==0
 #endif
+   && (pExpr->x.pSelect->selFlags & SF_MinMaxAgg)==0
    && pWC->op==TK_AND
    && pExpr->x.pSelect->pEList->nExpr <= UMXV(pTerm->nChild)
    /* ^-- See bug 2026-06-04T10:00:49Z */
@@ -201183,7 +201373,7 @@ static int getNextNode(
   iColLen = 0;
   for(ii=0; ii<pParse->nCol; ii++){
     const char *zStr = pParse->azCol[ii];
-    int nStr = (int)strlen(zStr);
+    int nStr = zStr ? (int)strlen(zStr) : 0;
     if( nInput>nStr && zInput[nStr]==':'
      && sqlite3_strnicmp(zStr, zInput, nStr)==0
     ){
@@ -201898,7 +202088,9 @@ static void fts3ExprTestCommon(
     );
   }
 
-  if( rc!=SQLITE_OK && rc!=SQLITE_NOMEM ){
+  if( rc==SQLITE_OK && fts3ExprCheckDepth(pExpr, SQLITE_FTS3_MAX_EXPR_DEPTH) ){
+    sqlite3_result_error(context, "Expression nested too deep", -1);
+  }else if( rc!=SQLITE_OK && rc!=SQLITE_NOMEM ){
     sqlite3_result_error(context, "Error parsing expression", -1);
   }else if( rc==SQLITE_NOMEM || !(zBuf = exprToString(pExpr, 0)) ){
     sqlite3_result_error_nomem(context);
@@ -233000,7 +233192,7 @@ static int dbpageUpdate(
     }
   }
   pBt = pTab->db->aDb[iDb].pBt;
-  if( pgno64<1 || pgno64>4294967294 || NEVER(pBt==0) ){
+  if( pgno64<1 || pgno64>4294967294U || NEVER(pBt==0) ){
     zErr = "bad page number";
     goto update_fail;
   }
@@ -239211,7 +239403,7 @@ static int sessionRetryConstraints(
     if( rc==SQLITE_OK ){
       sqlite3_step(pInsert);
       rc = sqlite3_finalize(pInsert);
-      if( rc==SQLITE_CONSTRAINT ){
+      if( (rc&0xff)==SQLITE_CONSTRAINT ){
         rc = sqlite3_exec(db, "ROLLBACK TO update_op", 0, 0, 0);
         sqlite3_free(pApply->constraints.aBuf);
         pApply->constraints = cons;
@@ -256885,7 +257077,7 @@ static void fts5MergeRowidLists(
   (void)nBuf;
   memset(&out, 0, sizeof(out));
   assert( nBuf==1 );
-  sqlite3Fts5BufferSize(&p->rc, &out, p1->n + p2->n);
+  sqlite3Fts5BufferSize(&p->rc, &out, p1->n + p2->n + 9);
   if( p->rc ) return;
 
   fts5NextRowid(p1, &i1, &iRowid1);
@@ -256893,12 +257085,12 @@ static void fts5MergeRowidLists(
   while( i1>=0 || i2>=0 ){
     if( i1>=0 && (i2<0 || iRowid1<iRowid2) ){
       assert( iOut==0 || iRowid1>iOut );
-      fts5BufferSafeAppendVarint(&out, iRowid1 - iOut);
+      fts5BufferSafeAppendVarint(&out, (u64)iRowid1 - (u64)iOut);
       iOut = iRowid1;
       fts5NextRowid(p1, &i1, &iRowid1);
     }else{
       assert( iOut==0 || iRowid2>iOut );
-      fts5BufferSafeAppendVarint(&out, iRowid2 - iOut);
+      fts5BufferSafeAppendVarint(&out, (u64)iRowid2 - (u64)iOut);
       iOut = iRowid2;
       if( i1>=0 && iRowid1==iRowid2 ){
         fts5NextRowid(p1, &i1, &iRowid1);
@@ -263984,7 +264176,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-07-29 23:47:55 180e75e07630b4fa7abdd28ad889e27031071555078989c40a8c10a1d2905338", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-08-07 13:33:54 8b3da5d6cea2e3b31784f5e8f05c4801a3d881039aa26ecadf3a50b4454a3de6", -1, SQLITE_TRANSIENT);
 }
 
 /*
