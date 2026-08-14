@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 39ae2b7c59505aeb198fb16eab3f3ea1b42e with changes in files:
+** 2530b5ada6e814931db257d3b5ca756032f2 with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-08-12 00:51:14 39ae2b7c59505aeb198fb16eab3f3ea1b42eb35bc38776f3579-experimental"
+#define SQLITE_SOURCE_ID      "2026-08-14 15:17:24 2530b5ada6e814931db257d3b5ca756032f2c004a2d96cb2d99-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-08-12T00:51:14.120Z"
+#define SQLITE_SCM_DATETIME   "2026-08-14T15:17:24.791Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -22167,6 +22167,7 @@ SQLITE_PRIVATE void sqlite3ExprListSetName(Parse*,ExprList*,const Token*,int);
 SQLITE_PRIVATE void sqlite3ExprListSetSpan(Parse*,ExprList*,const char*,const char*);
 SQLITE_PRIVATE void sqlite3ExprListDelete(sqlite3*, ExprList*);
 SQLITE_PRIVATE void sqlite3ExprListDeleteGeneric(sqlite3*,void*);
+SQLITE_PRIVATE int sqlite3ExprCanReturnSubtype(Parse*,Expr*);
 SQLITE_PRIVATE u32 sqlite3ExprListFlags(const ExprList*);
 SQLITE_PRIVATE int sqlite3IndexHasDuplicateRootPage(Index*);
 SQLITE_PRIVATE int sqlite3Init(sqlite3*, char**);
@@ -22546,6 +22547,7 @@ SQLITE_PRIVATE int sqlite3VListNameToNum(VList*,const char*,int);
 */
 SQLITE_PRIVATE int sqlite3PutVarint(unsigned char*, u64);
 SQLITE_PRIVATE u8 sqlite3GetVarint(const unsigned char *, u64 *);
+SQLITE_PRIVATE i64 sqlite3VarintValue(const unsigned char*);
 SQLITE_PRIVATE u8 sqlite3GetVarint32(const unsigned char *, u32 *);
 SQLITE_PRIVATE int sqlite3VarintLen(u64 v);
 
@@ -22561,9 +22563,6 @@ SQLITE_PRIVATE int sqlite3VarintLen(u64 v);
 #define putVarint32(A,B)  \
   (u8)(((u32)(B)<(u32)0x80)?(*(A)=(unsigned char)(B)),1:\
   sqlite3PutVarint((A),(B)))
-#define getVarint    sqlite3GetVarint
-#define putVarint    sqlite3PutVarint
-
 
 SQLITE_PRIVATE const char *sqlite3IndexAffinityStr(sqlite3*, Index*);
 SQLITE_PRIVATE char *sqlite3TableAffinityStr(sqlite3*,const Table*);
@@ -38347,170 +38346,82 @@ SQLITE_PRIVATE int sqlite3PutVarint(unsigned char *p, u64 v){
 }
 
 /*
-** Bitmasks used by sqlite3GetVarint().  These precomputed constants
-** are defined here rather than simply putting the constant expressions
-** inline in order to work around bugs in the RVT compiler.
-**
-** SLOT_2_0     A mask for  (0x7f<<14) | 0x7f
-**
-** SLOT_4_2_0   A mask for  (0x7f<<28) | SLOT_2_0
-*/
-#define SLOT_2_0     0x001fc07f
-#define SLOT_4_2_0   0xf01fc07f
-
-
-/*
 ** Read a 64-bit variable-length integer from memory starting at p[0].
 ** Return the number of bytes read.  The value is stored in *v.
 */
 SQLITE_PRIVATE u8 sqlite3GetVarint(const unsigned char *p, u64 *v){
-  u32 a,b,s;
-
-  if( ((signed char*)p)[0]>=0 ){
-    *v = *p;
-    return 1;
+  u64 iKey = p[0];
+  const u8 *pStart = p;
+  if( iKey>=0x80 ){
+    u8 x;
+    iKey = (iKey<<7) ^ (x = *++p);
+    if( x>=0x80 ){
+      iKey = (iKey<<7) ^ (x = *++p);
+      if( x>=0x80 ){
+        iKey = (iKey<<7) ^ 0x10204000 ^ (x = *++p);
+        if( x>=0x80 ){
+          iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+          if( x>=0x80 ){
+            iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+            if( x>=0x80 ){
+              iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+              if( x>=0x80 ){
+                iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+                if( x>=0x80 ){
+                  iKey = (iKey<<8) ^ 0x8000 ^ (*++p);
+                }
+              }
+            }
+          }
+        }
+      }else{
+        iKey ^= 0x204000;
+      }
+    }else{
+      iKey ^= 0x4000;
+    }
   }
-  if( ((signed char*)p)[1]>=0 ){
-    *v = ((u32)(p[0]&0x7f)<<7) | p[1];
-    return 2;
+  *v = iKey;
+  return (u8)(p - pStart) + 1;
+}
+
+/*
+** Return the value of a variable-length integer without computing
+** its length.  This is an optimization on sqlite3GetVarint() for the
+** cases when the return value of sqlite3GetVarint() is not needed.
+*/
+SQLITE_PRIVATE i64 sqlite3VarintValue(const unsigned char *p){
+  u64 iKey = p[0];
+  if( iKey>=0x80 ){
+    u8 x;
+    iKey = (iKey<<7) ^ (x = *++p);
+    if( x>=0x80 ){
+      iKey = (iKey<<7) ^ (x = *++p);
+      if( x>=0x80 ){
+        iKey = (iKey<<7) ^ 0x10204000 ^ (x = *++p);
+        if( x>=0x80 ){
+          iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+          if( x>=0x80 ){
+            iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+            if( x>=0x80 ){
+              iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+              if( x>=0x80 ){
+                iKey = (iKey<<7) ^ 0x4000 ^ (x = *++p);
+                if( x>=0x80 ){
+                  iKey = (iKey<<8) ^ 0x8000 ^ (*++p);
+                }
+              }
+            }
+          }
+        }
+      }else{
+        iKey ^= 0x204000;
+      }
+    }else{
+      iKey ^= 0x4000;
+    }
   }
-
-  /* Verify that constants are precomputed correctly */
-  assert( SLOT_2_0 == ((0x7f<<14) | (0x7f)) );
-  assert( SLOT_4_2_0 == ((0xfU<<28) | (0x7f<<14) | (0x7f)) );
-
-  a = ((u32)p[0])<<14;
-  b = p[1];
-  p += 2;
-  a |= *p;
-  /* a: p0<<14 | p2 (unmasked) */
-  if (!(a&0x80))
-  {
-    a &= SLOT_2_0;
-    b &= 0x7f;
-    b = b<<7;
-    a |= b;
-    *v = a;
-    return 3;
-  }
-
-  /* CSE1 from below */
-  a &= SLOT_2_0;
-  p++;
-  b = b<<14;
-  b |= *p;
-  /* b: p1<<14 | p3 (unmasked) */
-  if (!(b&0x80))
-  {
-    b &= SLOT_2_0;
-    /* moved CSE1 up */
-    /* a &= (0x7f<<14)|(0x7f); */
-    a = a<<7;
-    a |= b;
-    *v = a;
-    return 4;
-  }
-
-  /* a: p0<<14 | p2 (masked) */
-  /* b: p1<<14 | p3 (unmasked) */
-  /* 1:save off p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-  /* moved CSE1 up */
-  /* a &= (0x7f<<14)|(0x7f); */
-  b &= SLOT_2_0;
-  s = a;
-  /* s: p0<<14 | p2 (masked) */
-
-  p++;
-  a = a<<14;
-  a |= *p;
-  /* a: p0<<28 | p2<<14 | p4 (unmasked) */
-  if (!(a&0x80))
-  {
-    /* we can skip these cause they were (effectively) done above
-    ** while calculating s */
-    /* a &= (0x7f<<28)|(0x7f<<14)|(0x7f); */
-    /* b &= (0x7f<<14)|(0x7f); */
-    b = b<<7;
-    a |= b;
-    s = s>>18;
-    *v = ((u64)s)<<32 | a;
-    return 5;
-  }
-
-  /* 2:save off p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-  s = s<<7;
-  s |= b;
-  /* s: p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-
-  p++;
-  b = b<<14;
-  b |= *p;
-  /* b: p1<<28 | p3<<14 | p5 (unmasked) */
-  if (!(b&0x80))
-  {
-    /* we can skip this cause it was (effectively) done above in calc'ing s */
-    /* b &= (0x7f<<28)|(0x7f<<14)|(0x7f); */
-    a &= SLOT_2_0;
-    a = a<<7;
-    a |= b;
-    s = s>>18;
-    *v = ((u64)s)<<32 | a;
-    return 6;
-  }
-
-  p++;
-  a = a<<14;
-  a |= *p;
-  /* a: p2<<28 | p4<<14 | p6 (unmasked) */
-  if (!(a&0x80))
-  {
-    a &= SLOT_4_2_0;
-    b &= SLOT_2_0;
-    b = b<<7;
-    a |= b;
-    s = s>>11;
-    *v = ((u64)s)<<32 | a;
-    return 7;
-  }
-
-  /* CSE2 from below */
-  a &= SLOT_2_0;
-  p++;
-  b = b<<14;
-  b |= *p;
-  /* b: p3<<28 | p5<<14 | p7 (unmasked) */
-  if (!(b&0x80))
-  {
-    b &= SLOT_4_2_0;
-    /* moved CSE2 up */
-    /* a &= (0x7f<<14)|(0x7f); */
-    a = a<<7;
-    a |= b;
-    s = s>>4;
-    *v = ((u64)s)<<32 | a;
-    return 8;
-  }
-
-  p++;
-  a = a<<15;
-  a |= *p;
-  /* a: p4<<29 | p6<<15 | p8 (unmasked) */
-
-  /* moved CSE2 up */
-  /* a &= (0x7f<<29)|(0x7f<<15)|(0xff); */
-  b &= SLOT_2_0;
-  b = b<<8;
-  a |= b;
-
-  s = s<<4;
-  b = p[-4];
-  b &= 0x7f;
-  b = b>>3;
-  s |= b;
-
-  *v = ((u64)s)<<32 | a;
-
-  return 9;
+  return *(i64*)&iKey;
 }
 
 /*
@@ -73788,7 +73699,7 @@ static void btreeParseCellPtrNoPayload(
 #ifndef SQLITE_DEBUG
   UNUSED_PARAMETER(pPage);
 #endif
-  pInfo->nSize = 4 + getVarint(&pCell[4], (u64*)&pInfo->nKey);
+  pInfo->nSize = 4 + sqlite3GetVarint(&pCell[4], (u64*)&pInfo->nKey);
   pInfo->nPayload = 0;
   pInfo->nLocal = 0;
   pInfo->pPayload = 0;
@@ -73828,7 +73739,7 @@ static void btreeParseCellPtr(
 
   /* The next block of code is equivalent to:
   **
-  **     pIter += getVarint(pIter, (u64*)&pInfo->nKey);
+  **     pIter += sqlite3GetVarint(pIter, (u64*)&pInfo->nKey);
   **
   ** The code is inlined and the loop is unrolled for performance.
   ** This routine is a high-runner.
@@ -78439,7 +78350,7 @@ SQLITE_PRIVATE int sqlite3BtreeTableMoveto(
           }
         }
       }
-      getVarint(pCell, (u64*)&nCellKey);
+      nCellKey = sqlite3VarintValue(pCell);
       if( nCellKey<intKey ){
         lwr = idx+1;
         if( lwr>upr ){ c = -1; break; }
@@ -79646,7 +79557,7 @@ static int fillInCell(
     nSrc = pX->nData;
     assert( pPage->intKeyLeaf ); /* fillInCell() only called for leaves */
     nHeader += putVarint32(&pCell[nHeader], nPayload);
-    nHeader += putVarint(&pCell[nHeader], *(u64*)&pX->nKey);
+    nHeader += sqlite3PutVarint(&pCell[nHeader], *(u64*)&pX->nKey);
   }else{
     assert( pX->nKey<=0x7fffffff && pX->pKey!=0 );
     nSrc = nPayload = (int)pX->nKey;
@@ -81395,7 +81306,7 @@ static int balance_nonroot(
       j--;
       pNew->xParseCell(pNew, b.apCell[j], &info);
       pCell = pTemp;
-      sz = 4 + putVarint(&pCell[4], info.nKey);
+      sz = 4 + sqlite3PutVarint(&pCell[4], info.nKey);
       pTemp = 0;
     }else{
       pCell -= 4;
@@ -82280,7 +82191,7 @@ SQLITE_PRIVATE int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 
   }else{
     aOut += sqlite3PutVarint(aOut, pSrc->info.nPayload);
   }
-  if( pDest->pKeyInfo==0 ) aOut += putVarint(aOut, iKey);
+  if( pDest->pKeyInfo==0 ) aOut += sqlite3PutVarint(aOut, iKey);
   nIn = pSrc->info.nLocal;
   aIn = pSrc->info.pPayload;
   if( aIn+nIn>pSrc->pPage->aDataEnd ){
@@ -99475,22 +99386,9 @@ case OP_Affinity: {
     assert( zAffinity[0]==SQLITE_AFF_NONE || memIsValid(pIn1) );
     applyAffinity(pIn1, zAffinity[0], encoding);
     if( zAffinity[0]==SQLITE_AFF_REAL && (pIn1->flags & MEM_Int)!=0 ){
-      /* When applying REAL affinity, if the result is still an MEM_Int
-      ** that will fit in 6 bytes, then change the type to MEM_IntReal
-      ** so that we keep the high-resolution integer value but know that
-      ** the type really wants to be REAL. */
-      testcase( pIn1->u.i==140737488355328LL );
-      testcase( pIn1->u.i==140737488355327LL );
-      testcase( pIn1->u.i==-140737488355328LL );
-      testcase( pIn1->u.i==-140737488355329LL );
-      if( pIn1->u.i<=140737488355327LL && pIn1->u.i>=-140737488355328LL ){
-        pIn1->flags |= MEM_IntReal;
-        pIn1->flags &= ~MEM_Int;
-      }else{
-        pIn1->u.r = (double)pIn1->u.i;
-        pIn1->flags |= MEM_Real;
-        pIn1->flags &= ~(MEM_Int|MEM_Str);
-      }
+      pIn1->u.r = (double)pIn1->u.i;
+      pIn1->flags |= MEM_Real;
+      pIn1->flags &= ~(MEM_Int|MEM_Str);
     }
     REGISTER_TRACE((int)(pIn1-aMem), pIn1);
     zAffinity++;
@@ -117324,7 +117222,7 @@ static int exprNodeCanReturnSubtype(Walker *pWalker, Expr *pExpr){
 ** are acceptable as they only disable an optimization.  False negatives,
 ** on the other hand, can lead to incorrect answers.
 */
-static int sqlite3ExprCanReturnSubtype(Parse *pParse, Expr *pExpr){
+SQLITE_PRIVATE int sqlite3ExprCanReturnSubtype(Parse *pParse, Expr *pExpr){
   Walker w;
   memset(&w, 0, sizeof(w));
   w.pParse = pParse;
@@ -153770,12 +153668,21 @@ struct WhereConst {
 };
 
 /*
-** Add a new entry to the pConst object.  Except, do not add duplicate
-** pColumn entries.  Also, do not add if doing so would not be appropriate.
+** Add a new entry to the pConst object, if appropriate.
 **
-** The caller guarantees the pColumn is a column and pValue is a constant.
-** This routine has to do some additional checks before completing the
-** insert.
+**    *   Do not add if pValue is not constant.  (This is enforced by
+**        the caller)
+**
+**    *   Do not add duplicate pColumn entries
+**
+**    *   Do not add if pValue has an affinity
+**
+**    *   Do not add if the comparison uses a collating sequence other
+**        than binary.
+**
+**    *   Do not add if pValue is a function that might return a subtype
+**
+** The caller guarantees the pColumn is a column.
 */
 static void constInsert(
   WhereConst *pConst,  /* The WhereConst into which we are inserting */
@@ -153786,12 +153693,12 @@ static void constInsert(
   int i;
   assert( pColumn->op==TK_COLUMN );
   assert( sqlite3ExprIsConstant(pConst->pParse, pValue) );
-
   if( ExprHasProperty(pColumn, EP_FixedCol) ) return;
   if( sqlite3ExprAffinity(pValue)!=0 ) return;
   if( !sqlite3IsBinary(sqlite3ExprCompareCollSeq(pConst->pParse,pExpr)) ){
     return;
   }
+  if( sqlite3ExprCanReturnSubtype(pConst->pParse, pValue) ) return;
 
   /* 2018-10-25 ticket [cf5ed20f]
   ** Make sure the same pColumn is not inserted more than once */
@@ -164695,6 +164602,17 @@ static SQLITE_NOINLINE void codeINTerm(
   }else{
     sqlite3 *db = pParse->db;
     Expr *pXMod = removeUnindexableInClauseTerms(pParse, iEq, pLoop, pX);
+    if( nEq>1 ){
+      /* If this IN(SELECT ...) expression drives more than one column of
+      ** the index, disable the seek-scan optimization. The reasons for this
+      ** are that (a) it is only possible to make this happen by populating
+      ** the sqlite_stat1 table with inconsistent information, and (b) it
+      ** would require sqlite3FindInIndex() to find an index that is not
+      ** only unique for the columns in question, but also delivers them
+      ** in sorted order (requires checking asc/desc, and rejecting cases
+      ** where the indexed columns are not in the right order).  */
+      pLoop->wsFlags &= ~WHERE_IN_SEEKSCAN;
+    }
     if( !db->mallocFailed ){
       aiMap = (int*)sqlite3DbMallocZero(db, sizeof(int)*nEq);
       eType = sqlite3FindInIndex(pParse, pXMod, IN_INDEX_LOOP, 0, aiMap, &iTab);
@@ -166914,12 +166832,12 @@ SQLITE_PRIVATE SQLITE_NOINLINE void sqlite3WhereRightJoinLoop(
   pSubWInfo = sqlite3WhereBegin(pParse, pFrom, pSubWhere, 0, 0, 0,
                                 WHERE_RIGHT_JOIN, 0);
   if( pSubWInfo ){
-    int iCur = pLevel->iTabCur;
-    int r = ++pParse->nMem;
-    int nPk;
-    int jmp = 0;
+    int iCur = pLevel->iTabCur;  /* Table on RHS of RIGHT JOIN &*/
+    int r = ++pParse->nMem;      /* Register range to hold primary key */
+    int nPk;                     /* Number of values in the primary key */
+    int r2;                      /* Register holding record for primary key */
     int addrCont = sqlite3WhereContinueLabel(pSubWInfo);
-    Table *pTab = pTabItem->pSTab;
+    Table *pTab = pTabItem->pSTab;  /* Table on RHS of RIGHT JOIN */
     if( HasRowid(pTab) ){
       sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, -1, r);
       nPk = 1;
@@ -166933,13 +166851,31 @@ SQLITE_PRIVATE SQLITE_NOINLINE void sqlite3WhereRightJoinLoop(
         sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, iCol,r+iPk);
       }
     }
+
+    /* Generate code that checks to see if the current row of the RHS table
+    ** has appeared in any prior output row. */
     if( pRJ->regBloom ){
-      jmp = sqlite3VdbeAddOp4Int(v, OP_Filter, pRJ->regBloom, 0, r, nPk);
+      sqlite3VdbeAddOp4Int(v, OP_Filter, pRJ->regBloom,
+                 sqlite3VdbeCurrentAddr(v)+2, r, nPk);
       VdbeCoverage(v);
     }
     sqlite3VdbeAddOp4Int(v, OP_Found, pRJ->iMatch, addrCont, r, nPk);
     VdbeCoverage(v);
-    if( jmp ) sqlite3VdbeJumpHere(v, jmp);
+    r2 = sqlite3GetTempReg(pParse);
+
+    /* Generate code that inserts the PK of the RHS table into the
+    ** pRH->iMatch index to indicate that the current row has appeared
+    ** in the output set. */
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, r, nPk, r2);
+    sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pRJ->iMatch, r2, r, nPk);
+    sqlite3ReleaseTempReg(pParse, r2);
+    if( pRJ->regBloom ){
+      sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pRJ->regBloom, 0, r, nPk);
+      sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+    }
+
+    /* Invoke the subroutine that actually puts the current RHS table row
+    ** into the output set, with NULLs for the LHS. */
     sqlite3VdbeAddOp2(v, OP_Gosub, pRJ->regReturn, pRJ->addrSubrtn);
     sqlite3WhereEnd(pSubWInfo);
   }
@@ -200712,7 +200648,7 @@ static int fts3auxNextMethod(sqlite3_vtab_cursor *pCursor){
         /* State 3. The integer just read is a column number. */
         default: assert( eState==3 );
           iCol = (int)v;
-          if( iCol<1 || iCol>(pFts3->nColumn+1) ){
+          if( iCol<1 || iCol>32767 ){
             rc = SQLITE_CORRUPT_VTAB;
             break;
           }
@@ -200787,7 +200723,7 @@ static int fts3auxFilterMethod(
   pCsr->filter.flags = FTS3_SEGMENT_REQUIRE_POS|FTS3_SEGMENT_IGNORE_EMPTY;
   if( isScan ) pCsr->filter.flags |= FTS3_SEGMENT_SCAN;
 
-  if( iEq>=0 || iGe>=0 ){
+  if( (iEq>=0 || iGe>=0) && sqlite3_value_type(apVal[0])==SQLITE_TEXT ){
     const unsigned char *zStr = sqlite3_value_text(apVal[0]);
     assert( (iEq==0 && iGe==-1) || (iEq==-1 && iGe==0) );
     if( zStr ){
@@ -200797,7 +200733,7 @@ static int fts3auxFilterMethod(
     }
   }
 
-  if( iLe>=0 ){
+  if( iLe>=0 && sqlite3_value_type(apVal[0])==SQLITE_TEXT ){
     pCsr->zStop = sqlite3_mprintf("%s", sqlite3_value_text(apVal[iLe]));
     if( pCsr->zStop==0 ) return SQLITE_NOMEM;
     pCsr->nStop = (int)strlen(pCsr->zStop);
@@ -264296,7 +264232,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-08-12 00:51:14 39ae2b7c59505aeb198fb16eab3f3ea1b42eb35bc38776f3579000595cc9a572", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-08-14 15:17:24 2530b5ada6e814931db257d3b5ca756032f2c004a2d96cb2d998619e79ce0958", -1, SQLITE_TRANSIENT);
 }
 
 /*
