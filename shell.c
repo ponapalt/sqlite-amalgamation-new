@@ -748,6 +748,8 @@ struct sqlite3_qrf_spec {
   char **pzOutput;            /* Storage location for output string */
   /* The following are available in iVersion 2 and later */
   unsigned char bRowCount;    /* Show the number of rows at end of each query */
+  char *zIFmt;                /* Format string for integers */
+  char *zFpFmt;               /* Format string for floating point */
   /* Additional fields may be added in the future */
 };
 
@@ -889,6 +891,18 @@ int sqlite3_qrf_wcwidth(int c);
 */
 size_t sqlite3_qrf_wcswidth(const char*);
 
+/*
+** The argument is a proposed format string for the zIFmt or zFpFmt
+** parameters.  Return value indicates:
+**
+**    0     The input is not a valid format string.  If this string
+**          appears in either zIFmt or zFpFmt, it will be ignored.
+**
+**    1     The input is a valid format string for integers.
+**
+**    2     The input is a valid format string for floating point.
+*/
+int sqlite3_qrf_ckformat(const char*);
 
 #ifdef __cplusplus
 }
@@ -971,6 +985,7 @@ struct Qrf {
   } u;
   sqlite3_int64 nRow;         /* Number of rows handled so far */
   int *actualWidth;           /* Actual width of each column */
+  char zFmt[24];              /* Space to hold the true integer rendering fmt */
   sqlite3_qrf_spec spec;      /* Copy of the original spec */
 };
 
@@ -1014,6 +1029,44 @@ static const char qrfCType[] = {
 #  define deliberate_fall_through
 # endif
 #endif
+
+/*
+** The argument is a proposed format string for the zIFmt or zFpFmt
+** parameters.  Return value indicates:
+**
+**    0     The input is not a valid format string.  If this string
+**          appears in either zIFmt or zFpFmt, it will be ignored.
+**
+**    1     The input is a valid format string for integers.
+**
+**    2     The input is a valid format string for floating point.
+*/
+int sqlite3_qrf_ckformat(const char *z){
+  size_t n;
+  if( z==0 ) return 0;
+  if( z[0]!='%' ) return 0;
+  z++;
+  n = strspn(z,"+-,#0");
+  if( n>5 ) return 0;
+  z += n;
+  if( z[0]>='1' && z[0]<='9' ){
+    n = strspn(z,"0123456789");
+    if( n>3 ) return 0;
+    z += n;
+  }
+  if( z[0]=='.' ){
+    z++;
+    n = strspn(z,"0123456789");
+    if( n>3 ) return 0;
+    z += n;
+  }
+  n = strspn(z,"eEgGf");
+  if( n==1 && z[1]==0 ) return 2;
+  n = strspn(z,"dxXo");
+  if( n==1 && z[1]==0 ) return 1;
+  return 0;
+}
+
 
 /*
 ** Set an error code and error message.
@@ -2002,12 +2055,18 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
   }
   switch( sqlite3_column_type(p->pStmt,iCol) ){
     case SQLITE_INTEGER: {
-      sqlite3_str_appendf(pOut, "%lld", sqlite3_column_int64(p->pStmt,iCol));
+      sqlite3_str_appendf(pOut, p->spec.zIFmt,
+                          sqlite3_column_int64(p->pStmt,iCol));
       break;
     }
     case SQLITE_FLOAT: {
-      const char *zTxt = (const char*)sqlite3_column_text(p->pStmt,iCol);
-      sqlite3_str_appendall(pOut, zTxt);
+      if( p->spec.zFpFmt ){
+        double r = sqlite3_column_double(p->pStmt,iCol);
+        sqlite3_str_appendf(pOut,p->spec.zFpFmt,r);
+      }else{
+        const char *zTxt = (const char*)sqlite3_column_text(p->pStmt,iCol);
+        sqlite3_str_appendall(pOut, zTxt);
+      }
       break;
     }
     case SQLITE_BLOB: {
@@ -3730,7 +3789,11 @@ static void qrfInitialize(
   p->iErr = SQLITE_OK;
   p->nCol = sqlite3_column_count(p->pStmt);
   p->nRow = 0;
-  sz = sizeof(sqlite3_qrf_spec);
+  switch( pSpec->iVersion ){
+    case 0: sz = offsetof(sqlite3_qrf_spec, bRowCount);  break;
+    case 1: sz = offsetof(sqlite3_qrf_spec, bRowCount);  break;
+    default: sz = sizeof(sqlite3_qrf_spec);              break;
+  }
   memcpy(&p->spec, pSpec, sz);
   if( p->spec.zNull==0 ) p->spec.zNull = "";
   p->mxWidth = p->spec.nScreenWidth;
@@ -3742,9 +3805,6 @@ static void qrfInitialize(
   if( p->spec.eText>QRF_TEXT_Relaxed ) p->spec.eText = QRF_Auto;
   if( p->spec.eTitle>QRF_TEXT_Relaxed ) p->spec.eTitle = QRF_Auto;
   if( p->spec.eBlob>QRF_BLOB_Size ) p->spec.eBlob = QRF_Auto;
-  if( pSpec->iVersion<=1 ){
-    p->spec.bRowCount = 0;
-  }
 qrf_reinit:
   switch( p->spec.eStyle ){
     case QRF_Auto: {
@@ -3869,6 +3929,20 @@ qrf_reinit:
   }
   if( p->spec.zColumnSep==0 ) p->spec.zColumnSep = ",";
   if( p->spec.zRowSep==0 ) p->spec.zRowSep = "\n";
+  if( p->spec.zIFmt==0 || sqlite3_qrf_ckformat(p->spec.zIFmt)!=1 ){
+    p->spec.zIFmt = "%lld";
+  }else{
+    size_t n = strlen(p->spec.zIFmt);
+    memcpy(p->zFmt, p->spec.zIFmt, n-1);
+    p->zFmt[n-1] = 'l';
+    p->zFmt[n] = 'l';
+    p->zFmt[n+1] = p->spec.zIFmt[n-1];
+    p->zFmt[n+2] = 0;
+    p->spec.zIFmt = p->zFmt;
+  }
+  if( p->spec.zFpFmt && sqlite3_qrf_ckformat(p->spec.zFpFmt)!=2 ){
+    p->spec.zFpFmt = 0;
+  }
 }
 
 /*
@@ -14066,10 +14140,10 @@ static int zipfileUpdate(
       }
     }
     for(pOld=pTab->pFirstEntry; 1; pOld=pOld->pNext){
+      if( pOld==0 ) return SQLITE_OK;
       if( zipfileComparePath(pOld->cds.zFile, zDelete, nDelete)==0 ){
         break;
       }
-      assert( pOld->pNext );
     }
   }
 
@@ -24938,6 +25012,8 @@ typedef struct Mode {
   u8 bAutoScreenWidth;   /* Using the TTY to determine screen width */
   u8 mFlags;             /* MFLG_ECHO, MFLG_CRLF, etc. */
   u8 eMode;              /* One of the MODE_ values */
+  char zIFmt[24];        /* Space to hold the --ifmt value */
+  char zFpFmt[24];       /* Space to hold the --fpfmt value */
   sqlite3_qrf_spec spec; /* Spec to be passed into QRF */
 } Mode;
 
@@ -24945,6 +25021,20 @@ typedef struct Mode {
 #define MFLG_ECHO  0x01  /* Echo inputs to output */
 #define MFLG_CRLF  0x02  /* Use CR/LF output line endings */
 #define MFLG_HDR   0x04  /* .header used to change headers on/off */
+
+/* Bit values for ShellState.mStats
+*/
+#define CLISTAT_VMSTEP    0x01    /* Show vmsteps */
+#define CLISTAT_STMT      0x02    /* Stats for each statement */
+#define CLISTAT_MEM       0x04    /* Memory stats */
+#define CLISTAT_XSTMT     0x08    /* Extra statement stats */
+#define CLISTAT_XMEM      0x10    /* Extra memory stats */
+#define CLISTAT_IO        0x20    /* I/O stats (Linux only) */
+#define CLISTAT_ZIPVFS    0x40    /* ZIPVFS stats */
+#define CLISTAT_ON        0x17    /* Usual stats */
+#define CLISTAT_ALL       0x7f    /* All stats */
+#define CLISTAT_RESET     0x80    /* Reset stat counters each time */
+
 
 /* A file that needs to be deleted, but only after a delay.
 */
@@ -24967,7 +25057,7 @@ struct ShellState {
   u8 bSafeMode;          /* True to prohibit unsafe operations */
   u8 bSafeModePersist;   /* The long-term value of bSafeMode */
   u8 eRestoreState;      /* See comments above doAutoDetectRestore() */
-  unsigned statsOn;      /* True to display memory stats before each finalize */
+  u8 mStats;             /* Which stats to display (if any) */
   unsigned mEqpLines;    /* Mask of vertical lines in the EQP output graph */
   u8 nPopOutput;         /* Revert .output settings when reaching zero */
   u8 nPopMode;           /* Revert .mode settings when reaching zero */
@@ -26681,6 +26771,14 @@ static void modeDup(Mode *pDest, Mode *pSrc){
   if( pDest->spec.zNull ){
     pDest->spec.zNull = strdup(pSrc->spec.zNull);
   }
+  if( pDest->spec.zFpFmt ){
+    assert( pDest->spec.zFpFmt==pSrc->zFpFmt );
+    pDest->spec.zFpFmt = pDest->zFpFmt;
+  }
+  if( pDest->spec.zIFmt ){
+    assert( pDest->spec.zIFmt==pSrc->zIFmt );
+    pDest->spec.zIFmt = pDest->zIFmt;
+  }
 }
 
 /*
@@ -27896,16 +27994,16 @@ static void displayStatLine(
 */
 static int display_stats(
   sqlite3 *db,                /* Database to query */
-  ShellState *pArg,           /* Pointer to ShellState */
-  int bReset                  /* True to reset the stats */
+  ShellState *pArg            /* Pointer to ShellState */
 ){
   int iCur, iHiwtr;
   sqlite3_int64 iCur64, iHiwtr64;
   FILE *out;
   if( pArg==0 || pArg->out==0 ) return 0;
   out = pArg->out;
+  int bReset = (pArg->mStats & CLISTAT_RESET)!=0;
 
-  if( pArg->pStmt && pArg->statsOn==2 ){
+  if( pArg->pStmt && (pArg->mStats & CLISTAT_XSTMT)!=0 ){
     int nCol, i, x;
     sqlite3_stmt *pStmt = pArg->pStmt;
     char z[100];
@@ -27930,91 +28028,92 @@ static int display_stats(
     }
   }
 
-  if( pArg->statsOn==3 ){
-    if( pArg->pStmt ){
-      iCur = sqlite3_stmt_status(pArg->pStmt, SQLITE_STMTSTATUS_VM_STEP,bReset);
-      cli_printf(out, "VM-steps: %d\n", iCur);
-    }
-    return 0;
+  if( pArg->pStmt && (pArg->mStats & CLISTAT_VMSTEP)!=0 ){
+    iCur = sqlite3_stmt_status(pArg->pStmt, SQLITE_STMTSTATUS_VM_STEP,bReset);
+    cli_printf(out, "VM-steps: %d\n", iCur);
   }
 
-  displayStatLine(out, "Memory Used:",
-     "%lld (max %lld) bytes", SQLITE_STATUS_MEMORY_USED, bReset);
-  displayStatLine(out, "Number of Outstanding Allocations:",
-     "%lld (max %lld)", SQLITE_STATUS_MALLOC_COUNT, bReset);
-  if( pArg->shellFlgs & SHFLG_Pagecache ){
-    displayStatLine(out, "Number of Pcache Pages Used:",
-       "%lld (max %lld) pages", SQLITE_STATUS_PAGECACHE_USED, bReset);
+  if( (pArg->mStats & CLISTAT_MEM)!=0 ){
+    displayStatLine(out, "Memory Used:",
+       "%lld (max %lld) bytes", SQLITE_STATUS_MEMORY_USED, bReset);
+    displayStatLine(out, "Number of Outstanding Allocations:",
+       "%lld (max %lld)", SQLITE_STATUS_MALLOC_COUNT, bReset);
   }
-  displayStatLine(out, "Number of Pcache Overflow Bytes:",
-     "%lld (max %lld) bytes", SQLITE_STATUS_PAGECACHE_OVERFLOW, bReset);
-  displayStatLine(out, "Largest Allocation:",
-     "%lld bytes", SQLITE_STATUS_MALLOC_SIZE, bReset);
-  displayStatLine(out, "Largest Pcache Allocation:",
-     "%lld bytes", SQLITE_STATUS_PAGECACHE_SIZE, bReset);
+  if( (pArg->mStats & CLISTAT_XMEM)!=0 ){
+    if( pArg->shellFlgs & SHFLG_Pagecache ){
+      displayStatLine(out, "Number of Pcache Pages Used:",
+         "%lld (max %lld) pages", SQLITE_STATUS_PAGECACHE_USED, bReset);
+    }
+    displayStatLine(out, "Number of Pcache Overflow Bytes:",
+       "%lld (max %lld) bytes", SQLITE_STATUS_PAGECACHE_OVERFLOW, bReset);
+    displayStatLine(out, "Largest Allocation:",
+       "%lld bytes", SQLITE_STATUS_MALLOC_SIZE, bReset);
+    displayStatLine(out, "Largest Pcache Allocation:",
+       "%lld bytes", SQLITE_STATUS_PAGECACHE_SIZE, bReset);
 #ifdef YYTRACKMAXSTACKDEPTH
-  displayStatLine(out, "Deepest Parser Stack:",
-     "%lld (max %lld)", SQLITE_STATUS_PARSER_STACK, bReset);
+    displayStatLine(out, "Deepest Parser Stack:",
+       "%lld (max %lld)", SQLITE_STATUS_PARSER_STACK, bReset);
 #endif
-
-  if( db ){
-    if( pArg->shellFlgs & SHFLG_Lookaside ){
+  
+    if( db ){
+      if( pArg->shellFlgs & SHFLG_Lookaside ){
+        iHiwtr = iCur = -1;
+        sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                          &iCur, &iHiwtr, bReset);
+        cli_printf(out, 
+             "Lookaside Slots Used:                %d (max %d)\n", iCur, iHiwtr);
+        sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_HIT,
+                          &iCur, &iHiwtr, bReset);
+        cli_printf(out,
+             "Successful lookaside attempts:       %d\n", iHiwtr);
+        sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE,
+                          &iCur, &iHiwtr, bReset);
+        cli_printf(out,
+             "Lookaside failures due to size:      %d\n", iHiwtr);
+        sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL,
+                          &iCur, &iHiwtr, bReset);
+        cli_printf(out,
+             "Lookaside failures due to OOM:       %d\n", iHiwtr);
+      }
       iHiwtr = iCur = -1;
-      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
-                        &iCur, &iHiwtr, bReset);
-      cli_printf(out, 
-           "Lookaside Slots Used:                %d (max %d)\n", iCur, iHiwtr);
-      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_HIT,
-                        &iCur, &iHiwtr, bReset);
+      sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_USED, &iCur, &iHiwtr, bReset);
       cli_printf(out,
-           "Successful lookaside attempts:       %d\n", iHiwtr);
-      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE,
-                        &iCur, &iHiwtr, bReset);
+             "Pager Heap Usage:                    %d bytes\n", iCur);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT, &iCur, &iHiwtr, 1);
       cli_printf(out,
-           "Lookaside failures due to size:      %d\n", iHiwtr);
-      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL,
-                        &iCur, &iHiwtr, bReset);
+             "Page cache hits:                     %d\n", iCur);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &iCur, &iHiwtr, 1);
       cli_printf(out,
-           "Lookaside failures due to OOM:       %d\n", iHiwtr);
+             "Page cache misses:                   %d\n", iCur);
+      iHiwtr64 = iCur64 = -1;
+      sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
+                          0);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &iCur, &iHiwtr, 1);
+      cli_printf(out,
+             "Page cache writes:                   %d\n", iCur);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, &iCur, &iHiwtr, 1);
+      cli_printf(out,
+             "Page cache spills:                   %d\n", iCur);
+      cli_printf(out,
+             "Temporary data spilled to disk:      %lld\n", iCur64);
+      sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
+                          1);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_SCHEMA_USED, &iCur, &iHiwtr, bReset);
+      cli_printf(out,
+             "Schema Heap Usage:                   %d bytes\n", iCur);
+      iHiwtr = iCur = -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_STMT_USED, &iCur, &iHiwtr, bReset);
+      cli_printf(out,
+             "Statement Heap/Lookaside Usage:      %d bytes\n", iCur);
     }
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_USED, &iCur, &iHiwtr, bReset);
-    cli_printf(out,
-           "Pager Heap Usage:                    %d bytes\n", iCur);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT, &iCur, &iHiwtr, 1);
-    cli_printf(out,
-           "Page cache hits:                     %d\n", iCur);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &iCur, &iHiwtr, 1);
-    cli_printf(out,
-           "Page cache misses:                   %d\n", iCur);
-    iHiwtr64 = iCur64 = -1;
-    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
-                        0);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &iCur, &iHiwtr, 1);
-    cli_printf(out,
-           "Page cache writes:                   %d\n", iCur);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, &iCur, &iHiwtr, 1);
-    cli_printf(out,
-           "Page cache spills:                   %d\n", iCur);
-    cli_printf(out,
-           "Temporary data spilled to disk:      %lld\n", iCur64);
-    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &iCur64, &iHiwtr64,
-                        1);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_SCHEMA_USED, &iCur, &iHiwtr, bReset);
-    cli_printf(out,
-           "Schema Heap Usage:                   %d bytes\n", iCur);
-    iHiwtr = iCur = -1;
-    sqlite3_db_status(db, SQLITE_DBSTATUS_STMT_USED, &iCur, &iHiwtr, bReset);
-    cli_printf(out,
-           "Statement Heap/Lookaside Usage:      %d bytes\n", iCur);
   }
-
-  if( pArg->pStmt ){
+  
+  if( pArg->pStmt && (pArg->mStats & CLISTAT_STMT)!=0 ){
     int iHit, iMiss;
     iCur = sqlite3_stmt_status(pArg->pStmt, SQLITE_STMTSTATUS_FULLSCAN_STEP,
                                bReset);
@@ -28034,9 +28133,6 @@ static int display_stats(
       cli_printf(out,
            "Bloom filter bypass taken:           %d/%d\n", iHit, iHit+iMiss);
     }
-    iCur = sqlite3_stmt_status(pArg->pStmt, SQLITE_STMTSTATUS_VM_STEP, bReset);
-    cli_printf(out,
-           "Virtual Machine Steps:               %d\n", iCur);
     iCur = sqlite3_stmt_status(pArg->pStmt, SQLITE_STMTSTATUS_REPREPARE,bReset);
     cli_printf(out,
            "Reprepare operations:                %d\n", iCur);
@@ -28049,10 +28145,16 @@ static int display_stats(
   }
 
 #ifdef __linux__
-  displayLinuxIoStats(pArg->out);
+  if( (pArg->mStats & CLISTAT_IO)!=0 ){
+    displayLinuxIoStats(pArg->out);
+  }
 #endif
 
-  /* Do not remove this machine readable comment: extra-stats-output-here */
+#ifdef SQLITE_ENABLE_ZIPVFS_VTAB
+  if( (pArg->mStats & CLISTAT_ZIPVFS)!=0 ){
+    /* Do not remove this machine readable comment: extra-stats-output-here */
+  }
+#endif
 
   return 0;
 }
@@ -28458,8 +28560,8 @@ static int shell_exec(
       }
 
       /* print usage stats if stats on */
-      if( pArg && pArg->statsOn ){
-        display_stats(db, pArg, 0);
+      if( pArg && pArg->mStats!=0 ){
+        display_stats(db, pArg);
       }
 
       /* print loop-counters if required */
@@ -29148,6 +29250,10 @@ static const struct {
 "  --escape ESC             Enable/disable escaping of control characters\n"
 "                           found in the output. ESC can be \"off\", \"ascii\",\n"
 "                           or \"symbol\".\n"
+"  --fpfmt STRING           String is a printf-style format string used to\n"
+"                           render floating-point values.\n"
+"  --ifmt STRING            String is a printf-style format string used to\n"
+"                           render integer values.\n"
 "  --linelimit N            Set the maximum number of output lines to show for\n"
 "                           any single SQL value to N. Longer values are\n"
 "                           truncated. Zero means \"no limit\". Only works\n"
@@ -29261,6 +29367,27 @@ static const struct {
 "                         will follow.\n"
 "  --notglob              Output should not match PATTERN\n"
 "  --show                 Write testcase output to the screen, for debugging.\n"
+  },
+  { ".stats",
+"USAGE: .stats [OPTIONS] ...\n"
+"\n"
+"Show status information about the database and database connection.\n"
+"The stats setting is persistent, unless the --once option is used.\n"
+"Options are cumulative and are processed from left to right.\n"
+"If no options are given, that is the same as \".stats all --once\".\n"
+"\n"
+"Options:\n"
+"  all          Show all available stats.\n"
+"  io           Show I/O stats (Linux only).\n"
+"  mem          Show basic memory usage.\n"
+"  off          Show nothing.  Turn off stat display.\n"
+"  on           Shorthand for \"stmt xmem\".\n"
+"  --once       Show the stats once. Do not change the default stats display.\n"
+"  reset        Reset \"max\" values after next display of each that value.\n"
+"  stmt         Show information about the last SQL statement.\n"
+"  vmstep       Show the number of virtual machine steps taken.\n"
+"  xmem         Show detailed memory status information\n"
+"  xstmt        Show details about each SQL statement\n"
   },
   { ".testcase",
 "USAGE: .testcase [OPTIONS] NAME\n"
@@ -33427,6 +33554,10 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **   --escape ESC             Enable/disable escaping of control characters
 **                            found in the output. ESC can be "off", "ascii",
 **                            or "symbol".
+**   --fpfmt STRING           String is a printf-style format string used to
+**                            render floating-point values.
+**   --ifmt STRING            String is a printf-style format string used to
+**                            render integer values.
 **   --linelimit N            Set the maximum number of output lines to show for
 **                            any single SQL value to N. Longer values are
 **                            truncated. Zero means "no limit". Only works
@@ -33683,6 +33814,40 @@ static int dotCmdMode(ShellState *p){
           break;
       }
       chng = 1;
+    }else if( optionMatch(z,"ifmt") ){
+      if( i+1>=nArg ){
+        dotCmdError(p, i, "missing argument", 0);
+        return 1;
+      }
+      i++;
+      if( azArg[i][0]==0 || cli_strcmp(azArg[i],"auto")==0 ){
+        p->mode.spec.zIFmt = 0;
+      }else if( sqlite3_qrf_ckformat(azArg[i])!=1 ){
+        dotCmdError(p, i, "not a valid integer format", 0);
+        return 1;
+      }else{
+        assert( strlen(azArg[i])<sizeof(p->mode.zIFmt)-1 );
+        memcpy(p->mode.zIFmt, azArg[i], strlen(azArg[i])+1);
+        p->mode.spec.zIFmt = p->mode.zIFmt;
+      }
+      chng = 1;
+    }else if( optionMatch(z,"fpfmt") ){
+      if( i+1>=nArg ){
+        dotCmdError(p, i, "missing argument", 0);
+        return 1;
+      }
+      i++;
+      if( azArg[i][0]==0 || cli_strcmp(azArg[i],"auto")==0 ){
+        p->mode.spec.zFpFmt = 0;
+      }else if( sqlite3_qrf_ckformat(azArg[i])!=2 ){
+        dotCmdError(p, i, "not a valid floating-point format", 0);
+        return 1;
+      }else{
+        assert( strlen(azArg[i])<sizeof(p->mode.zFpFmt)-1 );
+        memcpy(p->mode.zFpFmt, azArg[i], strlen(azArg[i])+1);
+        p->mode.spec.zFpFmt = p->mode.zFpFmt;
+      }
+      chng = 1;
     }else if( optionMatch(z,"reset") ){
       int saved_eMode = p->mode.eMode;
       modeFree(&p->mode);
@@ -33916,6 +34081,14 @@ static int dotCmdMode(ShellState *p){
     }
     if( bAll || p->mode.spec.eEsc!=QRF_Auto ){
       sqlite3_str_appendf(pDesc, " --escape %s",qrfEscNames[p->mode.spec.eEsc]);
+    }
+    if( bAll || p->mode.spec.zFpFmt!=0 ){
+      const char *z = p->mode.spec.zFpFmt;
+      sqlite3_str_appendf(pDesc, " --fpfmt %s", z ? z : "auto");
+    }
+    if( bAll || p->mode.spec.zIFmt!=0 ){
+      const char *z = p->mode.spec.zIFmt;
+      sqlite3_str_appendf(pDesc, " --ifmt %s", z ? z : "auto");
     }
     if( bAll
      || (p->mode.spec.nLineLimit>0 && pI->eCx>0)
@@ -34395,6 +34568,97 @@ static int dotCmdCheck(ShellState *p){
   if( !bKeep ){
     output_reset(p);
     p->zTestcase[0] = 0;
+  }
+  return 0;
+}
+
+/*
+** DOT-COMMAND: .stats
+** USAGE: .stats [OPTIONS] ...
+**
+** Show status information about the database and database connection.
+** The stats setting is persistent, unless the --once option is used.
+** Options are cumulative and are processed from left to right.
+** If no options are given, that is the same as ".stats all --once".
+**
+** Options:
+**   all          Show all available stats.
+**   io           Show I/O stats (Linux only).
+**   mem          Show basic memory usage.
+**   off          Show nothing.  Turn off stat display.
+**   on           Shorthand for "stmt xmem".
+**   --once       Show the stats once. Do not change the default stats display.
+**   reset        Reset "max" values after next display of each that value.
+**   stmt         Show information about the last SQL statement.
+**   vmstep       Show the number of virtual machine steps taken.
+**   xmem         Show detailed memory status information
+**   xstmt        Show details about each SQL statement
+*/
+static int dotCmdStats(ShellState *p){
+  int nArg = p->dot.nArg;        /* Number of arguments */
+  char **azArg = p->dot.azArg;   /* Text of the arguments */
+  int ii;                        /* Loop counter */
+  int bOnce = 0;                 /* --once option seen */
+  u8 mNew = 0;                   /* New status setting */
+  u8 savedStats = p->mStats;     /* Current stats setting */
+
+  if( nArg==1 ){
+    p->mStats = CLISTAT_ALL;
+    display_stats(p->db, p);
+    p->mStats = savedStats;
+    return 0;
+  }
+  for(ii=1; ii<nArg; ii++){
+    const char *z = azArg[ii];
+    if( z[0]=='-' ){
+      z++;
+      if( z[0]=='-' && z[1]!=0 ) z++;
+    }
+    if( cli_strcmp(z,"stmt")==0 ){
+      mNew |= CLISTAT_STMT|CLISTAT_VMSTEP;
+    }else if( cli_strcmp(z,"xstmt")==0 ){
+      mNew |= CLISTAT_STMT|CLISTAT_XSTMT|CLISTAT_VMSTEP;
+    }else if( cli_strcmp(z,"vmstep")==0 ){
+      mNew |= CLISTAT_VMSTEP;
+    }else if( cli_strcmp(z,"mem")==0 ){
+      mNew |= CLISTAT_MEM;
+    }else if( cli_strcmp(z,"xmem")==0 ){
+      mNew |= CLISTAT_XMEM|CLISTAT_MEM;
+    }else if( cli_strcmp(z,"io")==0 ){
+      mNew |= CLISTAT_IO;
+    }else if( cli_strcmp(z,"all")==0 ){
+      mNew |= CLISTAT_ALL;
+#ifndef __linux__
+      dotCmdError(p, ii, "available only on Linux", 0);
+      return 1;
+#endif
+#ifdef SQLITE_ENABLE_ZIPVFS_VTAB
+    }else if( cli_strcmp(z,"zipvfs")==0 ){
+      mNew |= CLISTAT_ZIPVFS;
+#endif
+    }else if( cli_strcmp(z,"reset")==0 ){
+      mNew |= CLISTAT_RESET;
+    }else if( cli_strcmp(z,"once")==0 ){
+      bOnce = 1;
+    }else if( IsDigit(z[0]) ){
+      if( booleanValue(z) ){
+        mNew |= CLISTAT_ON;
+      }else{
+        mNew = 0;
+      }
+    }else if( pickStr(z, 0, "on", "yes", "ON", "YES", 0)>=0 ){
+      mNew |= CLISTAT_ON;
+    }else if( pickStr(z, 0, "off", "no", "OFF", "NO", 0)>=0 ){
+      mNew = 0;
+    }else{
+      dotCmdError(p, ii, "unknown argument", 0);
+      return 1;
+    }
+  }
+  p->mStats = mNew;
+  if( bOnce ){
+    display_stats(p->db, p);
+    p->mStats = savedStats;
   }
   return 0;
 }
@@ -35598,6 +35862,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
       { "trigger_depth",         SQLITE_LIMIT_TRIGGER_DEPTH             },
       { "worker_threads",        SQLITE_LIMIT_WORKER_THREADS            },
       { "schema",                SQLITE_LIMIT_SCHEMA                    },
+      { "trigger_steps",         SQLITE_LIMIT_TRIGGER_STEPS             },
     };
     int i, n2;
     open_db(p, 0);
@@ -36911,7 +37176,6 @@ static int do_meta_command(const char *zLine, ShellState *p){
 
   if( c=='s' && cli_strncmp(azArg[0], "show", n)==0 ){
     static const char *azBool[] = { "off", "on", "trigger", "full"};
-    const char *zOut;
     int i;
     if( nArg!=1 ){
       eputz("Usage: .show\n");
@@ -36951,13 +37215,42 @@ static int do_meta_command(const char *zLine, ShellState *p){
     cli_printf(p->out, "%12.12s: ", "rowseparator");
     output_c_string(p->out, p->mode.spec.zRowSep);
     cli_puts("\n", p->out);
-    switch( p->statsOn ){
-      case 0:  zOut = "off";     break;
-      default: zOut = "on";      break;
-      case 2:  zOut = "stmt";    break;
-      case 3:  zOut = "vmstep";  break;
+    cli_printf(p->out, "%12.12s:", "stats");
+    if( p->mStats==0 ){
+      cli_printf(p->out, " off\n");
+    }else{
+      u8 mStats = p->mStats;
+      if( (mStats & CLISTAT_ALL)==CLISTAT_ALL ){
+        cli_printf(p->out, " all");
+        mStats &= ~CLISTAT_ALL;
+      }
+      if( (mStats & CLISTAT_ON)==CLISTAT_ON ){
+        cli_printf(p->out, " on");
+        mStats &= ~CLISTAT_ON;
+      }
+      if( mStats & CLISTAT_XSTMT ){
+        cli_printf(p->out, " xstmt");
+      }else if( mStats & CLISTAT_STMT ){
+        cli_printf(p->out, " stmt");
+      }else if( mStats & CLISTAT_VMSTEP ){
+        cli_printf(p->out, " vmstep");
+      }
+      if( mStats & CLISTAT_XMEM ){
+        cli_printf(p->out, " xmem");
+      }else if( mStats & CLISTAT_MEM ){
+        cli_printf(p->out, " mem");
+      }
+      if( mStats & CLISTAT_IO ){
+        cli_printf(p->out, " io");
+      }
+      if( mStats & CLISTAT_ZIPVFS ){
+        cli_printf(p->out, " zipvfs");
+      }
+      if( mStats & CLISTAT_RESET ){
+        cli_printf(p->out, " reset");
+      }
+      cli_printf(p->out,"\n");
     }
-    cli_printf(p->out, "%12.12s: %s\n","stats", zOut);
     cli_printf(p->out, "%12.12s: ", "width");
     for(i=0; i<p->mode.spec.nWidth; i++){
       cli_printf(p->out, "%d ", (int)p->mode.spec.aWidth[i]);
@@ -36968,20 +37261,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
   }else
 
   if( c=='s' && cli_strncmp(azArg[0], "stats", n)==0 ){
-    if( nArg==2 ){
-      if( cli_strcmp(azArg[1],"stmt")==0 ){
-        p->statsOn = 2;
-      }else if( cli_strcmp(azArg[1],"vmstep")==0 ){
-        p->statsOn = 3;
-      }else{
-        p->statsOn = (u8)booleanValue(azArg[1]);
-      }
-    }else if( nArg==1 ){
-      display_stats(p->db, p, 0);
-    }else{
-      eputz("Usage: .stats ?on|off|stmt|vmstep?\n");
-      rc = 1;
-    }
+    rc = dotCmdStats(p);
   }else
 
   if( (c=='t' && n>1 && cli_strncmp(azArg[0], "tables", n)==0) ){
@@ -39018,7 +39298,7 @@ int SQLITE_CDECL main(int argc, char **argv){
     }else if( cli_strcmp(z,"-eqpfull")==0 ){
       data.mode.autoEQP = AUTOEQP_full;
     }else if( cli_strcmp(z,"-stats")==0 ){
-      data.statsOn = 1;
+      data.mStats = CLISTAT_ON;
     }else if( cli_strcmp(z,"-scanstats")==0 ){
       data.mode.scanstatsOn = 1;
     }else if( cli_strcmp(z,"-backslash")==0 ){
