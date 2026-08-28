@@ -636,6 +636,7 @@ int sqlite3_fprintf(FILE *out, const char *zFormat, ...){
     va_start(ap, zFormat);
     z = sqlite3_vmprintf(zFormat, ap);
     va_end(ap);
+    if( z==0 ) return -1;
     sqlite3_fputs(z, out);
     rc = (int)strlen(z);
     sqlite3_free(z);
@@ -657,6 +658,7 @@ int sqlite3_vfprintf(FILE *out, const char *zFormat, va_list ap){
     */
     char *z;
     z = sqlite3_vmprintf(zFormat, ap);
+    if( z==0 ) return -1;
     sqlite3_fputs(z, out);
     rc = (int)strlen(z);
     sqlite3_free(z);
@@ -1330,7 +1332,7 @@ static void qrfEqpStats(Qrf *p){
     if( sqlite3_stmt_scanstatus_v2(pS,i,SQLITE_SCANSTAT_EXPLAIN,f,(void*)&z) ){
       break;
     }
-    n = (int)strlen(z) + qrfStatsHeight(pS,i)*3;
+    n = (z ? (int)strlen(z) : 0) + qrfStatsHeight(pS,i)*3;
     if( n>nWidth ) nWidth = n;
   }
   nWidth += 2;
@@ -25085,6 +25087,8 @@ struct ShellState {
   char *zDestTable;      /* Name of destination table when MODE_Insert */
   char *zTempFile;       /* Temporary file that might need deleting */
   char *zErrPrefix;      /* Alternative error message prefix */
+  char *zAuthIgnore;     /* Authorizer returns SQLITE_IGNORE for glob matches */
+  char *zAuthDeny;       /* Authorizer returns SQLITE_DENY for glob matches */
   sqlite3_stmt *pStmt;   /* Current statement if any. */
   FILE *pLog;            /* Write log output here */
   char *azPrompt[2];     /* Main and continuation prompt strings */
@@ -27493,24 +27497,20 @@ static int shellAuth(
      "ANALYZE",              "CREATE_VTABLE",        "DROP_VTABLE",
      "FUNCTION",             "SAVEPOINT",            "RECURSIVE"
   };
-  int i;
-  const char *az[4];
-  az[0] = zA1;
-  az[1] = zA2;
-  az[2] = zA3;
-  az[3] = zA4;
-  cli_printf(p->out, "authorizer: %s", azAction[op]);
-  for(i=0; i<4; i++){
-    cli_puts(" ", p->out);
-    if( az[i] ){
-      output_c_string(p->out, az[i]);
-    }else{
-      cli_puts("NULL", p->out);
-    }
+  char *zResult = "OK";
+  int rc = SQLITE_OK;
+  char *zMsg = sqlite3_mprintf("%s %Q %Q %Q %Q", azAction[op],zA1,zA2,zA3,zA4);
+  if( p->zAuthDeny && sqlite3_strglob(p->zAuthDeny, zMsg)==0 ){
+    zResult = "DENY";
+    rc = SQLITE_DENY;
+  }else if( p->zAuthIgnore && sqlite3_strglob(p->zAuthIgnore, zMsg)==0 ){
+    zResult = "IGNORE";
+    rc = SQLITE_IGNORE;
   }
-  cli_puts("\n", p->out);
+  cli_printf(p->out, "authorizer: %s -> %s\n", zMsg, zResult);
+  sqlite3_free(zMsg);
   if( p->bSafeMode ) (void)safeModeAuth(pClientData, op, zA1, zA2, zA3, zA4);
-  return SQLITE_OK;
+  return rc;
 }
 #endif
 
@@ -27999,9 +27999,11 @@ static int display_stats(
   int iCur, iHiwtr;
   sqlite3_int64 iCur64, iHiwtr64;
   FILE *out;
+  int bReset;
+
   if( pArg==0 || pArg->out==0 ) return 0;
   out = pArg->out;
-  int bReset = (pArg->mStats & CLISTAT_RESET)!=0;
+  bReset = (pArg->mStats & CLISTAT_RESET)!=0;
 
   if( pArg->pStmt && (pArg->mStats & CLISTAT_XSTMT)!=0 ){
     int nCol, i, x;
@@ -28948,6 +28950,9 @@ static const char *(azHelp[]) = {
 #endif
 #ifndef SQLITE_OMIT_AUTHORIZATION
   ".auth ON|OFF             Show authorizer callbacks",
+  "   Options:",
+  "     --deny GLOB           Return SQLITE_DENY if pattern matches",
+  "     --ignore GLOB         Return SQLITE_IGNORE if pattern matches",
 #endif
 #ifndef SQLITE_SHELL_FIDDLE
   ".backup ?DB? FILE        Backup DB (default \"main\") to FILE",
@@ -29232,7 +29237,9 @@ static const struct {
 "\n"
 "Change the output mode to MODE and/or apply OPTIONS to the output mode.\n"
 "Arguments are processed from left to right.  If no arguments, show the\n"
-"current output mode and relevant options.\n"
+"current output mode and relevant options.  Use the --list option to get\n"
+"a list of available MODE values.  Use -v to show all the current output\n"
+"mode settings.\n"
 "\n"
 "Options:\n"
 "  --align STRING           Set the alignment of text in columnar modes\n"
@@ -29282,7 +29289,7 @@ static const struct {
 "                           means \"no limit\".  Or N can be \"auto\" to set the\n"
 "                           width automatically.\n"
 "  --tablename NAME         Set the name of the table for \"insert\" mode.\n"
-"  --tag NAME               Save mode to the left as NAME.\n"
+"  --tag NAME               Save current settings as a new mode called NAME.\n"
 "  --textjsonb BOOLEAN      If enabled, JSONB text is displayed as text JSON.\n"
 "  --title ARG              Whether or not to show column headers, and if so\n"
 "                           how to encode them.  ARG can be \"off\", \"on\",\n"
@@ -33536,7 +33543,9 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **
 ** Change the output mode to MODE and/or apply OPTIONS to the output mode.
 ** Arguments are processed from left to right.  If no arguments, show the
-** current output mode and relevant options.
+** current output mode and relevant options.  Use the --list option to get
+** a list of available MODE values.  Use -v to show all the current output
+** mode settings.
 **
 ** Options:
 **   --align STRING           Set the alignment of text in columnar modes
@@ -33586,7 +33595,7 @@ static int modeTitleDsply(ShellState *p, int bAll){
 **                            means "no limit".  Or N can be "auto" to set the
 **                            width automatically.
 **   --tablename NAME         Set the name of the table for "insert" mode.
-**   --tag NAME               Save mode to the left as NAME.
+**   --tag NAME               Save current settings as a new mode called NAME.
 **   --textjsonb BOOLEAN      If enabled, JSONB text is displayed as text JSON.
 **   --title ARG              Whether or not to show column headers, and if so
 **                            how to encode them.  ARG can be "off", "on",
@@ -34646,9 +34655,9 @@ static int dotCmdStats(ShellState *p){
       }else{
         mNew = 0;
       }
-    }else if( pickStr(z, 0, "on", "yes", "ON", "YES", 0)>=0 ){
+    }else if( pickStr(z, 0, "on", "yes", "ON", "YES", "")>=0 ){
       mNew |= CLISTAT_ON;
-    }else if( pickStr(z, 0, "off", "no", "OFF", "NO", 0)>=0 ){
+    }else if( pickStr(z, 0, "off", "no", "OFF", "NO", "")>=0 ){
       mNew = 0;
     }else{
       dotCmdError(p, ii, "unknown argument", 0);
@@ -34814,13 +34823,57 @@ static int do_meta_command(const char *zLine, ShellState *p){
 
 #ifndef SQLITE_OMIT_AUTHORIZATION
   if( c=='a' && cli_strncmp(azArg[0], "auth", n)==0 ){
-    if( nArg!=2 ){
-      cli_printf(stderr, "Usage: .auth ON|OFF\n");
+    int ii;
+    int eOnOff = -1;
+    open_db(p, 0);
+    for(ii=1; ii<nArg && rc==0; ii++){
+      const char *z = azArg[ii];
+      if( z[0]=='-' && z[1]=='-' ) z++;
+      if( strcmp(z,"-deny")==0 ){
+        ii++;
+        if( ii>=nArg ){
+          dotCmdError(p, ii-1, "missing argument", 0);
+          rc = 1;
+          goto meta_command_exit;
+        }else{
+          free(p->zAuthDeny);
+          p->zAuthDeny = 0;
+          if( azArg[ii][0] ){
+            p->zAuthDeny = strdup(azArg[ii]);
+            shell_check_oom(p->zAuthDeny);
+          }
+        }
+      }else
+      if( strcmp(z,"-ignore")==0 ){
+        ii++;
+        if( ii>=nArg ){
+          dotCmdError(p, ii-1, "missing argument", 0);
+          rc = 1;
+          goto meta_command_exit;
+        }else{
+          free(p->zAuthIgnore);
+          p->zAuthIgnore = 0;
+          if( azArg[ii][0] ){
+            p->zAuthIgnore = strdup(azArg[ii]);
+            shell_check_oom(p->zAuthIgnore);
+          }
+        }
+      }else
+      if( eOnOff<0 ){
+        eOnOff = booleanValue(z);
+      }else
+      {
+        dotCmdError(p, ii, "unknown argument", 0);
+        rc = 1;
+        goto meta_command_exit;
+      }
+    }
+    if( eOnOff<0 ){
+      cli_printf(stderr, "Usage: .auth ON|OFF [--deny GLOB] [--ignore]\n");
       rc = 1;
       goto meta_command_exit;
     }
-    open_db(p, 0);
-    if( booleanValue(azArg[1]) ){
+    if( eOnOff ){
       sqlite3_set_authorizer(p->db, shellAuth, p);
     }else if( p->bSafeModePersist ){
       sqlite3_set_authorizer(p->db, safeModeAuth, p);
@@ -37420,7 +37473,6 @@ static int do_meta_command(const char *zLine, ShellState *p){
             { 0x00000001, 0, "Flatten" },
             { 0x00000002, 1, "WindowFunc" },
             { 0x00000004, 1, "GroupByOrder" },
-            { 0x00000008, 1, "FactorOutConst" },
             { 0x00000010, 1, "DistinctOpt" },
             { 0x00000020, 1, "CoverIdxScan" },
             { 0x00000040, 1, "OrderByIdxJoin" },
@@ -37437,7 +37489,6 @@ static int do_meta_command(const char *zLine, ShellState *p){
             { 0x00020000, 1, "SeekScan" },
             { 0x00040000, 1, "OmitOrderBy" },
             { 0x00080000, 1, "BloomFilter" },
-            { 0x00100000, 1, "BloomPulldown" },
             { 0x00200000, 1, "BalancedMerge" },
             { 0x00400000, 1, "ReleaseReg" },
             { 0x00800000, 1, "FlttnUnionAll" },
@@ -37448,6 +37499,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
             { 0x10000000, 1, "OrderBySubq" },
             { 0x20000000, 1, "StarQuery" },
             { 0x40000000, 1, "ExistsToJoin" },
+            { 0x80000000, 1, "UnionLimit" },
             { 0xffffffff, 0, "All" },
           };
           unsigned int curOpt;
@@ -39557,6 +39609,8 @@ int SQLITE_CDECL main(int argc, char **argv){
   free(data.dot.abQuot);
   free(data.azPrompt[0]);
   free(data.azPrompt[1]);
+  free(data.zAuthDeny);
+  free(data.zAuthIgnore);
   if( data.nTestRun ){
     sqlite3_fprintf(stdout, "%d test%s run with %d error%s\n",
        data.nTestRun, data.nTestRun==1 ? "" : "s",
