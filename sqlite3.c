@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 5251f4d7071f86ad9d772d8b9309bc7191ca with changes in files:
+** 4021369bc9558fbfcfa83ee4cd6b986734b8 with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-08-27 18:07:23 5251f4d7071f86ad9d772d8b9309bc7191ca485c3db5cb658f6-experimental"
+#define SQLITE_SOURCE_ID      "2026-09-04 14:20:44 4021369bc9558fbfcfa83ee4cd6b986734b8c41b6d72bd97064-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-08-27T18:07:23.412Z"
+#define SQLITE_SCM_DATETIME   "2026-09-04T14:20:44.144Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -3844,6 +3844,11 @@ SQLITE_API int sqlite3_set_authorizer(
 ** is the name of the inner-most trigger or view that is responsible for
 ** the access attempt or NULL if this access attempt is directly from
 ** top-level SQL code.
+**
+** The case of strings in the 3rd through the 6th argument to the
+** authorization callback is arbitrary.  Authorization callbacks
+** implementations should use [sqlite3_stricmp()] or similar when
+** doing comparisons against those values.
 */
 /******************************************* 3rd ************ 4th ***********/
 #define SQLITE_CREATE_INDEX          1   /* Index Name      Table Name      */
@@ -17211,6 +17216,10 @@ SQLITE_PRIVATE   void sqlite3PagerRefdump(Pager*);
 SQLITE_PRIVATE int sqlite3PagerWalSystemErrno(Pager*);
 #endif
 
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+SQLITE_PRIVATE   void sqlite3PagerWalStat(Pager*,sqlite3_str*);
+#endif
+
 #endif /* SQLITE_PAGER_H */
 
 /************** End of pager.h ***********************************************/
@@ -18592,7 +18601,7 @@ SQLITE_PRIVATE int sqlite3PCacheIsDirty(PCache *pCache);
 # define SQLITE_MUTEX_OMIT
 #endif
 #if SQLITE_THREADSAFE && !defined(SQLITE_MUTEX_NOOP)
-#  if SQLITE_OS_UNIX
+#  if SQLITE_OS_UNIX || defined(__CYGWIN__)
 #    define SQLITE_MUTEX_PTHREADS
 #  elif SQLITE_OS_WIN
 #    define SQLITE_MUTEX_W32
@@ -49892,6 +49901,9 @@ static struct win_syscall {
 #define osCygwin_conv_path ((size_t(*)(unsigned int, \
     const void *, void *, size_t))aSyscall[58].pCurrent)
 
+  { "GetDriveTypeW",            (SYSCALL)GetDriveTypeW,          0 },
+#define osGetDriveTypeW ((UINT(WINAPI*)(LPCWSTR))aSyscall[59].pCurrent)
+
 }; /* End of the overrideable system calls */
 
 /*
@@ -52469,6 +52481,23 @@ static int winIsUNCPath(const char *zFile){
 }
 
 /*
+** Return true if the string passed in is the name of a file on a
+** remote (network-mounted) volume.
+*/
+static int winIsRemoteVolume(const char *zFile){
+  WCHAR zRoot[4];
+  if( strncmp(zFile, "\\\\?\\",4)==0 ) zFile += 4;
+  if( !sqlite3Isalpha(zFile[0]) ) return 0;
+  if( zFile[1]!=':' ) return 0;
+  if( !winIsDirSep(zFile[2]) ) return 0;
+  zRoot[0] = (WCHAR)zFile[0];
+  zRoot[1] = ':';
+  zRoot[2] = '\\';
+  zRoot[3] = 0;
+  return osGetDriveTypeW(zRoot)==DRIVE_REMOTE;
+}
+
+/*
 ** Open the shared-memory area associated with database file pDbFd.
 */
 static int winOpenSharedMemory(winFile *pDbFd){
@@ -52493,7 +52522,11 @@ static int winOpenSharedMemory(winFile *pDbFd){
   pNew->zFilename = (char*)&pNew[1];
   pNew->hSharedShm = INVALID_HANDLE_VALUE;
   pNew->isUnlocked = 1;
-  pNew->bUseSharedLockHandle = winIsUNCPath(pDbFd->zPath);
+  if( winIsUNCPath(pDbFd->zPath) || winIsRemoteVolume(pDbFd->zPath) ){
+    pNew->bUseSharedLockHandle = 1;
+  }else{
+    pNew->bUseSharedLockHandle = 0;
+  }
   sqlite3_snprintf(nName+15, pNew->zFilename, "%s-shm", pDbFd->zPath);
   sqlite3FileSuffix3(pDbFd->zPath, pNew->zFilename);
 
@@ -54491,7 +54524,7 @@ SQLITE_API int sqlite3_os_init(void){
 
   /* Double-check that the aSyscall[] array has been constructed
   ** correctly.  See ticket [bb3a86e890c8e96ab] */
-  assert( ArraySize(aSyscall)==59 );
+  assert( ArraySize(aSyscall)==60 );
   assert( strcmp(aSyscall[0].zName,"AreFileApisANSI")==0 );
   assert( strcmp(aSyscall[8].zName,"FreeLibrary")==0 );
   assert( strcmp(aSyscall[16].zName,"GetSystemInfo")==0 );
@@ -58881,6 +58914,10 @@ SQLITE_PRIVATE void sqlite3WalDb(Wal *pWal, sqlite3 *db);
 
 #ifdef SQLITE_USE_SEH
 SQLITE_PRIVATE int sqlite3WalSystemErrno(Wal*);
+#endif
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+SQLITE_PRIVATE   void sqlite3WalStat(Wal*,sqlite3_str*);
 #endif
 
 #endif /* ifndef SQLITE_OMIT_WAL */
@@ -65757,6 +65794,20 @@ SQLITE_PRIVATE int sqlite3PagerRefcount(Pager *pPager){
 }
 #endif
 
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Append JSON structure elements describing the current state of
+** the write-ahead log to pStr.
+*/
+SQLITE_PRIVATE void sqlite3PagerWalStat(Pager *pPager, sqlite3_str *pStr){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ){
+    sqlite3WalStat(pPager->pWal, pStr);
+  }
+#endif
+}
+#endif
+
 /*
 ** Return the approximate number of bytes of memory currently
 ** used by the pager and its associated cache.
@@ -67353,10 +67404,41 @@ typedef u16 ht_slot;
 **   walIteratorFree() - Free an iterator.
 **
 ** This functionality is used by the checkpoint code (see walCheckpoint()).
+**
+** There are two possible algorithms:
+**
+**   WALITER-1     Load all pages mentioned in the WAL file and sort them,
+**                 then hand them back out in sorted order as requested by
+**                 walIteratorNext().  nPagemap==0 for this algorithm.
+**
+**   WALITER-2     Create a map of all database file pages and record the
+**                 last WAL file frame that updates that page.  Then walk
+**                 through the map in acsending order and return all
+**                 non-zero entries. nPagemap is positive for this algorithm.
+**
+** Either algorithm should work for any database and WAL file, however
+** algorithm WALITER-1 is faster and uses less memory when the database is
+** larger than the WAL file and algorithm WALITER-2 is faster and uses
+** less memory when the WAL file is larger than the database, modulo a
+** constant of proportionality.  The walIteratorInit() routine selects
+** the best algorithm for each situation.  WALITER-2 was added for
+** SQLite 3.54.0.  Prior to that, WALITER-1 was used always.
+**
+** For algorithm WALITER-2, nPagemap stores the number of pages in the
+** database file, nSegment==1, and aSegment[0].aPgno[] is the page map array
+** that is nPagemap+1 entries in length.  The value of aSegment[0].aPgno[PGNO]
+** is the frame number of the last (newest) entry for page PGNO in the WAL
+** file, or 0 if PGNO is not in the WAL file.  (Aside: There is no page
+** number 0 in a well-formed database, so the memory allocation is arranged
+** such that aSegment[0].aPgno[0] and aSegment[0].iZero are aliases for the
+** same four bits of memory.  This saves us from having to use -1 and +1
+** offsets to translate between 1-based SQLite page numbers and 0-based
+** C-language index numbers.  tag-20260903-1)
 */
 struct WalIterator {
   u32 iPrior;                     /* Last result returned from the iterator */
   int nSegment;                   /* Number of entries in aSegment[] */
+  u32 nPagemap;                   /* Non-zero in "page-map" mode */
   struct WalSegment {
     int iNext;                    /* Next slot in aIndex[] not yet returned */
     ht_slot *aIndex;              /* i0, i1, i2... such that aPgno[iN] ascend */
@@ -67369,6 +67451,7 @@ struct WalIterator {
 /* Size (in bytes) of a WalIterator object suitable for N or fewer segments */
 #define SZ_WALITERATOR(N)  \
      (offsetof(WalIterator,aSegment)+(N)*sizeof(struct WalSegment))
+
 
 /*
 ** Define the parameters of the hash tables in the wal-index file. There
@@ -68532,24 +68615,38 @@ static int walIteratorNext(
   u32 *piPage,                  /* OUT: The page number of the next page */
   u32 *piFrame                  /* OUT: Wal frame index of next page */
 ){
-  u32 iMin;                     /* Result pgno must be greater than iMin */
   u32 iRet = 0xFFFFFFFF;        /* 0xffffffff is never a valid page number */
-  int i;                        /* For looping through segments */
 
-  iMin = p->iPrior;
-  assert( iMin<0xffffffff );
-  for(i=p->nSegment-1; i>=0; i--){
-    struct WalSegment *pSegment = &p->aSegment[i];
-    while( pSegment->iNext<pSegment->nEntry ){
-      u32 iPg = pSegment->aPgno[pSegment->aIndex[pSegment->iNext]];
-      if( iPg>iMin ){
-        if( iPg<iRet ){
-          iRet = iPg;
-          *piFrame = pSegment->iZero + pSegment->aIndex[pSegment->iNext];
-        }
+  if( p->nPagemap ){
+    /* Algorithm WALITER-2 */
+    while( p->iPrior<p->nPagemap ){
+      p->iPrior++;
+      if( p->aSegment[0].aPgno[p->iPrior] ){
+        iRet = p->iPrior;
+        *piFrame = p->aSegment[0].aPgno[p->iPrior];
         break;
       }
-      pSegment->iNext++;
+    }
+  }else{
+    /* Algorithm WALITER-1 */
+    u32 iMin;                     /* Result pgno must be greater than iMin */
+    int i;                        /* For looping through segments */
+
+    iMin = p->iPrior;
+    assert( iMin<0xffffffff );
+    for(i=p->nSegment-1; i>=0; i--){
+      struct WalSegment *pSegment = &p->aSegment[i];
+      while( pSegment->iNext<pSegment->nEntry ){
+        u32 iPg = pSegment->aPgno[pSegment->aIndex[pSegment->iNext]];
+        if( iPg>iMin ){
+          if( iPg<iRet ){
+            iRet = iPg;
+            *piFrame = pSegment->iZero + pSegment->aIndex[pSegment->iNext];
+          }
+          break;
+        }
+        pSegment->iNext++;
+      }
     }
   }
 
@@ -68718,35 +68815,59 @@ static void walIteratorFree(WalIterator *p){
 ** WalIterator object when it has finished with it.
 */
 static int walIteratorInit(Wal *pWal, u32 nBackfill, WalIterator **pp){
+  int iFirstPage;                 /* First 32KB *-shm page to visit */
+  int iLastPage;                  /* Last 32KB *-shm page to visit */
+  u32 iZero;                      /* Frame before first frame to visit */
   WalIterator *p;                 /* Return value */
   int nSegment;                   /* Number of segments to merge */
   u32 iLast;                      /* Last frame in log */
   sqlite3_int64 nByte;            /* Number of bytes to allocate */
+  sqlite3_int64 nExtra;           /* Number of bytes to allocate */
   int i;                          /* Iterator variable */
-  ht_slot *aTmp;                  /* Temp space used by merge-sort */
+  ht_slot *aTmp = 0;              /* Temp space used by merge-sort */
   int rc = SQLITE_OK;             /* Return Code */
+  int eAlg;                       /* Which algorithm to use.  1 or 2 */
 
   /* This routine only runs while holding the checkpoint lock. And
-  ** it only runs if there is actually content in the log (mxFrame>0).
-  */
+  ** it only runs if there is actually content in the log (mxFrame>0).  */
   assert( pWal->ckptLock && pWal->hdr.mxFrame>0 );
+
   iLast = pWal->hdr.mxFrame;
+  iFirstPage = walFramePage(nBackfill+1);
+  iLastPage = walFramePage(iLast);
+  iZero = iFirstPage ? (HASHTABLE_NPAGE_ONE+(iFirstPage-1)*HASHTABLE_NPAGE) : 0;
+
+  if( (iLast-iZero)*sizeof(ht_slot)>pWal->hdr.nPage*sizeof(u32) ){
+    /* Algorithm WALITER-2 */
+    nSegment = 1;
+    eAlg = 2;
+    nByte = SZ_WALITERATOR(nSegment) + pWal->hdr.nPage * sizeof(u32);
+    nExtra = 0;
+  }else{
+    /* Algorithm WALITER-1 */
+    nSegment = iLastPage - iFirstPage + 1;
+    eAlg = 1;
+    nByte = SZ_WALITERATOR(nSegment) + (iLast-iZero)*sizeof(ht_slot);
+    nExtra = sizeof(ht_slot) * (iLast>HASHTABLE_NPAGE?HASHTABLE_NPAGE:iLast);
+  }
 
   /* Allocate space for the WalIterator object. */
-  nSegment = walFramePage(iLast) + 1;
-  nByte = SZ_WALITERATOR(nSegment)
-        + iLast*sizeof(ht_slot);
-  p = (WalIterator *)sqlite3_malloc64(nByte
-      + sizeof(ht_slot) * (iLast>HASHTABLE_NPAGE?HASHTABLE_NPAGE:iLast)
-  );
+  p = (WalIterator *)sqlite3_malloc64(nByte + nExtra);
   if( !p ){
     return SQLITE_NOMEM_BKPT;
   }
   memset(p, 0, nByte);
   p->nSegment = nSegment;
-  aTmp = (ht_slot*)&(((u8*)p)[nByte]);
+  if( eAlg==2 ){
+    p->nPagemap = pWal->hdr.nPage;
+    p->aSegment[0].aPgno = ((u32*)&p->aSegment[1]) - 1;
+    assert( (u8*)&(p->aSegment[0].aPgno[0]) == (u8*)&(p->aSegment[0].iZero) );
+    /* ^-- verifies tag-20260903-1 */
+  }else{
+    aTmp = (ht_slot*)&(((u8*)p)[nByte]);
+  }
   SEH_FREE_ON_ERROR(0, p);
-  for(i=walFramePage(nBackfill+1); rc==SQLITE_OK && i<nSegment; i++){
+  for(i=iFirstPage; rc==SQLITE_OK && i<=iLastPage; i++){
     WalHashLoc sLoc;
 
     rc = walHashGet(pWal, i, &sLoc);
@@ -68755,22 +68876,34 @@ static int walIteratorInit(Wal *pWal, u32 nBackfill, WalIterator **pp){
       int nEntry;                 /* Number of entries in this segment */
       ht_slot *aIndex;            /* Sorted index for this segment */
 
-      if( (i+1)==nSegment ){
+      if( i==iLastPage ){
         nEntry = (int)(iLast - sLoc.iZero);
       }else{
         nEntry = (int)((u32*)sLoc.aHash - (u32*)sLoc.aPgno);
       }
-      aIndex = &((ht_slot *)&p->aSegment[p->nSegment])[sLoc.iZero];
-      sLoc.iZero++;
 
-      for(j=0; j<nEntry; j++){
-        aIndex[j] = (ht_slot)j;
+      if( eAlg==2 ){
+        u32 *aPagemap = p->aSegment[0].aPgno;
+        for(j=0; j<nEntry; j++){
+          u32 pgno = sLoc.aPgno[ j ];
+          if( pgno<=p->nPagemap ){
+            aPagemap[pgno] = sLoc.iZero + j + 1;
+          }
+        }
+      }else{
+        assert( i!=iFirstPage || iZero==sLoc.iZero );
+        aIndex = &((ht_slot *)&p->aSegment[p->nSegment])[sLoc.iZero - iZero];
+        sLoc.iZero++;
+
+        for(j=0; j<nEntry; j++){
+          aIndex[j] = (ht_slot)j;
+        }
+        walMergesort((u32 *)sLoc.aPgno, aTmp, aIndex, &nEntry);
+        p->aSegment[i-iFirstPage].iZero = sLoc.iZero;
+        p->aSegment[i-iFirstPage].nEntry = nEntry;
+        p->aSegment[i-iFirstPage].aIndex = aIndex;
+        p->aSegment[i-iFirstPage].aPgno = (u32 *)sLoc.aPgno;
       }
-      walMergesort((u32 *)sLoc.aPgno, aTmp, aIndex, &nEntry);
-      p->aSegment[i].iZero = sLoc.iZero;
-      p->aSegment[i].nEntry = nEntry;
-      p->aSegment[i].aIndex = aIndex;
-      p->aSegment[i].aPgno = (u32 *)sLoc.aPgno;
     }
   }
   if( rc!=SQLITE_OK ){
@@ -71411,6 +71544,64 @@ SQLITE_PRIVATE int sqlite3WalFramesize(Wal *pWal){
 SQLITE_PRIVATE sqlite3_file *sqlite3WalFile(Wal *pWal){
   return pWal->pWalFd;
 }
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Helper function to sqlite3WalStat().
+**
+** Append JSON-5 structure elements onto describing the current state
+** of pWal onto the end of pStr.  This function is for debugging and
+** analysis only and is not included in production builds.
+*/
+static void walIndexHdrStat(volatile WalIndexHdr *pHdr, sqlite3_str *pStr){
+  sqlite3_str_appendf(pStr, "iVersion:%u",pHdr->iVersion);
+  sqlite3_str_appendf(pStr, ",iChange:%u",pHdr->iChange);
+  sqlite3_str_appendf(pStr, ",isInit:%u",pHdr->isInit);
+  sqlite3_str_appendf(pStr, ",bigEndCksum:%u",pHdr->bigEndCksum);
+  sqlite3_str_appendf(pStr, ",szPage:%u",pHdr->szPage);
+  sqlite3_str_appendf(pStr, ",mxFrame:%u",pHdr->mxFrame);
+  sqlite3_str_appendf(pStr, ",nPage:%u",pHdr->nPage);
+#if 0  /* Not often needed.  Declutter. */
+  sqlite3_str_appendf(pStr, ",aFrameCksum:[0x%08x,0x%08x]",
+                      pHdr->aFrameCksum[0], pHdr->aFrameCksum[1]);
+  sqlite3_str_appendf(pStr, ",aSalt:[0x%08x,0x%08x]",
+                      pHdr->aSalt[0], pHdr->aSalt[1]);
+  sqlite3_str_appendf(pStr, ",aCksum:[0x%08x,0x%08x]",
+                      pHdr->aCksum[0], pHdr->aCksum[1]);
+#endif
+}
+#endif /* SQLITE_DEBUG || SQLITE_ENABLE_WALSTAT */
+
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Append JSON-5 structure elements onto describing the current state
+** of pWal onto the end of pStr.  This function is for debugging and
+** analysis only and is not included in production builds.
+*/
+SQLITE_PRIVATE void sqlite3WalStat(Wal *pWal, sqlite3_str *pStr){
+  SEH_TRY {
+    int i;
+    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+    volatile WalIndexHdr *pHdr = walIndexHdr(pWal);
+    sqlite3_str_appendf(pStr, "hdr0:{");
+    walIndexHdrStat(pHdr,pStr);
+    sqlite3_str_appendf(pStr, "},ckpt:{");
+    sqlite3_str_appendf(pStr, "nBackfill:%u",pInfo->nBackfill);
+    sqlite3_str_appendf(pStr, ",aReadMark:[%u", pInfo->aReadMark[0]);
+    for(i=1; i<WAL_NREADER; i++){
+      sqlite3_str_appendf(pStr, ",%u", pInfo->aReadMark[i]);
+    }
+    sqlite3_str_appendf(pStr, "],nBackfillAttempted:%u}",
+                        pInfo->nBackfillAttempted);
+
+    sqlite3_str_appendf(pStr, ",nWiData:%d", pWal->nWiData);
+    sqlite3_str_appendf(pStr, ",readLock:%d", pWal->readLock);
+    sqlite3_str_appendf(pStr, ",minFrame:%u", pWal->minFrame);
+  }
+  SEH_EXCEPT( ; )
+}
+#endif /* SQLITE_DEBUG || SQLITE_ENABLE_WALSTAT */
 
 #endif /* #ifndef SQLITE_OMIT_WAL */
 
@@ -74648,7 +74839,7 @@ static int btreeComputeFreeSpace(MemPage *pPage){
       size = get2byte(&data[pc+2]);
       if( size<4 && sqlite3FaultSim(422)==SQLITE_OK ){
         /* Minimum freeblock size is 4.  Enable fault-sim 422 to disable this
-        ** check to reach interesting error stats.  However, disabling this
+        ** check to reach interesting error states.  However, disabling this
         ** check can cause assertion faults due to min-heap overflow.  All
         ** fault-sims are for testing use only, but this one especially so. */
         return SQLITE_CORRUPT_PAGE(pPage);
@@ -82909,6 +83100,9 @@ static int btreeDropTable(Btree *p, Pgno iTable, int *piMoved){
       }
       pMove = 0;
       rc = btreeGetPage(pBt, maxRootPgno, &pMove, 0);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3PagerWrite(pMove->pDbPage);
+      }
       freePage(pMove, &rc);
       releasePage(pMove);
       if( rc!=SQLITE_OK ){
@@ -86927,7 +87121,7 @@ SQLITE_PRIVATE int sqlite3ValueFromExpr(
     if( rc==SQLITE_OK && pVal
      && affinity==SQLITE_AFF_REAL
      && (pVal->flags & MEM_Int)
-     && (u64)(pVal->u.i<0 ? pVal->u.i : pVal->u.i)>140737488355327LL
+     && (pVal->u.i<-140737488355328LL || pVal->u.i>140737488355327LL)
     ){
       /* If the integer value is too large to fit in a 6-byte integer and
       ** the affinity is REAL, convert it to a real value now. In most
@@ -120902,6 +121096,7 @@ SQLITE_PRIVATE void sqlite3AlterFinishAddColumn(Parse *pParse, Token *pColDef){
      || (pCol->notNull && (pCol->colFlags & COLFLAG_GENERATED)!=0)
      || (pTab->tabFlags & TF_Strict)!=0
     ){
+      pParse->colNamesSet = 1;
       sqlite3NestedParse(pParse,
         "SELECT CASE WHEN quick_check GLOB 'CHECK*'"
         " THEN raise(ABORT,'CHECK constraint failed')"
@@ -137163,6 +137358,48 @@ static void filestatFunc(
 }
 #endif /* SQLITE_DEBUG || SQLITE_ENABLE_FILESTAT */
 
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Implementation of sqlite_walstat(SCHEMA).
+**
+** Return JSON text that describes the current state of a WAL file.
+** This function is for debugging and analysis only.  It is not part
+** of production builds.  This function is not part of the SQLite API
+** and is likely to change or be removed in future versions of SQLite.
+*/
+static void walstatFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  const char *zDbName;
+  sqlite3_str *pStr;
+  Btree *pBtree;
+
+  zDbName = (const char*)sqlite3_value_text(argv[0]);
+  pBtree = sqlite3DbNameToBtree(db, zDbName);
+  if( pBtree ){
+    Pager *pPager;
+    sqlite3BtreeEnter(pBtree);
+    pPager = sqlite3BtreePager(pBtree);
+    assert( pPager!=0 );
+    pStr = sqlite3_str_new(db);
+    if( sqlite3_str_errcode(pStr) ){
+      sqlite3_result_error_nomem(context);
+    }else{
+      sqlite3_str_append(pStr, "{", 1);
+      sqlite3PagerWalStat(pPager, pStr);
+      sqlite3_str_append(pStr, "}", 1);
+      sqlite3_result_str(context, pStr, SQLITE_FINISH);
+    }
+    sqlite3BtreeLeave(pBtree);
+  }else{
+    sqlite3_result_text(context, "{}", 2, SQLITE_STATIC);
+  }
+}
+#endif /* SQLITE_DEBUG || SQLITE_ENABLE_WALSTAT */
+
 #ifdef SQLITE_DEBUG
 /*
 ** Implementation of fpdecode(x,y,z) function.
@@ -137323,6 +137560,7 @@ SQLITE_PRIVATE void sqlite3RegisterBuiltinFunctions(void){
 #endif
 #if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_FILESTAT)
     FUNCTION(sqlite_filestat,    1, 0, 0, filestatFunc     ),
+    FUNCTION(sqlite_walstat,     1, 0, 0, walstatFunc      ),
 #endif
     FUNCTION(ltrim,              1, 1, 0, trimFunc         ),
     FUNCTION(ltrim,              2, 1, 0, trimFunc         ),
@@ -144571,7 +144809,7 @@ static const PragmaName aPragmaName[] = {
   /* ColNames:  */ 0, 0,
   /* iArg:      */ SQLITE_CountRows },
 #endif
-#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) && SQLITE_OS_WIN
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) && defined(_WIN32)
  {/* zName:     */ "data_store_directory",
   /* ePragTyp:  */ PragTyp_DATA_STORE_DIRECTORY,
   /* ePragFlg:  */ PragFlg_NoColumns1,
@@ -144994,7 +145232,7 @@ static const PragmaName aPragmaName[] = {
   /* iArg:      */ SQLITE_WriteSchema|SQLITE_NoSchemaError },
 #endif
 };
-/* Number of pragmas: 68 on by default, 78 total. */
+/* Number of pragmas: 67 on by default, 78 total. */
 
 /************** End of pragma.h **********************************************/
 /************** Continuing where we left off in pragma.c *********************/
@@ -149850,7 +150088,10 @@ static int sqlite3ProcessJoin(Parse *pParse, Select *p){
       p->selFlags |= SF_OnToWhere;
     }
 
-    if( pRight->fg.isTabFunc && joinType==EP_OuterON && pRight->u1.pFuncArg ){
+    if( (pRight->fg.isTabFunc && joinType==EP_OuterON && pRight->u1.pFuncArg)
+     || (pLeft->fg.isTabFunc && pLeft->u1.pFuncArg
+         && pLeft->fg.jointype & JT_LTORJ)
+    ){
       p->selFlags |= SF_OnToWhere;
     }
   }
@@ -150959,6 +151200,9 @@ static void generateSortTail(
     Table *pTab = pSort->aDefer[i].pTab;
     int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
     sqlite3OpenTable(pParse, pSort->aDefer[i].iCsr, iDb, pTab, OP_OpenRead);
+    sqlite3VdbeAddOp2(v, OP_Rewind, pSort->aDefer[i].iCsr,
+                      sqlite3VdbeCurrentAddr(v)+1);
+    VdbeCoverage(v);
     nRefKey = MAX(nRefKey, pSort->aDefer[i].nKey);
   }
 #endif
@@ -156658,7 +156902,7 @@ static SQLITE_NOINLINE void existsToJoin(
 typedef struct CheckOnCtx CheckOnCtx;
 struct CheckOnCtx {
   SrcList *pSrc;       /* SrcList for this context */
-  int iJoin;           /* Cursors must be left of this one, if not zero */
+  int iJoin;           /* Cursors must be left of this one, if not negative */
   int bFuncArg;        /* True for table-function arg */
   CheckOnCtx *pParent; /* Parent context */
 };
@@ -156691,11 +156935,11 @@ static int selectCheckOnClausesExpr(Walker *pWalker, Expr *pExpr){
     ** set it to the cursor number of the RHS of the join to which this
     ** ON expression was attached and then iterate through the entire
     ** expression.  */
-    assert( pCtx->iJoin==0 || pCtx->iJoin==pExpr->w.iJoin );
-    if( pCtx->iJoin==0 ){
+    assert( pCtx->iJoin<0 || pCtx->iJoin==pExpr->w.iJoin );
+    if( pCtx->iJoin<0 ){
       pCtx->iJoin = pExpr->w.iJoin;
       sqlite3WalkExprNN(pWalker, pExpr);
-      pCtx->iJoin = 0;
+      pCtx->iJoin = -1;
       return WRC_Prune;
     }
   }
@@ -156713,7 +156957,7 @@ static int selectCheckOnClausesExpr(Walker *pWalker, Expr *pExpr){
       for(ii=0; ii<nSrc && pSrc->a[ii].iCursor!=iTab; ii++){}
       if( ii<nSrc ){
         /* pSrc is the FROM clause that contains iTab */
-        if( pCtx->iJoin ){
+        if( pCtx->iJoin>=0 ){
           for(ii--; ii>=0 && pSrc->a[ii].iCursor!=pCtx->iJoin; ii--){}
           if( ii>=0 ){
             /* Table iJoin appears to the left of table iTab in the SrcList.
@@ -156745,6 +156989,7 @@ static int selectCheckOnClausesSelect(Walker *pWalker, Select *pSelect){
     memset(&sCtx, 0, sizeof(sCtx));
     sCtx.pSrc = pSelect->pSrc;
     sCtx.pParent = pCtx;
+    sCtx.iJoin = -1;
     pWalker->u.pCheckOnCtx = &sCtx;
     sqlite3WalkSelect(pWalker, pSelect);
     pWalker->u.pCheckOnCtx = pCtx;
@@ -156770,6 +157015,7 @@ SQLITE_PRIVATE void sqlite3SelectCheckOnClauses(Parse *pParse, Select *pSelect){
   w.u.pCheckOnCtx = &sCtx;
   memset(&sCtx, 0, sizeof(sCtx));
   sCtx.pSrc = pSelect->pSrc;
+  sCtx.iJoin = -1;
   sqlite3WalkExpr(&w, pSelect->pWhere);
   pSelect->selFlags &= ~SF_OnToWhere;
 
@@ -156780,7 +157026,7 @@ SQLITE_PRIVATE void sqlite3SelectCheckOnClauses(Parse *pParse, Select *pSelect){
   for(ii=0; ii<pSelect->pSrc->nSrc; ii++){
     SrcItem *pItem = &pSelect->pSrc->a[ii];
     if( pItem->fg.isTabFunc
-     && (pItem->fg.jointype & JT_OUTER)
+     && (pItem->fg.jointype & (JT_OUTER|JT_LTORJ))
     ){
       sCtx.iJoin = pItem->iCursor;
       sqlite3WalkExprList(&w, pItem->u1.pFuncArg);
@@ -160097,8 +160343,7 @@ static void updateVirtualTable(
 static SQLITE_NOINLINE void columnDefaultUncommonCase(
   Vdbe *v,          /* Byte code under construction */
   Table *pTab,      /* The table */
-  Column *pCol,     /* Which column of the table */
-  int iReg          /* Register in which results are stored */
+  Column *pCol      /* Which column of the table */
 ){
   sqlite3_value *pValue = 0;
   u8 enc = ENC(sqlite3VdbeDb(v));
@@ -160110,11 +160355,6 @@ static SQLITE_NOINLINE void columnDefaultUncommonCase(
   if( pValue ){
     sqlite3VdbeAppendP4(v, pValue, P4_MEM);
   }
-#ifndef SQLITE_OMIT_FLOATING_POINT
-  if( pCol->affinity==SQLITE_AFF_REAL ){
-    sqlite3VdbeAddOp1(v, OP_RealAffinity, iReg);
-  }
-#endif
 }
 SQLITE_PRIVATE void sqlite3ColumnDefault(
   Vdbe *v,          /* Byte code under construction */
@@ -160127,7 +160367,7 @@ SQLITE_PRIVATE void sqlite3ColumnDefault(
   assert( pTab->nCol>i );
   pCol = &pTab->aCol[i];
   if( pCol->iDflt ){
-    columnDefaultUncommonCase(v,pTab,pCol,iReg);
+    columnDefaultUncommonCase(v,pTab,pCol);
   }
 #ifndef SQLITE_OMIT_FLOATING_POINT
   if( pCol->affinity==SQLITE_AFF_REAL ){
@@ -165214,17 +165454,7 @@ static int codeAllEqualityTerms(
     testcase( pTerm->wtFlags & TERM_VIRTUAL );
     r1 = codeEqualityTerm(pParse, pTerm, pLevel, j, bRev, regBase+j);
     if( r1!=regBase+j ){
-      /* If this routine is being called as part of a RIGHT JOIN loop, then
-      ** register r1 may be used by the body of the loop that the RIGHT JOIN
-      ** will jump back into (e.g. if pTerm is a sub-query). This can cause
-      ** problems if (say) the affinity of r1 is modified by the caller of
-      ** this routine. So, always take a copy of the value in this case. */
-      if( nReg==1 && pParse->withinRJSubrtn==0 ){
-        sqlite3ReleaseTempReg(pParse, regBase);
-        regBase = r1;
-      }else{
-        sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase+j);
-      }
+      sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase+j);
     }
     if( pTerm->eOperator & WO_IN ){
       if( pTerm->pExpr->flags & EP_xIsSelect ){
@@ -176900,17 +177130,17 @@ SQLITE_PRIVATE void sqlite3WhereEnd(WhereInfo *pWInfo){
       VdbeCoverageIf(v, pLevel->op==OP_Next);
       VdbeCoverageIf(v, pLevel->op==OP_Prev);
       VdbeCoverageIf(v, pLevel->op==OP_VNext);
-      if( pLevel->regBignull ){
-        sqlite3VdbeResolveLabel(v, pLevel->addrBignull);
-        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, pLevel->regBignull, pLevel->p2-1);
-        VdbeCoverage(v);
-      }
 #ifndef SQLITE_DISABLE_SKIPAHEAD_DISTINCT
       if( addrSeek ){
         sqlite3VdbeJumpHere(v, addrSeek);
         addrSeek = 0;
       }
 #endif
+      if( pLevel->regBignull ){
+        sqlite3VdbeResolveLabel(v, pLevel->addrBignull);
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, pLevel->regBignull, pLevel->p2-1);
+        VdbeCoverage(v);
+      }
     }
     if( (pLoop->wsFlags & WHERE_IN_ABLE)!=0 && pLevel->u.in.nIn>0 ){
       struct InLoop *pIn;
@@ -259917,6 +260147,9 @@ static int fts5QueryCksum(
 }
 
 /*
+** This function is purely an internal test. It does not contribute to
+** FTS functionality, or even the integrity-check, in any way.
+**
 ** Check if buffer z[], size n bytes, contains as series of valid utf-8
 ** encoded codepoints. If so, return 0. Otherwise, if the buffer does not
 ** contain valid utf-8, return non-zero.
@@ -259938,8 +260171,8 @@ static int fts5TestUtf8(const char *z, int n){
     }else
     if( (z[i] & 0xF8)==0xF0 ){
       if( i+3>=n || (z[i+1] & 0xC0)!=0x80 || (z[i+2] & 0xC0)!=0x80 ) return 1;
-      if( (z[i+2] & 0xC0)!=0x80 ) return 1;
-      i += 3;
+      if( (z[i+3] & 0xC0)!=0x80 ) return 1;
+      i += 4;
     }else{
       return 1;
     }
@@ -264833,7 +265066,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-08-27 18:07:23 5251f4d7071f86ad9d772d8b9309bc7191ca485c3db5cb658f689abf02de72c4", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-09-04 14:20:44 4021369bc9558fbfcfa83ee4cd6b986734b8c41b6d72bd97064e566ca8189ea8", -1, SQLITE_TRANSIENT);
 }
 
 /*

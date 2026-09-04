@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-08-27 18:07:23 5251f4d7071f86ad9d772d8b9309bc7191ca485c3db5cb658f6-experimental"
+#define SQLITE_SOURCE_ID      "2026-09-04 14:20:44 4021369bc9558fbfcfa83ee4cd6b986734b8c41b6d72bd97064-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-08-27T18:07:23.412Z"
+#define SQLITE_SCM_DATETIME   "2026-09-04T14:20:44.144Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -3523,6 +3523,11 @@ SQLITE_API int sqlite3_set_authorizer(
 ** is the name of the inner-most trigger or view that is responsible for
 ** the access attempt or NULL if this access attempt is directly from
 ** top-level SQL code.
+**
+** The case of strings in the 3rd through the 6th argument to the
+** authorization callback is arbitrary.  Authorization callbacks
+** implementations should use [sqlite3_stricmp()] or similar when
+** doing comparisons against those values.
 */
 /******************************************* 3rd ************ 4th ***********/
 #define SQLITE_CREATE_INDEX          1   /* Index Name      Table Name      */
