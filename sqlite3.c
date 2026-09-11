@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 4021369bc9558fbfcfa83ee4cd6b986734b8 with changes in files:
+** e308b0fce47e184860564f0535174017eb7d with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-09-04 14:20:44 4021369bc9558fbfcfa83ee4cd6b986734b8c41b6d72bd97064-experimental"
+#define SQLITE_SOURCE_ID      "2026-09-10 23:54:06 e308b0fce47e184860564f0535174017eb7d5d7efc4f86dd1eb-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-09-04T14:20:44.144Z"
+#define SQLITE_SCM_DATETIME   "2026-09-10T23:54:06.766Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -83923,9 +83923,9 @@ SQLITE_PRIVATE int sqlite3BtreeIntegrityCheck(
     checkOom(&sCheck);
     goto integrity_ck_cleanup;
   }
-  sCheck.heap = (u32*)sqlite3PageMalloc( pBt->pageSize );
+  sCheck.heap = (u32*)sqlite3Malloc( pBt->pageSize*2 );
 #ifdef SQLITE_DEBUG
-  sCheck.mxHeap = pBt->pageSize/4 - 1;
+  sCheck.mxHeap = pBt->pageSize/2 - 1;
 #endif
   if( sCheck.heap==0 ){
     checkOom(&sCheck);
@@ -84013,7 +84013,7 @@ SQLITE_PRIVATE int sqlite3BtreeIntegrityCheck(
   /* Clean  up and report errors.
   */
 integrity_ck_cleanup:
-  sqlite3PageFree(sCheck.heap);
+  sqlite3_free(sCheck.heap);
   sqlite3_free(sCheck.aPgRef);
   *pnErr = sCheck.nErr;
   if( sCheck.nErr==0 ){
@@ -184808,6 +184808,7 @@ static YYACTIONTYPE yy_reduce(
         SrcItem *pOld = yymsp[-3].minor.yy203->a;
         assert( pOld->fg.fixedSchema==0 );
         pNew->zName = pOld->zName;
+        pOld->zName = 0;
         assert( pOld->fg.fixedSchema==0 );
         if( pOld->fg.isSubquery ){
           pNew->fg.isSubquery = 1;
@@ -184827,8 +184828,13 @@ static YYACTIONTYPE yy_reduce(
           pOld->u1.pFuncArg = 0;
           pOld->fg.isTabFunc = 0;
           pNew->fg.isTabFunc = 1;
+        }else if( pOld->fg.isIndexedBy ){
+          pNew->u1.zIndexedBy = pOld->u1.zIndexedBy;
+          pOld->u1.zIndexedBy = 0;
+          pOld->fg.isIndexedBy = 0;
+          pNew->fg.isIndexedBy = 1;
         }
-        pOld->zName = 0;
+        pNew->fg.notIndexed = pOld->fg.notIndexed;
       }
       sqlite3SrcListDelete(pParse->db, yymsp[-3].minor.yy203);
     }else{
@@ -219146,7 +219152,7 @@ static int jsonEachColumn(
       break;
     }
     default: {
-      sqlite3_result_text(ctx, p->path.zBuf, p->nRoot, SQLITE_STATIC);
+      sqlite3_result_text(ctx, p->path.zBuf, p->nRoot, SQLITE_TRANSIENT);
       break;
     }
     case JEACH_JSON: {
@@ -265066,7 +265072,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-09-04 14:20:44 4021369bc9558fbfcfa83ee4cd6b986734b8c41b6d72bd97064e566ca8189ea8", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-09-10 23:54:06 e308b0fce47e184860564f0535174017eb7d5d7efc4f86dd1eb8d234f75e4d08", -1, SQLITE_TRANSIENT);
 }
 
 /*
