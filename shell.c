@@ -3808,6 +3808,9 @@ static void qrfInitialize(
   if( p->spec.eTitle>QRF_TEXT_Relaxed ) p->spec.eTitle = QRF_Auto;
   if( p->spec.eBlob>QRF_BLOB_Size ) p->spec.eBlob = QRF_Auto;
 qrf_reinit:
+  if( p->spec.zFpFmt && sqlite3_qrf_ckformat(p->spec.zFpFmt)!=2 ){
+    p->spec.zFpFmt = 0;
+  }
   switch( p->spec.eStyle ){
     case QRF_Auto: {
       switch( sqlite3_stmt_isexplain(pStmt) ){
@@ -3826,6 +3829,7 @@ qrf_reinit:
     case QRF_STYLE_Json: {
       p->spec.eText = QRF_TEXT_Json;
       p->spec.zNull = "null";
+      if( p->spec.zFpFmt==0 ) p->spec.zFpFmt = "%0.16g";
       break;
     }
     case QRF_STYLE_Html: {
@@ -3839,6 +3843,7 @@ qrf_reinit:
       if( p->spec.zTableName==0 || p->spec.zTableName[0]==0 ){
         p->spec.zTableName = "tab";
       }
+      if( p->spec.zFpFmt==0 ) p->spec.zFpFmt = "%0.16g";
       p->u.nIns = 0;
       break;
     }
@@ -3942,9 +3947,6 @@ qrf_reinit:
     p->zFmt[n+1] = p->spec.zIFmt[n-1];
     p->zFmt[n+2] = 0;
     p->spec.zIFmt = p->zFmt;
-  }
-  if( p->spec.zFpFmt && sqlite3_qrf_ckformat(p->spec.zFpFmt)!=2 ){
-    p->spec.zFpFmt = 0;
   }
 }
 
@@ -20222,6 +20224,7 @@ static void diskusedFunc(
   int rc;
   sqlite3_stmt *pStmt;
   int n;
+  char *z;
   sqlite3_int64 ii;
   sqlite3_int64 pgsz;
   sqlite3_int64 nPage;
@@ -20545,9 +20548,11 @@ static void diskusedFunc(
   sqlite3_str_appendf(s.pOut,
     "The following SQL will create a table named \"space_used\" which\n"
     "contains most of the information used to generate the report above.\n"
-    "*/\n"
   );
+  z = sqlite3_str_value(s.pOut);
+  while( z && (z = strstr(z,"*/"))!=0 ){ z[0] = '+'; }
   sqlite3_str_appendf(s.pOut,
+    "*/\n"
     "BEGIN;\n"
     "CREATE TABLE space_used(\n"
     "   name text,                -- A table or index\n"                /* 0 */
@@ -25713,7 +25718,24 @@ static const char *shellPromptAppDef(int c){
 }
 #endif /* !defined(SQLITE_PS_APPDEF) */
 
-
+#ifdef SQLITE_DEBUG
+/*
+** SQL function:  sqlite3_incomplete(TEXT)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
+** Invoke the sqlite3_incomplete() interface and return its result.
+*/
+static void shellIncompleteFunc(
+  sqlite3_context *pCtx,
+  int nVal,
+  sqlite3_value **apVal
+){
+  const char *zSql = (const char*)sqlite3_value_text(apVal[0]);
+  sqlite3_result_int64(pCtx, zSql?sqlite3_incomplete(zSql):SQLITE_MISUSE);
+}
+#endif /* SQLITE_DEBUG */
 
 /*
 ** Return the raw (unexpanded) prompt string.  This will be the
@@ -25813,6 +25835,89 @@ static int nAnsiEscape(const char *z){
     i = k+1;
   }
   return i;
+}
+
+/*
+** Append text on pOut that is sufficient to complete the statement zBase
+** (according to sqlite3_complete()).  eFlags:
+**
+**    0x01     Include the final ";" if needed
+**    0x04     Assume zBase ends with '\n'
+*/
+static void appendCompletion(
+  sqlite3_str *pOut,      /* Append the completion here */
+  const char *zBase,      /* Existing SQL text */
+  int eFlags              /* 0x01:  Include ";",   0x04: Assume '\n' */
+){
+  sqlite3_int64 R = zBase ? sqlite3_incomplete(zBase) : 0;
+  int cc = (R>>16)&0xff;
+  int nParen = R>>32;
+  int eSemi = (R>>8)&0xff;
+  int eStat = R&0xff;
+  int bSemi = (eFlags & 0x01)!=0;
+  if( cc==0 ){
+    /* no-op */
+  }else if( cc=='-' ){
+    if( (eFlags & 0x04)==0 ) sqlite3_str_appendchar(pOut, 1, '\n');
+  }else if( cc=='/' ){
+    sqlite3_str_append(pOut,"*/",2);
+  }else{
+    sqlite3_str_appendchar(pOut, 1, cc);
+  }
+  if( nParen>0 ){
+    sqlite3_str_appendf(pOut, "%.*c",nParen,')');
+  }
+  if( eStat==SQLITE_OK || eStat==SQLITE_EMPTY ){
+    /* Nothing to add */
+  }else if( eSemi==1 ){
+    if( bSemi ) sqlite3_str_append(pOut, ";", 1);
+  }else if( eSemi==2 ){
+    sqlite3_str_append(pOut, "END;", 3+(bSemi!=0));
+  }else if( eSemi==3 ){
+    sqlite3_str_append(pOut, ";END;", 4+(bSemi!=0));
+  }
+}
+
+/*
+** SQL function:  shell_complete_sql(SQL)
+**                shell_complete_sql(SQL, FLAGS)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
+** If the SQL input is a string, return a new string which is the same
+** text with all pending quotes and comments finish, so that the
+** SQL is ready to receive its final semicolon.  The optional FLAGS
+** parameter can be an integer where bits mean:
+**
+**   0x01        Include the final semicolon
+**   0x02        Only return the completion text.  Omit the original SQL.
+**   0x04        Assume that SQL has a \n at the end.
+**
+** The /C substitution in the CLI prompt is computed using the
+** equivalent of shell_complete_sql(SQL,3);
+*/
+static void shell_complete_sql(
+  sqlite3_context *pCtx,
+  int nVal,
+  sqlite3_value **apVal
+){
+  const char *zSql;      /* Input SQL text */
+  sqlite3_str *pOut;     /* Completed SQL */
+  int flags;
+
+  if( nVal!=1 && nVal!=2 ) return;
+  if( nVal==2 ){
+    flags = 0x7 & sqlite3_value_int64(apVal[1]);
+  }else{
+    flags = 0;
+  }
+  zSql = (const char*)sqlite3_value_text(apVal[0]);
+  if( zSql==0 ) return;
+  pOut = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
+  if( (flags & 0x02)==0 ) sqlite3_str_appendall(pOut, zSql);
+  appendCompletion(pOut, zSql, flags & 0x05);
+  sqlite3_result_str(pCtx, pOut, SQLITE_FINISH);
 }
 
 /*
@@ -25991,29 +26096,7 @@ static char *expand_prompt(
     if( c=='C' ){
       /* /C becomes text needed to terminate current input */
       if( !mOff ){
-        sqlite3_int64 R = zPrior ? sqlite3_incomplete(zPrior) : 0;
-        int cc = (R>>16)&0xff;
-        int nParen = R>>32;
-        int eSemi = (R>>8)&0xff;
-        if( cc==0 ){
-          /* no-op */
-        }else if( cc=='-' ){
-          sqlite3_str_append(pOut,"\\n",3);
-        }else if( cc=='/' ){
-          sqlite3_str_append(pOut,"*/",2);
-        }else{
-          sqlite3_str_appendchar(pOut, 1, cc);
-        }
-        if( nParen>0 ){
-          sqlite3_str_appendf(pOut, "%.*c",nParen,')');
-        }
-        if( eSemi==1 ){
-          sqlite3_str_append(pOut, ";", 1);
-        }else if( eSemi==2 ){
-          sqlite3_str_append(pOut, "END;", 4);
-        }else if( eSemi==3 ){
-          sqlite3_str_append(pOut, ";END;", 5);
-        }
+        appendCompletion(pOut, zPrior, 0x5);
       }
       zPrompt += 2;
       i = -1;
@@ -26380,6 +26463,9 @@ static char *shellFakeSchema(
 /*
 ** SQL function:  strtod(X)
 **
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
 ** Use the C-library strtod() function to convert string X into a double.
 ** Used for comparing the accuracy of SQLite's internal text-to-float conversion
 ** routines against the C-library.
@@ -26397,6 +26483,9 @@ static void shellStrtod(
 
 /*
 ** SQL function:  dtostr(X)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
 **
 ** Use the C-library printf() function to convert real value X into a string.
 ** Used for comparing the accuracy of SQLite's internal float-to-text conversion
@@ -26418,9 +26507,14 @@ static void shellDtostr(
 }
 
 /*
-** SQL function:  shell_add_schema(S,X)
+** SQL function:  shell_add_schema(S,X,N)
 **
-** Add the schema name X to the CREATE statement in S and return the result.
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
+** Add the schema X to the CREATE statement in S for table N and return
+** the result.
+**
 ** Examples:
 **
 **    CREATE TABLE t1(x)   ->   CREATE TABLE xyz.t1(x);
@@ -26459,32 +26553,28 @@ static void shellAddSchemaName(
     for(i=0; i<ArraySize(aPrefix); i++){
       int n = strlen30(aPrefix[i]);
       if( cli_strncmp(zIn+7, aPrefix[i], n)==0 && zIn[n+7]==' ' ){
-        char *z = 0;
+        sqlite3_str *pOut = sqlite3_str_new(db);
         char *zFake = 0;
         if( zSchema ){
           char cQuote = quoteChar(zSchema);
           if( cQuote && sqlite3_stricmp(zSchema,"temp")!=0 ){
-            z = sqlite3_mprintf("%.*s \"%w\".%s", n+7, zIn, zSchema, zIn+n+8);
+            sqlite3_str_appendf(pOut, "%.*s \"%w\".%s", n+7,zIn,zSchema,zIn+n+8);
           }else{
-            z = sqlite3_mprintf("%.*s %s.%s", n+7, zIn, zSchema, zIn+n+8);
+            sqlite3_str_appendf(pOut, "%.*s %s.%s", n+7, zIn, zSchema, zIn+n+8);
           }
+        }else{
+          sqlite3_str_appendall(pOut, zIn);
         }
+        appendCompletion(pOut, sqlite3_str_value(pOut), 1);
         if( zName
          && aPrefix[i][0]=='V'
          && (zFake = shellFakeSchema(db, zSchema, zName))!=0
         ){
           assert( strstr(zFake,"*/")==0 );
-          if( z==0 ){
-            z = sqlite3_mprintf("%s\n/* %s */", zIn, zFake);
-          }else{
-            z = sqlite3_mprintf("%z\n/* %s */", z, zFake);
-          }
-          sqlite3_free(zFake);
+          sqlite3_str_appendf(pOut, "\n/* %z */", zFake);
         }
-        if( z ){
-          sqlite3_result_text(pCtx, z, -1, sqlite3_free);
-          return;
-        }
+        sqlite3_result_str(pCtx, pOut, SQLITE_FINISH);
+        return;
       }
     }
   }
@@ -26493,6 +26583,9 @@ static void shellAddSchemaName(
 
 /*
 ** SQL function:  shell_prompt_test(PROMPT,PRIOR,FILENAME,FLAGS)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
 **
 ** Return the shell prompt, with escapes expanded, for testing purposes.
 ** The first argument is the raw (unexpanded) prompt string.  Or if the
@@ -26979,6 +27072,9 @@ static void shellLog(void *pArg, int iErrCode, const char *zMsg){
 
 /*
 ** SQL function:  shell_putsnl(X)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
 **
 ** Write the text X to the screen (or whatever output is being directed)
 ** adding a newline at the end, and then return X.
@@ -27536,32 +27632,13 @@ static int shellAuth(
 ** printing the result.  https://sqlite.org/forum/forumpost/d7be961c5c
 */
 static void printSchemaLine(FILE *out, const char *z, const char *zTail){
-  char *zToFree = 0;
   if( z==0 ) return;
   if( zTail==0 ) return;
-  if( zTail[0]==';' && (strstr(z, "/*")!=0 || strstr(z,"--")!=0) ){
-    const char *zOrig = z;
-    static const char *azTerm[] = { "", "*/", "\n" };
-    int i;
-    for(i=0; i<ArraySize(azTerm); i++){
-      char *zNew = sqlite3_mprintf("%s%s;", zOrig, azTerm[i]);
-      shell_check_oom(zNew);
-      if( sqlite3_complete(zNew) ){
-        size_t n = strlen(zNew);
-        zNew[n-1] = 0;
-        zToFree = zNew;
-        z = zNew;
-        break;
-      }
-      sqlite3_free(zNew);
-    }
-  }
   if( sqlite3_strglob("CREATE TABLE ['\"]*", z)==0 ){
     cli_printf(out, "CREATE TABLE IF NOT EXISTS %s%s", z+13, zTail);
   }else{
     cli_printf(out, "%s%s", z, zTail);
   }
-  sqlite3_free(zToFree);
 }
 
 /*
@@ -27582,13 +27659,16 @@ static int wsToEol(const char *z){
 /*
 ** SQL Function:  shell_format_schema(SQL,FLAGS)
 **
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
 ** This function is internally by the CLI to assist with the
 ** ".schema", ".fullschema", and ".dump" commands.  The first
 ** argument is the value from sqlite_schema.sql.  The value returned
 ** is a modification of the input that can actually be run as SQL
 ** to recreate the schema object.
 **
-** When FLAGS is zero, the only changes is to append ";".  If the
+** When FLAGS is zero, this routine is a no-op. If the
 ** 0x01 bit of FLAGS is set, then transformations are made to implement
 ** ".schema --indent".
 */
@@ -27599,7 +27679,6 @@ static void shellFormatSchema(
 ){
   int flags;          /* Value of 2nd parameter */
   const char *zSql;   /* Value of 1st parameter */
-  int nSql;           /* Bytes of text in zSql[] */
   sqlite3_str *pOut;  /* Output buffer */
   char *z;            /* Writable copy of zSql */
   int i, j;           /* Loop counters */
@@ -27611,23 +27690,23 @@ static void shellFormatSchema(
   int isWhere = 0;
 
   assert( nVal==2 );
-  pOut = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
-  nSql = sqlite3_value_bytes(apVal[0]);
-  zSql = (const char*)sqlite3_value_text(apVal[0]);
-  if( zSql==0 || zSql[0]==0 ) goto shellFormatSchema_finish;
   flags = sqlite3_value_int(apVal[1]);
   if( (flags & 0x01)==0 ){
-    sqlite3_str_append(pOut, zSql, nSql);
-    sqlite3_str_append(pOut, ";", 1);
-    goto shellFormatSchema_finish;
+    sqlite3_result_value(pCtx, apVal[0]);
+    return;
+  }
+  zSql = (const char*)sqlite3_value_text(apVal[0]);
+  if( zSql==0 || zSql[0]==0 ){
+    sqlite3_result_text(pCtx, "", 0, SQLITE_STATIC);
+    return;
   }
   if( sqlite3_strlike("CREATE VIEW%", zSql, 0)==0
    || sqlite3_strlike("CREATE TRIG%", zSql, 0)==0
   ){
-    sqlite3_str_append(pOut, zSql, nSql);
-    sqlite3_str_append(pOut, ";", 1);
-    goto shellFormatSchema_finish;
+    sqlite3_result_value(pCtx, apVal[0]);
+    return;
   }
+  pOut = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
   isIndex = sqlite3_strlike("CREATE INDEX%", zSql, 0)==0
          || sqlite3_strlike("CREATE UNIQUE INDEX%", zSql, 0)==0;
   z = sqlite3_mprintf("%s", zSql);
@@ -27699,10 +27778,7 @@ static void shellFormatSchema(
     z[j] = 0;
   }
   sqlite3_str_appendall(pOut, z);
-  sqlite3_str_append(pOut, ";", 1);
   sqlite3_free(z);
-
-shellFormatSchema_finish:
   sqlite3_result_text(pCtx, sqlite3_str_finish(pOut), -1, sqlite3_free);
 }
 
@@ -29879,6 +29955,9 @@ static void shellUSleepFunc(
 /*
 ** SQL function:  shell_module_schema(X)
 **
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
+**
 ** Return a fake schema for the table-valued function or eponymous virtual
 ** table X.
 */
@@ -30085,6 +30164,10 @@ static void open_db(ShellState *p, int openFlags){
                             shellPutsFunc, 0, 0);
     sqlite3_create_function(p->db, "shell_format_schema", 2, SQLITE_UTF8, p,
                             shellFormatSchema, 0, 0);
+    sqlite3_create_function(p->db, "shell_complete_sql", 1, SQLITE_UTF8, p,
+                            shell_complete_sql, 0, 0);
+    sqlite3_create_function(p->db, "shell_complete_sql", 2, SQLITE_UTF8, p,
+                            shell_complete_sql, 0, 0);
     sqlite3_create_function(p->db, "usleep",1,SQLITE_UTF8,0,
                             shellUSleepFunc, 0, 0);
 #ifndef SQLITE_NOHAVE_SYSTEM
@@ -30097,6 +30180,10 @@ static void open_db(ShellState *p, int openFlags){
                             p, shellExpandPrompt, 0, 0);
     sqlite3_create_function(p->db, "shell_temp_filename", 1, SQLITE_UTF8,
                             p, shellTempFilenameFunc, 0, 0);
+#ifdef SQLITE_DEBUG
+    sqlite3_create_function(p->db, "sqlite3_incomplete", 1, SQLITE_UTF8,
+                            p, shellIncompleteFunc, 0, 0);
+#endif
 
 
     if( p->openMode==SHELL_OPEN_ZIPFILE ){
@@ -30905,7 +30992,11 @@ static void output_reset(ShellState *p){
       "xdg-open";
 #endif
       char *zCmd;
+#ifdef __linux__
+      zCmd = sqlite3_mprintf("%s %s 2>/dev/null", zXdgOpenCmd, p->zTempFile);
+#else
       zCmd = sqlite3_mprintf("%s %s", zXdgOpenCmd, p->zTempFile);
+#endif
       if( system(zCmd) ){
         cli_printf(stderr,"Failed: [%s]\n", zCmd);
       }else{
@@ -30914,7 +31005,7 @@ static void output_reset(ShellState *p){
         ** p->zTempFile data file out from under it */
         p->aUnlink = realloc(p->aUnlink, sizeof(Unlink)*(1+p->nUnlink));
         shell_check_oom(p->aUnlink);
-        p->aUnlink[p->nUnlink].tm = timeOfDay()+10000;
+        p->aUnlink[p->nUnlink].tm = timeOfDay()+10000000;
         p->aUnlink[p->nUnlink].zFN = p->zTempFile;
         p->nUnlink++;
         p->zTempFile = 0;
@@ -31355,8 +31446,9 @@ int shellDeleteFile(const char *zFilename, int *pRetry){
       sqlite3_sleep(pRetry[0]);
       pRetry[0] = 0;
       continue;
+    }else{
+      break;
     }
-    break;
   }
   return rc;
 }
@@ -31379,23 +31471,20 @@ int shellDeleteFile(const char *zFilename, int *pRetry){
 ** wait for nDelay milliseconds and try again before giving up.  Only
 ** a single wait occurs, even if problems are encountered with multiple
 ** temp files.  Only the first problem seen takes the delay.  Thus
-** the total delay never exceeds nDelay milliseconds.  When nDelay
-** is non-zero, memory used to hold the filename is reclaimed regardless
-** of whether or not the temporary files were successfully deleted.
+** the total delay never exceeds nDelay milliseconds.
 **
 ** If bForce is true, deletion is attempted on p->aUnlink[] files
 ** even if their time has not expired.  However, there is a pause
-** of up to nDelay milliseconds before doing the deletion.
-**
-** When nDelay is zero and the deletion attempt fails, memory used to
-** store temporary filesnames is not reclaimed.
+** of up to nDelay milliseconds before doing the deletion.  Memory
+** used to hold filenames is reclaimed regardless of whether or not
+** the delete is successful.
 **
 ** The bForce flag is used only when the process is about to exit.  When
 ** bForce is set, that indicates that this is our last opportunity to
 ** clean up temporary files.
 */
 static void clearTempFile(ShellState *p, int nDelay, int bForce){
-  int alwaysFree = (nDelay>0) || bForce;
+  int alwaysFree = bForce;
   int rc = 0;
   if( p->zTempFile && (!p->doXdgOpen || bForce) ){
     rc = shellDeleteFile(p->zTempFile, &nDelay);
@@ -31411,7 +31500,11 @@ static void clearTempFile(ShellState *p, int nDelay, int bForce){
       int doDelete =  tmToGo<=0;
       if( !doDelete && alwaysFree ){
         int tmSleep = nDelay;
-        if( tmSleep > tmToGo ) tmSleep = (int)tmToGo;
+        if( tmSleep > tmToGo/1000 ) tmSleep = (int)(tmToGo/1000);
+        if( tmSleep>=1000 ){
+          cli_printf(p->out,"Waiting about %d.%d seconds to delete temp"
+                            " file(s)\n", tmSleep/1000, (tmSleep/100)%10);
+        }
         sqlite3_sleep(tmSleep);
         nDelay -= tmSleep;
         doDelete = 1;
@@ -31475,6 +31568,9 @@ static void newTempFile(ShellState *p, const char *zSuffix){
 
 /*
 ** SQL function:  shell_temp_filename(SUFFIX)
+**
+** For use internally and for debugging and testing only.  This function
+** is subject to change or removal in future versions.
 **
 ** Return a randomly generated temporary filename.
 */
@@ -32647,8 +32743,19 @@ end_ar_command:
 */
 static int recoverSqlCb(void *pCtx, const char *zSql){
   ShellState *pState = (ShellState*)pCtx;
-  cli_printf(pState->out, "%s;\n", zSql);
-  return SQLITE_OK;
+  sqlite3_str *pOut = sqlite3_str_new(pState->db);
+  char *zOut;
+  int rc = SQLITE_OK;
+  sqlite3_str_appendall(pOut, zSql);
+  appendCompletion(pOut, zSql, 0);
+  zOut = sqlite3_str_value(pOut);
+  if( zOut ){
+    cli_printf(pState->out, "%s;\n", zOut);
+  }else{
+    rc = SQLITE_NOMEM;
+  }
+  sqlite3_str_free(pOut);
+  return rc;
 }
 
 /*
@@ -33303,7 +33410,7 @@ static int dotCmdImport(ShellState *p){
   import_append_char(&sCtx, 0);    /* To ensure sCtx.z is allocated */
   if( sqlite3_table_column_metadata(p->db, zSchema, zTable,0,0,0,0,0,0) 
    && 0==db_int(p->db, "SELECT count(*) FROM \"%w\".sqlite_schema"
-                       " WHERE name=%Q AND type='view'",
+                       " WHERE name=%Q COLLATE nocase AND type='view'",
                        zSchema ? zSchema : "main", zTable)
   ){
     /* Table does not exist.  Create it. */
@@ -35325,7 +35432,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     p->nErr = 0;
     if( zLike==0 ) zLike = sqlite3_mprintf("true");
     zSql = sqlite3_mprintf(
-      "SELECT name, type, sql FROM sqlite_schema AS o "
+      "SELECT name, type, shell_complete_sql(sql) FROM sqlite_schema AS o "
       "WHERE (%s) AND type=='table'"
       "  AND sql NOT NULL"
       " ORDER BY tbl_name='sqlite_sequence', rowid",
@@ -35335,7 +35442,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     sqlite3_free(zSql);
     if( (p->shellFlgs & SHFLG_DumpDataOnly)==0 ){
       zSql = sqlite3_mprintf(
-        "SELECT sql FROM sqlite_schema AS o "
+        "SELECT shell_complete_sql(sql) FROM sqlite_schema AS o "
         "WHERE (%s) AND sql NOT NULL"
         "  AND type IN ('index','trigger','view') "
         "ORDER BY type COLLATE NOCASE DESC",
@@ -35597,7 +35704,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     }
     open_db(p, 0);
     zSql = sqlite3_mprintf(
-       "SELECT shell_format_schema(sql,%d) FROM"
+       "SELECT shell_format_schema(shell_complete_sql(sql),%d) FROM"
        "  (SELECT sql sql, type type, tbl_name tbl_name, name name, rowid x"
        "     FROM sqlite_schema UNION ALL"
        "   SELECT sql, type, tbl_name, name, rowid FROM sqlite_temp_schema) "
@@ -35609,7 +35716,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     data.mode.eMode = MODE_List;
     data.mode.spec.eText = QRF_TEXT_Plain;
     data.mode.spec.nCharLimit = 0;
-    data.mode.spec.zRowSep = "\n";
+    data.mode.spec.zRowSep = ";\n";
     rc = shell_exec(&data,zSql,0);
     sqlite3_free(zSql);
     if( rc==SQLITE_OK ){
@@ -36613,7 +36720,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
       goto meta_command_exit;
     }
     pSql = sqlite3_str_new(p->db);
-    sqlite3_str_appendf(pSql, "SELECT sql FROM", 0);
+    sqlite3_str_appendf(pSql, "SELECT shell_complete_sql(sql,1) FROM", 0);
     iSchema = 0;
     while( sqlite3_step(pStmt)==SQLITE_ROW ){
       const char *zDb = (const char*)sqlite3_column_text(pStmt, 1);
@@ -38089,23 +38196,6 @@ static int line_is_all_whitespace(const char *z){
 }
 
 /*
-** Return TRUE if the line typed in is an SQL command terminator other
-** than a semi-colon.  The SQL Server style "go" command is understood
-** as is the Oracle "/".
-*/
-static int line_is_command_terminator(const char *zLine){
-  while( IsSpace(zLine[0]) ){ zLine++; };
-  if( zLine[0]=='/' && line_is_all_whitespace(&zLine[1]) ){
-    return 1;  /* Oracle */
-  }
-  if( ToLower(zLine[0])=='g' && ToLower(zLine[1])=='o'
-         && line_is_all_whitespace(&zLine[2]) ){
-    return 1;  /* SQL Server */
-  }
-  return 0;
-}
-
-/*
 ** The CLI needs a working sqlite3_complete() to work properly.  So error
 ** out of the build if compiling with SQLITE_OMIT_COMPLETE.
 */
@@ -38113,19 +38203,33 @@ static int line_is_command_terminator(const char *zLine){
 # error the CLI application is incompatible with SQLITE_OMIT_COMPLETE.
 #endif
 
+#ifdef SQLITE_SHELL_LEGACY_COMMAND_TERMINATOR
 /*
-** Return true if zSql is a complete SQL statement.  Return false if it
-** ends in the middle of a string literal or C-style comment.
+** Return TRUE if the line typed in is an SQL command terminator other
+** than a semi-colon.  The SQL Server style "go" command is understood
+** as is the Oracle "/".
 */
-static int line_is_complete(char *zSql, int nSql){
-  int rc;
-  if( zSql==0 ) return 1;
-  zSql[nSql] = ';';
-  zSql[nSql+1] = 0;
-  rc = sqlite3_complete(zSql);
-  zSql[nSql] = 0;
-  return rc;
+static int line_is_command_terminator(
+  const char *zLine,         /* Current line of input */
+  char *zSql,                /* Total accumulated input text */
+  int nSql                   /* Bytes of accumulated input text */
+){
+  while( IsSpace(zLine[0]) ){ zLine++; };
+  if( (zLine[0]=='/' && line_is_all_whitespace(&zLine[1]))  /* Oracle */
+   || (sqlite3_strnicmp(zLine,"go",2)==0
+             && line_is_all_whitespace(&zLine[2]))          /* SQL Server */
+  }{
+    int rc;
+    if( zSql==0 ) return 1;
+    zSql[nSql] = ';';
+    zSql[nSql+1] = 0;
+    rc = sqlite3_complete(zSql);
+    zSql[nSql] = 0;
+    return rc;
+  }
+  return 0;
 }
+#endif
 
 /*
 ** This function is called after processing each line of SQL in the
@@ -38388,9 +38492,11 @@ static int process_input(ShellState *p, const char *zSrc){
       }
       continue;
     }
-    if( line_is_command_terminator(zLine) && line_is_complete(zSql, nSql) ){
+#ifdef SQLITE_SHELL_LEGACY_COMMAND_TERMINATOR
+    if( line_is_command_terminator(zLine, zSql, nSql) ){
       memcpy(zLine,";",2);
     }
+#endif
     hasSemi = strchr(zLine,';')!=0;
     nLine = strlen(zLine);
     if( nSql+nLine+2>=nAlloc ){
@@ -39603,7 +39709,7 @@ int SQLITE_CDECL main(int argc, char **argv){
   find_home_dir(1);
   output_reset(&data);
   data.doXdgOpen = 0;
-  clearTempFile(&data,2500,1);
+  clearTempFile(&data,10000,1);
   globalShellState = 0;
   while( data.nModeStack ) modePop(&data);
   free(data.aModeStack);
