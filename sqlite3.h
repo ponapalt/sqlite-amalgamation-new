@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.55.0"
 #define SQLITE_VERSION_NUMBER 3055000
-#define SQLITE_SOURCE_ID      "2026-10-21 16:56:58 fa0247a431bd99a9442c61028dc85ad1ffd2c5ea5b76ab68c39-experimental"
+#define SQLITE_SOURCE_ID      "2026-10-23 16:01:12 b5271900464944afdbbc5de9fbed185ff6b6143bc6dca3984e8-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-10-21T16:56:58.035Z"
+#define SQLITE_SCM_DATETIME   "2026-10-23T16:01:12.832Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -5888,6 +5888,10 @@ SQLITE_API int sqlite3_create_window_function(
 ** These constants define integer codes that represent the various
 ** text encodings supported by SQLite.
 **
+** If any value other than the ones defined here are passed into the
+** "encoding" argument of an API function, then the results are
+** unspecified and subject to change.
+**
 ** <dl>
 ** [[SQLITE_UTF8]] <dt>SQLITE_UTF8</dt><dd>Text is encoding as UTF-8</dd>
 **
@@ -6870,6 +6874,10 @@ SQLITE_API void sqlite3_activate_cerod(
 ** at all. ^In SQLite version 3.42.0 and later, a negative
 ** argument passed into sqlite3_sleep() is changed to zero before it is relayed
 ** down into the xSleep method of the VFS.
+**
+** The maximum sleep time is 2147483 milliseconds (about 35 minutes and
+** 47 seconds).  If the argument to sqlite3_sleep() is greater than 2147483,
+** the sleep time is capped at 2147483 milliseconds.
 */
 SQLITE_API int sqlite3_sleep(int);
 

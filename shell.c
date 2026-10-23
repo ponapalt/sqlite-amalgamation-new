@@ -3726,6 +3726,12 @@ static void qrfOneSimpleRow(Qrf *p){
       pVal = sqlite3_str_new(p->db);
       nSep = (int)strlen(p->spec.zColumnSep);
       mxW = p->mxWidth - (nSep + p->u.sLine.mxColWth);
+      if( mxW<2 ){
+        /* The column names leave little or no room for the value. Use a
+        ** width of at least 2, enough for any one character, so that
+        ** qrfWrapLine() always makes progress. */
+        mxW = 2;
+      }
       bWW = p->spec.bWordWrap==QRF_Yes;
       for(i=0; i<p->nCol; i++){
         const char *zVal;
@@ -8093,7 +8099,7 @@ static void ieee754func(
       if( m<(-9223372036854775807LL) ) return;
       isNeg = 1;
       m = -m;
-    }else if( m==0 && e>-1000 && e<1000 ){
+    }else if( m==0 ){
       sqlite3_result_double(context, 0.0);
       return;
     }
@@ -21802,11 +21808,39 @@ static void dbdataValue(
             switch( enc ){
   #ifndef SQLITE_OMIT_UTF16
               case SQLITE_UTF16BE:
-                sqlite3_result_text16be(pCtx, (void*)pData, n, SQLITE_TRANSIENT);
+              case SQLITE_UTF16LE: {
+                /* sqlite3_result_text16be/le() remove a leading BOM. If
+                ** the stored text begins with U+FEFF or U+FFFE, prepend
+                ** a BOM in the database byte order, so that only the
+                ** added BOM is removed. */
+                u8 *aBuf = 0;
+                if( n>=2 && ((pData[0]==0xFE && pData[1]==0xFF)
+                          || (pData[0]==0xFF && pData[1]==0xFE))
+                ){
+                  aBuf = (u8*)sqlite3_malloc64(n+2);
+                  if( aBuf==0 ){
+                    sqlite3_result_error_nomem(pCtx);
+                    break;
+                  }
+                  aBuf[0] = (enc==SQLITE_UTF16BE) ? 0xFE : 0xFF;
+                  aBuf[1] = (enc==SQLITE_UTF16BE) ? 0xFF : 0xFE;
+                  memcpy(&aBuf[2], pData, n);
+                }
+                if( enc==SQLITE_UTF16BE ){
+                  if( aBuf ){
+                    sqlite3_result_text16be(pCtx, aBuf, n+2, sqlite3_free);
+                  }else{
+                    sqlite3_result_text16be(pCtx, pData, n, SQLITE_TRANSIENT);
+                  }
+                }else{
+                  if( aBuf ){
+                    sqlite3_result_text16le(pCtx, aBuf, n+2, sqlite3_free);
+                  }else{
+                    sqlite3_result_text16le(pCtx, pData, n, SQLITE_TRANSIENT);
+                  }
+                }
                 break;
-              case SQLITE_UTF16LE:
-                sqlite3_result_text16le(pCtx, (void*)pData, n, SQLITE_TRANSIENT);
-                break;
+              }
   #endif
               default:
                 sqlite3_result_text(pCtx, (char*)pData, n, SQLITE_TRANSIENT);
@@ -22732,7 +22766,7 @@ static void recoverBitmapFree(RecoverBitmap *pMap){
 ** Set the bit associated with page iPg in bitvec pMap.
 */
 static void recoverBitmapSet(RecoverBitmap *pMap, i64 iPg){
-  if( iPg<=pMap->nPg ){
+  if( iPg<=pMap->nPg && iPg>0 ){
     int iElem = (iPg / 32);
     int iBit = (iPg % 32);
     pMap->aElem[iElem] |= (((u32)1) << iBit);
