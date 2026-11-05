@@ -19240,8 +19240,8 @@ struct sqlite3 {
 /*
 ** Macros for testing whether or not optimizations are enabled or disabled.
 */
-#define OptimizationDisabled(D,M)  (((D)->dbOptFlags&(1ull<<((M)-1)))!=0)
-#define OptimizationEnabled(D,M)   (((D)->dbOptFlags&(1ull<<((M)-1)))==0)
+#define OptimizationDisabled(D,M)  (((D)->dbOptFlags&(((u64)1)<<((M)-1)))!=0)
+#define OptimizationEnabled(D,M)   (((D)->dbOptFlags&(((u64)1)<<((M)-1)))==0)
 
 /*
 ** Return true if it OK to factor constant expressions into the initialization
@@ -135187,7 +135187,11 @@ static void absFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
       ** that cannot be converted to a numeric value.
       */
       double rVal = sqlite3_value_double(argv[0]);
-      if( signbit(rVal) ) rVal = -rVal;
+      u64 uBits;
+      /* signbit() is C99 and missing from the VC6 headers, so test the
+      ** IEEE754 sign bit directly. */
+      memcpy(&uBits, &rVal, sizeof(uBits));
+      if( (uBits>>63)!=0 ) rVal = -rVal;
       sqlite3_result_double(context, rVal);
       break;
     }
@@ -217590,9 +217594,13 @@ static int jsonConvertInteger(const char *zIn, u32 sz, i64 *pI, double *pR){
     }while( k<sz );
   }
   if( rOverflow>1.0
-   || (u>0x7fffffffffffffffULL && (!bNeg || u>0x8000000000000000ULL))
+   || (u>UINT64_C(0x7fffffffffffffff)
+        && (!bNeg || u>UINT64_C(0x8000000000000000)))
   ){
-    *pR = rOverflow * (double)u;
+    /* MSVC 6 cannot convert unsigned __int64 to double (C2520), so
+    ** split the value in two. */
+    *pR = rOverflow * ((double)(sqlite3_int64)(u>>1)*2.0
+                         + (double)(sqlite3_int64)(u&1));
     if( bNeg ) *pR = -*pR;
     return 1;
   }else{
@@ -221791,7 +221799,7 @@ static int writeInt64(u8 *p, i64 i){
 static int rtreeValueInt32(sqlite3_value *pVal){
   i64 v64 = sqlite3_value_int64(pVal);
   if( v64>2147483647 ) return 2147483647;
-  if( v64<-2147483648LL ) return (int)-2147483648LL;
+  if( v64<-INT64_C(2147483648) ) return (int)-INT64_C(2147483648);
   return (int)v64;
 }
 
