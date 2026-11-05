@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.55.0"
 #define SQLITE_VERSION_NUMBER 3055000
-#define SQLITE_SOURCE_ID      "2026-10-30 16:36:19 7b45acf8cae5b60c4c49354034659c1ed025dcb8439933bfd23-experimental"
+#define SQLITE_SOURCE_ID      "2026-11-05 22:24:56 6f5c9687f64f24abcf8f7ea32bba04ba2147084ab43c77b2708-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-10-30T16:36:19.596Z"
+#define SQLITE_SCM_DATETIME   "2026-11-05T22:24:56.863Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -5009,7 +5009,7 @@ typedef struct sqlite3_context sqlite3_context;
 ** ^ (1) A destructor to dispose of the BLOB or string after SQLite has finished
 ** with it may be passed. ^It is called to dispose of the BLOB or string even
 ** if the call to the bind API fails, except the destructor is not called if
-** the third parameter is a NULL pointer or the fourth parameter is negative.
+** the third parameter is a NULL pointer or the fifth parameter is negative.
 ** ^ (2) The special constant, [SQLITE_STATIC], may be passed to indicate that
 ** the application remains responsible for disposing of the object. ^In this
 ** case, the object and the provided pointer to it must remain valid until
