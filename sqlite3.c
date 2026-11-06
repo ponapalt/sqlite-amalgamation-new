@@ -18,7 +18,7 @@
 ** separate file. This file contains only code for the core SQLite library.
 **
 ** The content in this amalgamation comes from Fossil check-in
-** 6f5c9687f64f24abcf8f7ea32bba04ba2147 with changes in files:
+** 9f8bf750d9a0eea4bf9e280008ad9163d84d with changes in files:
 **
 **    
 */
@@ -469,10 +469,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.55.0"
 #define SQLITE_VERSION_NUMBER 3055000
-#define SQLITE_SOURCE_ID      "2026-11-05 22:24:56 6f5c9687f64f24abcf8f7ea32bba04ba2147084ab43c77b2708-experimental"
+#define SQLITE_SOURCE_ID      "2026-11-06 16:53:43 9f8bf750d9a0eea4bf9e280008ad9163d84d8c28c2ad6839e0f-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-11-05T22:24:56.863Z"
+#define SQLITE_SCM_DATETIME   "2026-11-06T16:53:43.630Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -150840,6 +150840,7 @@ static int sqlite3ProcessJoin(Parse *pParse, Select *p){
   int bSeenTFunc = 0;             /* True if have seen table-valued function */
 
   pSrc = p->pSrc;
+  if( pSrc->nSrc<=1 ) return 0;
   pLeft = &pSrc->a[0];
   pRight = &pLeft[1];
   for(i=0; i<pSrc->nSrc-1; i++, pRight++, pLeft++){
@@ -169300,7 +169301,13 @@ static void whereCombineDisjuncts(
   int idxNew;            /* Index in pWC of the next virtual term */
   Expr *pA, *pB;         /* Expressions associated with pOne and pTwo */
 
-  if( (pOne->wtFlags | pTwo->wtFlags) & TERM_VNULL ) return;
+  if( (pOne->wtFlags | pTwo->wtFlags) & (TERM_VNULL|TERM_LIKEOPT) ){
+    testcase( pOne->wtFlags & TERM_VNULL );
+    testcase( pOne->wtFlags & TERM_LIKEOPT );
+    testcase( pTwo->wtFlags & TERM_VNULL );
+    testcase( pTwo->wtFlags & TERM_LIKEOPT );
+    return;
+  }
   if( (pOne->eOperator & (WO_EQ|WO_LT|WO_LE|WO_GT|WO_GE))==0 ) return;
   if( (pTwo->eOperator & (WO_EQ|WO_LT|WO_LE|WO_GT|WO_GE))==0 ) return;
   if( (eOp & (WO_EQ|WO_LT|WO_LE))!=eOp
@@ -171895,7 +171902,7 @@ static SQLITE_NOINLINE void constructAutomaticIndex(
         idxCols |= cMask;
         pIdx->aiColumn[n] = pTerm->u.x.leftColumn;
         pColl = sqlite3ExprCompareCollSeq(pParse, pX);
-        assert( pColl!=0 || pParse->nErr>0 ); /* TH3 collate01.800 */
+        testcase( pColl==0 && pParse->nErr==0 ); /* TH3 collate01.810 */
         if( !sqlite3IsBinary(pColl) ){
           /* Disallow the use of a Bloom filter if any non-BINARY collating
           ** sequence is involved.  tag-202607231411 */
@@ -196402,6 +196409,9 @@ SQLITE_PRIVATE int sqlite3Fts3FirstFilter(sqlite3_int64, char *, int, char *);
 SQLITE_PRIVATE void sqlite3Fts3CreateStatTable(int*, Fts3Table*);
 SQLITE_PRIVATE int sqlite3Fts3EvalTestDeferred(Fts3Cursor *pCsr, int *pRc);
 SQLITE_PRIVATE int sqlite3Fts3ReadInt(const char *z, int *pnOut);
+SQLITE_PRIVATE int sqlite3Fts3CreateHashFunction(sqlite3*, const char*, int, int, Fts3Hash*,
+    void (*)(sqlite3_context*,int,sqlite3_value**)
+);
 
 /* fts3_tokenizer.c */
 SQLITE_PRIVATE const char *sqlite3Fts3NextToken(const char *, int *);
@@ -200277,6 +200287,31 @@ static void hashDestroy(void *p){
 }
 
 /*
+** Register an SQL function that uses the tokenizer hash table pHash as its
+** user-data pointer. The new function holds a reference to the hash table,
+** which is released by hashDestroy() when the function is deleted or if
+** this call fails.
+**
+** The Fts3Hash object passed as the fifth argument must be the "hash" member
+** of an Fts3HashWrapper object. Since it is the first member of that
+** structure, the pointer may be cast to (Fts3HashWrapper*).
+*/
+SQLITE_PRIVATE int sqlite3Fts3CreateHashFunction(
+  sqlite3 *db,                    /* Database connection */
+  const char *zName,              /* Name of SQL function */
+  int nArg,                       /* Number of arguments */
+  int eTextRep,                   /* Text encoding and function flags */
+  Fts3Hash *pHash,                /* Tokenizer hash table */
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**)  /* Implementation */
+){
+  Fts3HashWrapper *pWrapper = (Fts3HashWrapper*)pHash;
+  pWrapper->nRef++;
+  return sqlite3_create_function_v2(
+      db, zName, nArg, eTextRep, (void*)pWrapper, xFunc, 0, 0, hashDestroy
+  );
+}
+
+/*
 ** The fts3 built-in tokenizers - "simple", "porter" and "icu"- are
 ** implemented in files fts3_tokenizer1.c, fts3_porter.c and fts3_icu.c
 ** respectively. The following three forward declarations are for functions
@@ -200330,13 +200365,14 @@ SQLITE_PRIVATE int sqlite3Fts3Init(sqlite3 *db){
   sqlite3Fts3SimpleTokenizerModule(&pSimple);
   sqlite3Fts3PorterTokenizerModule(&pPorter);
 
-  /* Allocate and initialize the hash-table used to store tokenizers. */
+  /* Allocate and initialize the hash-table used to store tokenizers. The
+  ** reference held by this function is released before it returns. */
   pHash = sqlite3_malloc(sizeof(Fts3HashWrapper));
   if( !pHash ){
     rc = SQLITE_NOMEM;
   }else{
     sqlite3Fts3HashInit(&pHash->hash, FTS3_HASH_STRING, 1);
-    pHash->nRef = 0;
+    pHash->nRef = 1;
   }
 
   /* Load the built-in tokenizers into the hash table */
@@ -200387,16 +200423,23 @@ SQLITE_PRIVATE int sqlite3Fts3Init(sqlite3 *db){
       pHash->nRef++;
       rc = sqlite3Fts3InitTok(db, (void *)pHash, hashDestroy);
     }
-    return rc;
   }
 
-
-  /* An error has occurred. Delete the hash table and return the error code. */
-  assert( rc!=SQLITE_OK );
-  if( pHash ){
-    sqlite3Fts3HashClear(&pHash->hash);
-    sqlite3_free(pHash);
+  /* If an error has occurred, remove any modules and functions registered
+  ** above. If this is a loadable extension, the shared library may be unloaded
+  ** as soon as this function returns, so they must not be left in place. */
+  if( rc!=SQLITE_OK ){
+    sqlite3_create_module(db, "fts3", 0, 0);
+    sqlite3_create_module(db, "fts4", 0, 0);
+    sqlite3_create_module(db, "fts3tokenize", 0, 0);
+    sqlite3_create_module(db, "fts4aux", 0, 0);
+    sqlite3_create_function(db, "fts3_tokenizer", 1, SQLITE_UTF8, 0, 0, 0, 0);
+    sqlite3_create_function(db, "fts3_tokenizer", 2, SQLITE_UTF8, 0, 0, 0, 0);
   }
+
+  /* Release the reference held by this function. If nothing else still holds
+  ** a reference, this deletes the hash table. */
+  if( pHash ) hashDestroy(pHash);
   return rc;
 }
 
@@ -204282,12 +204325,13 @@ static void fts3ExprTestRebalance(
 ** with database connection db.
 */
 SQLITE_PRIVATE int sqlite3Fts3ExprInitTestInterface(sqlite3 *db, Fts3Hash *pHash){
-  int rc = sqlite3_create_function(
-      db, "fts3_exprtest", -1, SQLITE_UTF8, (void*)pHash, fts3ExprTest, 0, 0
+  int rc = sqlite3Fts3CreateHashFunction(
+      db, "fts3_exprtest", -1, SQLITE_UTF8, pHash, fts3ExprTest
   );
   if( rc==SQLITE_OK ){
-    rc = sqlite3_create_function(db, "fts3_exprtest_rebalance",
-        -1, SQLITE_UTF8, (void*)pHash, fts3ExprTestRebalance, 0, 0
+    rc = sqlite3Fts3CreateHashFunction(
+        db, "fts3_exprtest_rebalance", -1, SQLITE_UTF8, pHash,
+        fts3ExprTestRebalance
     );
   }
   return rc;
@@ -205828,7 +205872,6 @@ SQLITE_PRIVATE int sqlite3Fts3InitHashTable(
   const char *zName
 ){
   int rc = SQLITE_OK;
-  void *p = (void *)pHash;
   const int any = SQLITE_UTF8|SQLITE_DIRECTONLY;
 
 #ifdef SQLITE_TEST
@@ -205843,14 +205886,18 @@ SQLITE_PRIVATE int sqlite3Fts3InitHashTable(
 #endif
 
   if( SQLITE_OK==rc ){
-    rc = sqlite3_create_function(db, zName, 1, any, p, fts3TokenizerFunc, 0, 0);
+    rc = sqlite3Fts3CreateHashFunction(
+        db, zName, 1, any, pHash, fts3TokenizerFunc
+    );
   }
   if( SQLITE_OK==rc ){
-    rc = sqlite3_create_function(db, zName, 2, any, p, fts3TokenizerFunc, 0, 0);
+    rc = sqlite3Fts3CreateHashFunction(
+        db, zName, 2, any, pHash, fts3TokenizerFunc
+    );
   }
 #ifdef SQLITE_TEST
   if( SQLITE_OK==rc ){
-    rc = sqlite3_create_function(db, zTest, -1, any, p, testFunc, 0, 0);
+    rc = sqlite3Fts3CreateHashFunction(db, zTest, -1, any, pHash, testFunc);
   }
   if( SQLITE_OK==rc ){
     rc = sqlite3_create_function(db, zTest2, 0, any, pdb, intTestFunc, 0, 0);
@@ -217751,7 +217798,6 @@ static u32 jsonTranslateBlobToPrettyText(
         if( pPretty->nIndent >= JSON_MAX_DEPTH ){
           jsonStringTooDeep(pOut);
         }
-        pParse->iDepth = pPretty->nIndent;
         while( pOut->eErr==0 ){
           jsonPrettyIndent(pPretty);
           j = jsonTranslateBlobToText(pParse, j, pOut);
@@ -243813,9 +243859,6 @@ SQLITE_API int sqlite3changegroup_change_begin(
   }
   if( rc==SQLITE_OK ){
     int nReq = pTab->nCol * (eOp==SQLITE_UPDATE ? 2 : 1);
-    pGrp->cd.pTab = pTab;
-    pGrp->cd.eOp = eOp;
-    pGrp->cd.bIndirect = bIndirect;
 
     if( pGrp->cd.nBufAlloc<nReq ){
       SessionBuffer *aBuf = (SessionBuffer*)sqlite3_realloc(
@@ -243830,6 +243873,14 @@ SQLITE_API int sqlite3changegroup_change_begin(
         pGrp->cd.aBuf = aBuf;
         pGrp->cd.nBufAlloc = nReq;
       }
+    }
+
+    /* Only mark a change as under construction once the column buffers
+    ** have been allocated. */
+    if( rc==SQLITE_OK ){
+      pGrp->cd.pTab = pTab;
+      pGrp->cd.eOp = eOp;
+      pGrp->cd.bIndirect = bIndirect;
     }
 
 #ifdef SQLITE_DEBUG
@@ -243873,8 +243924,9 @@ static int checkChangeParams(
       pBuf += pGrp->cd.pTab->nCol;
     }
     pBuf->nBuf = 0;
-    sessionBufferGrow(pBuf, nReq, &rc);
-    pBuf->nBuf = nReq;
+    if( sessionBufferGrow(pBuf, nReq, &rc)==0 ){
+      pBuf->nBuf = (int)nReq;
+    }
     *ppBuf = pBuf;
   }
   return rc;
@@ -249432,7 +249484,7 @@ static int sqlite3Fts5ConfigDeclareVtab(Fts5Config *pConfig){
     const char *zSep = (i==0?"":", ");
     zSql = sqlite3Fts5Mprintf(&rc, "%z%s%Q", zSql, zSep, pConfig->azCol[i]);
   }
-  zSql = sqlite3Fts5Mprintf(&rc, "%z, %Q HIDDEN, %s HIDDEN)",
+  zSql = sqlite3Fts5Mprintf(&rc, "%z, %Q BLOB HIDDEN, %s HIDDEN)",
       zSql, pConfig->zName, FTS5_RANK_NAME
   );
 
@@ -266974,7 +267026,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2026-11-05 22:24:56 6f5c9687f64f24abcf8f7ea32bba04ba2147084ab43c77b27081cdc496c9c5e3", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2026-11-06 16:53:43 9f8bf750d9a0eea4bf9e280008ad9163d84d8c28c2ad6839e0fcc3e64d29d468", -1, SQLITE_TRANSIENT);
 }
 
 /*
