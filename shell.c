@@ -1657,6 +1657,12 @@ static int qrfDisplayWidth(const char *zIn, sqlite3_int64 nByte, int *pnNL){
           nNL++;
           if( n>mx ) mx = n;
           n = 0;
+        }else{
+          /* Any other control character is shown by qrfAppendWithTabs()
+          ** as a one-column-wide Control Picture symbol, and is counted as
+          ** one column by qrfWrapLine().  Count it as one column here too,
+          ** so that columns are wide enough to hold it. */
+          n++;
         }
         z++;
       }
@@ -2011,6 +2017,7 @@ static int qrfTitleLimit(char *zIn, int N){
   unsigned char *z = (unsigned char*)zIn;
   int n = 0;
   unsigned char *zEllipsis = 0;
+  int nEllipsis = 0;     /* Display width of the text before zEllipsis */
   while( 1 /*exit-by-break*/ ){
     if( z[0]<' ' ){
       int k;
@@ -2027,20 +2034,24 @@ static int qrfTitleLimit(char *zIn, int N){
         z++;
       }
     }else if( (0x80&z[0])==0 ){
-      if( n>=(N-3) && zEllipsis==0 ) zEllipsis = z;
+      if( n>=(N-3) && zEllipsis==0 ){ zEllipsis = z; nEllipsis = n; }
       if( n==N ){ z[0] = 0; break; }
       n++;
       z++;
     }else{
       int u = 0;
       int len = sqlite3_qrf_decode_utf8(z, &u);
-      if( n+len>(N-3) && zEllipsis==0 ) zEllipsis = z;
-      if( n+len>N ){ z[0] = 0; break; }
+      int w = sqlite3_qrf_wcwidth(u);   /* Display width, not byte count */
+      if( n+w>(N-3) && zEllipsis==0 ){ zEllipsis = z; nEllipsis = n; }
+      if( n+w>N ){ z[0] = 0; break; }
       z += len;
-      n += sqlite3_qrf_wcwidth(u);
+      n += w;
     }
   }
-  if( zEllipsis && N>=3 ) memcpy(zEllipsis,"...",4);
+  if( zEllipsis && N>=3 ){
+    memcpy(zEllipsis,"...",4);
+    n = nEllipsis + 3;   /* Width of the text kept plus the "..." */
+  }
   return n;
 }
 
@@ -2180,7 +2191,12 @@ static void qrfRenderValue(Qrf *p, sqlite3_str *pOut, int iCol){
       break;
     }
     case SQLITE_NULL: {
-      sqlite3_str_appendall(pOut, p->spec.zNull);
+      if( p->spec.eText==QRF_TEXT_Html ){
+        /* The NULL text is user-supplied (--null) and must be escaped */
+        qrfEncodeText(p, pOut, p->spec.zNull);
+      }else{
+        sqlite3_str_appendall(pOut, p->spec.zNull);
+      }
       break;
     }
     case SQLITE_TEXT: {
@@ -3872,7 +3888,7 @@ qrf_reinit:
     }
     case QRF_STYLE_Html: {
       p->spec.eText = QRF_TEXT_Html;
-      p->spec.zNull = "null";
+      if( pSpec->zNull==0 ) p->spec.zNull = "null";
       break;
     }
     case QRF_STYLE_Insert: {
@@ -7213,41 +7229,58 @@ static char * skipNonB64( char *s, int nc ){
   return s;
 }
 
-/* Decode base64 text into a byte buffer. */
+/* Decode base64 text into a byte buffer.
+**
+** Whitespace is ignored wherever it appears, including inside a group
+** of four base64 digits.  A pad character fills one position of its
+** group with zero bits.  Any other non-base64 character inside a group
+** ends the decode.  Each group yields only the whole bytes encoded by
+** the base64 digits actually present in it.
+*/
 static u8* fromBase64( char *pIn, int ncIn, u8 *pOut ){
   if( ncIn>0 && pIn[ncIn-1]=='\n' ) --ncIn;
   while( ncIn>0 && *pIn!=PAD_CHAR ){
     static signed char nboi[] = { 0, 0, 1, 2, 3 };
     char *pUse = skipNonB64(pIn, ncIn);
     unsigned long qv = 0L;
-    int nti, nbo, nac;
+    int nbo, nac = 0, ndg = 0;
     ncIn -= (pUse - pIn);
     pIn = pUse;
-    nti = (ncIn>4)? 4 : ncIn;
-    ncIn -= nti;
-    nbo = nboi[nti];
-    if( nbo==0 ) break;
-    for( nac=0; nac<4; ++nac ){
-      char c = (nac<nti)? *pIn++ : b64Numerals[0];
-      u8 bdp = BX_DV_PROTO(c);
-      switch( bdp ){
-      case ND:
-        /*  Treat dark non-digits as pad, but they terminate decode too. */
-        ncIn = 0;
-        deliberate_fall_through; /* FALLTHRU */
-      case WS:
-        /* Treat whitespace as pad and terminate this group.*/
-        nti = nac;
-        deliberate_fall_through; /* FALLTHRU */
-      case PC:
-        bdp = 0;
-        --nbo;
-        deliberate_fall_through; /* FALLTHRU */
-      default: /* bdp is the digit value. */
-        qv = qv<<6 | bdp;
-        break;
+    if( ncIn>=4 ){
+      /* Fast path: a complete group of four base64 digits. */
+      u8 d0 = BX_DV_PROTO(pIn[0]), d1 = BX_DV_PROTO(pIn[1]);
+      u8 d2 = BX_DV_PROTO(pIn[2]), d3 = BX_DV_PROTO(pIn[3]);
+      if( IS_BX_DIGIT(d0|d1|d2|d3) ){
+        qv = (unsigned long)d0<<18 | (unsigned long)d1<<12 | d2<<6 | d3;
+        pOut[0] = (qv>>16) & 0xff;
+        pOut[1] = (qv>>8) & 0xff;
+        pOut[2] = (qv) & 0xff;
+        pOut += 3;
+        pIn += 4;
+        ncIn -= 4;
+        continue;
       }
     }
+    /* Gather up to four group positions: digits and pad characters. */
+    while( nac<4 && ncIn>0 ){
+      u8 bdp = BX_DV_PROTO(*pIn);
+      if( IS_BX_DIGIT(bdp) ){
+        qv = qv<<6 | bdp;
+        ++nac;
+        ++ndg;
+      }else if( IS_BX_PAD(bdp) ){
+        qv <<= 6;
+        ++nac;
+      }else if( !IS_BX_WS(bdp) ){
+        /* Dark non-digits terminate the decode. */
+        ncIn = 0;
+        break;
+      }
+      ++pIn;
+      --ncIn;
+    }
+    qv <<= 6*(4-nac);
+    nbo = nboi[ndg];
     switch( nbo ){
     case 3:
       pOut[2] = (qv) & 0xff;
@@ -9158,6 +9191,25 @@ static int seriesBestIndex(
       aIdx[iCol] = i;
     }
   }
+  if( pIdxInfo->nOrderBy>=1 ){
+    int iOB = pIdxInfo->aOrderBy[0].iColumn;
+    if( iOB==SERIES_COLUMN_VALUE || iOB==SERIES_COLUMN_ROWID ){
+      /* The rowid is an alias for value, and both are unique, so the
+      ** series can be generated in the requested order regardless of any
+      ** subsequent ORDER BY terms. */
+      if( pIdxInfo->aOrderBy[0].desc ){
+        idxNum |= 0x08;
+      }else{
+        idxNum |= 0x10;
+      }
+      pIdxInfo->orderByConsumed = 1;
+    }else{
+      /* The core will sort the output, so it needs to see every row.
+      ** A LIMIT or OFFSET applied here would discard rows before the sort */
+      idxNum &= ~0x60;
+      aIdx[3] = aIdx[4] = -1;
+    }
+  }
   if( aIdx[3]==0 ){
     /* Ignore OFFSET if LIMIT is omitted */
     idxNum &= ~0x60;
@@ -9193,14 +9245,6 @@ static int seriesBestIndex(
     ** the preferred case */
     pIdxInfo->estimatedCost = (double)(2 - ((idxNum&4)!=0));
     pIdxInfo->estimatedRows = 1000;
-    if( pIdxInfo->nOrderBy>=1 && pIdxInfo->aOrderBy[0].iColumn==0 ){
-      if( pIdxInfo->aOrderBy[0].desc ){
-        idxNum |= 0x08;
-      }else{
-        idxNum |= 0x10;
-      }
-      pIdxInfo->orderByConsumed = 1;
-    }
   }else if( (idxNum & 0x21)==0x21 ){
     /* We have start= and LIMIT */
     pIdxInfo->estimatedRows = 2500;
@@ -11547,6 +11591,10 @@ int sqlite3_fileio_init(
   int rc = SQLITE_OK;
   SQLITE_EXTENSION_INIT2(pApi);
   (void)pzErrMsg;  /* Unused parameter */
+
+  /* REMINDER: Changes here should be reflected in the ".safe" command
+  ** of the CLI.
+  */
   rc = sqlite3_create_function(db, "readfile", 1, 
                                SQLITE_UTF8|SQLITE_DIRECTONLY, 0,
                                readfileFunc, 0, 0);
@@ -15070,6 +15118,9 @@ static int zipfileRegister(sqlite3 *db){
     0                          /* xIntegrity */
   };
 
+  /* REMINDER: Changes here should also be reflected in the ".safe"
+  ** command of the CLI
+  */
   int rc = sqlite3_create_module(db, "zipfile"  , &zipfileModule, 0);
   if( rc==SQLITE_OK ) rc = sqlite3_overload_function(db, "zipfile_cds", -1);
   if( rc==SQLITE_OK ){
@@ -23740,9 +23791,19 @@ static int recoverWriteSchema2(sqlite3_recover *p){
   if( pSelect ){
     while( sqlite3_step(pSelect)==SQLITE_ROW ){
       const char *zSql = (const char*)sqlite3_column_text(pSelect, 1);
-      int rc = recoverOneStmt(p->dbOut, zSql, 0);
+      const char *zTail = 0;
+      int rc = recoverOneStmt(p->dbOut, zSql, &zTail);
       if( rc==SQLITE_OK ){
+        char *pToFree = 0;
+        if( zTail && zTail[0] ){
+          /* Omit any extraneous text that follows the first SQL statement */
+          int n = (int)(zTail - zSql);
+          while( n>0 && (zSql[n-1]==';' || zSql[n-1]<=' ') ){ n--; }
+          pToFree = sqlite3_mprintf("%.*s", n, zSql);
+          zSql = pToFree;
+        }
         recoverSqlCallback(p, zSql);
+        sqlite3_free(pToFree);
       }else if( rc!=SQLITE_ERROR ){
         recoverDbError(p, p->dbOut);
       }
@@ -25514,6 +25575,7 @@ struct ShellState {
   FILE *in;              /* Read commands from this stream */
   FILE *out;             /* Write results here */
   FILE *traceOut;        /* Output for sqlite3_trace() */
+  char *zEqpFile;        /* Append .eqp output to this file, if not NULL */
   int nErr;              /* Number of errors seen */
   int writableSchema;    /* True if PRAGMA writable_schema=ON */
   int nCheck;            /* Number of ".check" commands run */
@@ -25674,9 +25736,10 @@ static const char *qrfQuoteNames[] =
 #define MODE_Table    19  /* MySQL-style table formatting */
 #define MODE_Tabs     20  /* Tab-separated values */
 #define MODE_Tcl      21  /* Space-separated list of TCL strings */
-#define MODE_Www      22  /* Full web-page output */
+#define MODE_Test     22  /* list -colsep , -quote on  <-- for testing */
+#define MODE_Www      23  /* Full web-page output */
 
-#define MODE_BUILTIN  22  /* Maximum built-in mode */
+#define MODE_BUILTIN  23  /* Maximum built-in mode */
 #define MODE_BATCH    50  /* Default mode for batch processing */
 #define MODE_TTY      51  /* Default mode for interactive processing */
 #define MODE_USER     75  /* First user-defined mode */
@@ -25715,7 +25778,7 @@ static const ModeInfo aModeInfo[] = {
   { "column",   0,     0,    9,    1,    1,    0,   3,   2,     2,  0 },
   { "count",    0,     0,    0,    0,    0,    0,   0,   3,     0,  0 },
   { "csv",      4,     5,    9,    3,    3,    0,   1,   12,    0,  0 },
-  { "html",     0,     0,    9,    4,    4,    0,   3,   7,     0,  0 },
+  { "html",     0,     0,    11,   4,    4,    0,   3,   7,     0,  0 },
   { "insert",   0,     0,    10,   2,    2,    0,   1,   8,     0,  0 },
   { "jatom",    4,     1,    11,   6,    6,    0,   1,   12,    0,  0 },
   { "jobject",  0,     1,    11,   6,    6,    0,   0,   10,    0,  0 },
@@ -25731,7 +25794,7 @@ static const ModeInfo aModeInfo[] = {
   { "table",    0,     0,    9,    1,    1,    0,   3,   19,    2,  0 },
   { "tabs",     8,     1,    9,    3,    3,    0,   1,   12,    0,  0 },
   { "tcl",      3,     1,    12,   5,    5,    4,   1,   12,    0,  0 },
-  { "www",      0,     0,    9,    4,    4,    0,   3,   7,     0,  0 }
+  { "www",      0,     0,    11,   4,    4,    0,   3,   7,     0,  0 }
 };     /*       |     /     /      |     /    /     |    |     /     \____
        **       |    /     /       |    /    /      |    |    /           |
        ** Index into aModeStr[]    |   /    /       |    |  2: columnar   |
@@ -26920,6 +26983,34 @@ static char *shellFakeSchema(
 ** Return true if the current build has capability X.  Return 0
 ** if X is not a capability or NULL if X is NULL.
 **
+** A build has capability X if any of the following are true:
+**
+**   (1)  A function named X exists.
+**   (2)  A module named X exists.
+**   (3)  A compile-time option X is used for the build.
+**
+** Comparison between X and the various items above is done
+** without to case.  So capable('generate_series') and
+** capable('GENERATE_SERIES') and capable('Generate_Series')
+** all work the same.
+**
+** There are also special names "vtab", "fkey", and "load_ext"
+** that return true as long as compile-time options
+** SQLITE_OMIT_VIRTUALTABLE, SQLITE_OMIT_FOREIGN_KEY, and
+** SQLITE_OMIT_LOAD_EXTENSION are omitted from the build,
+** respectively.  New special names may be added in the future.
+** Thus, for example, "capable('vtab')" means that the build
+** lacks SQLITE_OMIT_VIRTUALTABLE and hence does support
+** virtual tables.
+**
+** For other "OMIT" options (besides the three special ones noted
+** in the previous paragraph) you have to say something like
+** "capable('OMIT_EXPLAIN')".  And that function returns true
+** if the EXPLAIN capability is omitted.  It works like a
+** double-negative.  This is a bit confusing (hence the special
+** names for the common cases mentioned above) but it servicable
+** for the rare cases when it is needed.
+**
 ** This function is intended to be used with the ".if" command
 ** to bypass test cases that use features that are not part of
 ** the build.  Examples:
@@ -27436,6 +27527,21 @@ static void modeSetStr(char **az, const char *zNew){
 static int pickStr(const char *zArg, char **pzErr, ...);
 
 /*
+** Clamp a user-supplied value into the range 0..32767 or
+** 0..2147483647
+*/
+static short int modeClamp16(i64 x){
+  if( x<0 ) x = 0;
+  if( x>0x7fff ) x = 0x7fff;
+  return (short int)x;
+}
+static int modeClamp32(i64 x){
+  if( x<0 ) x = 0;
+  if( x>0x7fffffff ) x = 0x7fffffff;
+  return (int)x;
+}
+
+/*
 ** Change the limits on the display mode.  Return 0 on
 ** success.  Return non-zero if zArg is mis-formatted.
 **
@@ -27462,9 +27568,9 @@ static int modeSetLimit(ShellState *p, const char *zArg){
     int L, C, T = 0;
     int nNum = sscanf(zArg, "%d,%d,%d", &L, &C, &T);
     if( nNum<2 || L<0 || C<0 || T<0) return 1;
-    p->mode.spec.nLineLimit = L;
+    p->mode.spec.nLineLimit = modeClamp16(L);
     p->mode.spec.nCharLimit = C;
-    if( nNum==3 ) p->mode.spec.nTitleLimit = T;
+    if( nNum==3 ) p->mode.spec.nTitleLimit = modeClamp16(T);
   }
   return 0;
 }
@@ -28417,6 +28523,30 @@ static void set_table_name(ShellState *p, const char *zName){
 }
 
 /*
+** Return a copy of the text z, obtained from sqlite3_malloc(), that is safe
+** to embed inside of a C-style comment in a script of SQL statements and
+** dot-commands.  Newlines and other control characters are changed to spaces,
+** and any end-of-comment sequence is broken up.  Otherwise, text taken from
+** an untrusted database (for example, a table name in an error message)
+** could terminate the comment and put arbitrary SQL, or a line that begins
+** with "." and so is interpreted as a dot-command, into the output.
+*/
+static char *shellSafeCommentText(const char *z){
+  char *zOut = sqlite3_mprintf("%s", z ? z : "");
+  int i;
+  if( zOut==0 ) return 0;
+  for(i=0; zOut[i]; i++){
+    unsigned char c = (unsigned char)zOut[i];
+    if( c<' ' || c==0x7f ){
+      zOut[i] = ' ';
+    }else if( c=='/' && i>0 && zOut[i-1]=='*' ){
+      zOut[i] = ' ';
+    }
+  }
+  return zOut;
+}
+
+/*
 ** Maybe construct two lines of text that point out the position of a
 ** syntax error.  Return a pointer to the text, in memory obtained from
 ** sqlite3_malloc().  Or, if the most recent error does not involve a
@@ -28482,8 +28612,10 @@ static int run_table_dump_query(
   rc = sqlite3_prepare_v2(p->db, zSelect, -1, &pSelect, 0);
   if( rc!=SQLITE_OK || !pSelect ){
     char *zContext = shell_error_context(zSelect, p->db);
+    char *zMsg = shellSafeCommentText(sqlite3_errmsg(p->db));
     cli_printf(p->out, "/**** ERROR: (%d) %s *****/\n%s",
-          rc, sqlite3_errmsg(p->db), zContext);
+          rc, zMsg, zContext);
+    sqlite3_free(zMsg);
     sqlite3_free(zContext);
     if( (rc&0xff)!=SQLITE_CORRUPT ) p->nErr++;
     return rc;
@@ -28507,8 +28639,9 @@ static int run_table_dump_query(
   }
   rc = sqlite3_finalize(pSelect);
   if( rc!=SQLITE_OK ){
-    cli_printf(p->out, "/**** ERROR: (%d) %s *****/\n",
-                    rc, sqlite3_errmsg(p->db));
+    char *zMsg = shellSafeCommentText(sqlite3_errmsg(p->db));
+    cli_printf(p->out, "/**** ERROR: (%d) %s *****/\n", rc, zMsg);
+    sqlite3_free(zMsg);
     if( (rc&0xff)!=SQLITE_CORRUPT ) p->nErr++;
   }
   return rc;
@@ -29137,6 +29270,7 @@ static int shell_exec(
       if( pArg && pArg->mode.autoEQP && isExplain==0 && pArg->dot.nArg==0 ){
         int triggerEQP = 0;
         u8 savedEnableTimer = pArg->enableTimer;
+        FILE *savedOut = pArg->out;
         pArg->enableTimer = 0;
         disable_debug_trace_modes();
         sqlite3_db_config(db, SQLITE_DBCONFIG_TRIGGER_EQP, -1, &triggerEQP);
@@ -29146,6 +29280,14 @@ static int shell_exec(
         sqlite3_reset(pStmt);
         spec.eStyle = QRF_STYLE_Auto;
         sqlite3_stmt_explain(pStmt, 2);
+        if( pArg->zEqpFile ){
+          pArg->out = sqlite3_fopen(pArg->zEqpFile, "ab");
+          if( pArg->out==0 ){
+            cli_printf(savedOut, "cannot open .eqp output file \"%s\"\n",
+                       pArg->zEqpFile);
+            pArg->out = savedOut;
+          }
+        }
         sqlite3_format_query_result(pStmt, &spec, 0);
         if( pArg->mode.autoEQP>=AUTOEQP_full ){
           sqlite3_reset(pStmt);
@@ -29158,6 +29300,10 @@ static int shell_exec(
         }
         sqlite3_reset(pStmt);
         sqlite3_stmt_explain(pStmt, 0);
+        if( pArg->out!=savedOut ){
+          fclose(pArg->out);
+          pArg->out = savedOut;
+        }
         restore_debug_trace_modes();
         pArg->enableTimer = savedEnableTimer;
       }
@@ -29518,7 +29664,9 @@ static int run_schema_dump_query(
     int len = strlen30(zQuery);
     cli_puts("/****** CORRUPTION ERROR *******/\n", p->out);
     if( zErr ){
-      cli_printf(p->out, "/****** %s ******/\n", zErr);
+      char *zMsg = shellSafeCommentText(zErr);
+      cli_printf(p->out, "/****** %s ******/\n", zMsg);
+      sqlite3_free(zMsg);
       sqlite3_free(zErr);
       zErr = 0;
     }
@@ -29527,7 +29675,9 @@ static int run_schema_dump_query(
     sqlite3_snprintf(len+100, zQ2, "%s ORDER BY rowid DESC", zQuery);
     rc = sqlite3_exec(p->db, zQ2, dump_callback, p, &zErr);
     if( rc ){
-      cli_printf(p->out, "/****** ERROR: %s ******/\n", zErr);
+      char *zMsg = shellSafeCommentText(zErr);
+      cli_printf(p->out, "/****** ERROR: %s ******/\n", zMsg);
+      sqlite3_free(zMsg);
     }else{
       rc = SQLITE_CORRUPT;
     }
@@ -29728,9 +29878,13 @@ static const char *(azHelp[]) = {
   "   --lost-and-found TABLE   Alternative name for the lost-and-found table",
   "   --no-rowids              Do not attempt to recover rowid values",
   "                            that are not also INTEGER PRIMARY KEYs",
+  "   --unsafe                 Do not issue the \".safe\" command in output",
 #endif
 #ifndef SQLITE_SHELL_FIDDLE
   ".restore ?DB? FILE       Restore content of DB (default \"main\") from FILE",
+#endif
+  ".safe                    Put the CLI into \"safe mode\"",
+#ifndef SQLITE_SHELL_FIDDLE
   ".save ?OPTIONS? FILE     Write database to FILE (an alias for .backup ...)",
 #endif
   ".scanstats on|off|est    Turn sqlite3_stmt_scanstatus() metrics on or off",
@@ -29993,21 +30147,47 @@ static const struct {
   { ".check",
 "USAGE: .check [OPTIONS] PATTERN\n"
 "\n"
-"Verify results of commands since the most recent .testcase command.\n"
-"Restore output to the console, unless --keep is used.\n"
+"Verify the output of all commands since the most recent .testcase\n"
+"command.  Both stdout and stderr are captured and compared, so error\n"
+"messages are part of the text being compared, however output from\n"
+"the \".echo on\" dot-command is not captured and is not part of the test\n"
+"result.\n"
 "\n"
-"If PATTERN starts with \"<<ENDMARK\" then the actual pattern is taken from\n"
-"subsequent lines of text up to the first line that begins with ENDMARK.\n"
-"All pattern lines and the ENDMARK are discarded.\n"
+"After checking the result, all captured output is discarded and\n"
+"output starts going back to the console, unless --keep is used.\n"
+"\n"
+"If PATTERN is \"<<ENDMARK\" (for any ENDMARK) then the actual pattern is\n"
+"taken from subsequent lines of text up to the first line that begins\n"
+"with ENDMARK.\n"
+"\n"
+"The default comparison algorithm is to ignore all leading and trailing\n"
+"whitespace and compare the pattern against the result byte-for-byte except\n"
+"that whitespace characters are equal to other whitespace characters.\n"
+"Thus if the pattern contains a space character and the result contains\n"
+"a tab in the same spot, they would still compare equal.  The number of\n"
+"whitespace characters must be the same in the pattern and the result.\n"
+"\n"
+"The --glob, --notglob, and --allglob comparisons are extended so that\n"
+"\"#\" in the pattern matches a sequence of one or more digits with an\n"
+"optional leading \"+\" or \"-\", and a space in the pattern matches a run\n"
+"of one or more whitespace characters.\n"
 "\n"
 "Options:\n"
-"  --exact                Do an exact comparison including leading and\n"
-"                         trailing whitespace.\n"
-"  --glob                 Treat PATTERN as a GLOB\n"
-"  --keep                 Do not reset the testcase.  More .check commands\n"
-"                         will follow.\n"
-"  --notglob              Output should not match PATTERN\n"
-"  --show                 Write testcase output to the screen, for debugging.\n"
+"  --allglob      PATTERN is a GLOB matching the entire test output except\n"
+"                 leading and trailing whitespace.\n"
+"  --any          PATTERN is any substring within the test output.\n"
+"  --exact        PATTERN matches the entire test output, byte for byte.\n"
+"  --glob         PATTERN is a GLOB matching any substring of the test\n"
+"                 output.  Leading and trailing whitespace on the PATTERN\n"
+"                 is ignored.\n"
+"  --keep         Do not reset the test output.  One or more .check commands\n"
+"                 will follow and do additional tests.\n"
+"  --not          Pass if the test output does *not* match PATTERN.\n"
+"  --notglob      Shorthand for \"--not --glob\".\n"
+"  --nowhere      Shorthand for \"--not --any\".\n"
+"  --regexp       PATTERN is a regular expression matching any substring\n"
+"                 of the test output.\n"
+"  --show         Write test output to the screen, for debugging.\n"
   },
   { ".stats",
 "USAGE: .stats [OPTIONS] ...\n"
@@ -30035,7 +30215,7 @@ static const struct {
 "\n"
 "Start a new test case identified by NAME.  All output\n"
 "through the next \".check\" command is captured for comparison. See the\n"
-"\".check\" command for additional informatioon.\n"
+"\".check\" command for additional information.\n"
 "\n"
 "Options:\n"
 "  --error-prefix TEXT       Change error message prefix text to TEXT\n"
@@ -30070,6 +30250,68 @@ static const struct {
 "USAGE: .endif\n"
 "\n"
 "Terminate an .if statement.\n"
+  },
+  { ".eqp",
+"USAGE: .eqp EQPMODE [>OUTPUTFILE]\n"
+"\n"
+"The .eqp command enables or disables the automatic display of EXPLAIN\n"
+"output for each SQL statement evaluated.  The required EQPMODE argument\n"
+"may be one of the following:\n"
+"\n"
+"  full          Show both EXPLAIN QUERY PLAN and EXPLAIN output.\n"
+"\n"
+"  off           Disable all explain output.\n"
+"\n"
+"  on            Show EXPLAIN QUERY PLAN output only.\n"
+"\n"
+"  trace         Like \"full\" but also enable VDBE tracing using\n"
+"                PRAGMA vdbe_trace=ON.  This option only works if the\n"
+"                CLI is compiled with -DSQLITE_DEBUG.  The trace output\n"
+"                always appears on stdout and is not redirected to a file.\n"
+"\n"
+"  trigger       Like \"full\" but also show EXPLAIN output for trigger\n"
+"                subprograms.\n"
+"\n"
+"The EQPMODE maybe be optionally followed by a filename.  If a file is\n"
+"specified, with or without a single leading \">\", then the file is\n"
+"deleted and all subsequent explain output is appended to that file.\n"
+"If the filename begins with \">>\" then the content of the file is retained\n"
+"and all output is appended.  If not redirection argument is provided,\n"
+"output redirection is cancelled.  The ability to redirect is not available\n"
+"for --safe mode.\n"
+  },
+  { ".safe",
+"USAGE: .safe\n"
+"\n"
+"This command puts the CLI into \"safe mode\".  This command cannot be\n"
+"undone.  The only way to restore full capabilities is to exit and\n"
+"restart the CLI.\n"
+"\n"
+"Safe mode restricts SQL statements and dot-commands so that no\n"
+"changes may be made to the filesystem other than writing to database\n"
+"files that are already open.\n"
+"\n"
+"   *  The .open command is blocked unless the database is \":memory:\"\n"
+"      or the --hexdb option is used.\n"
+"   *  The ATTACH command of SQL may not be used\n"
+"   *  SQL functions with side effects (ex: writefile()) are blocked.\n"
+"   *  The \".shell\" and \".system\" dot-commands are blocked.\n"
+"   *  Dot-command like \".archive\", \".backup\", \".load\", \".log\", \".save\"\n"
+"      are blocked.\n"
+"   *  Other commands with deleterious side effects are blocked.\n"
+"\n"
+"Unsafe actions might be simply blocked, or the CLI might issue an error\n"
+"and exit immediately.\n"
+"\n"
+"Safe mode does not prevent harm to database files that are already open.\n"
+"An attacker can still delete content and even use commands like\n"
+"\"PRAGMA writable_schema=ON\" to corrupt a database file that is already\n"
+"open.  Safe mode only blocks access to other previously unopened files.\n"
+"\n"
+"CAUTION: If third-party extensions with system side effects have been\n"
+"loaded prior to the .safe command, the CLI has no knowledge of those\n"
+"extensions and does not know to block them.  Unsafe actions might still\n"
+"be possible using those third-party extension.\n"
   },
 };
 
@@ -30215,7 +30457,7 @@ static int process_input(ShellState *p, const char*);
 ** is undefined in this case.
 */
 static char *readFile(const char *zName, int *pnByte){
-  FILE *in = sqlite3_fopen(zName, "rb");
+  FILE *in = (zName && zName[0]) ? sqlite3_fopen(zName, "rb") : 0;
   long nIn;
   size_t nRead;
   char *pBuf;
@@ -30424,6 +30666,7 @@ static int isScriptFile(const char *z, int bLeaveUninit){
   }
   if( sqlite3_strlike("%.sql",z,0)==0 ) return 1;
   if( sqlite3_strlike("%.txt",z,0)==0 ) return 1;
+  if( sqlite3_strlike("%.clitest",z,0)==0 ) return 1;
   return 0;
 }
 
@@ -30549,6 +30792,7 @@ static void shellDualRepFunc(
   int argcUnused,
   sqlite3_value **argv
 ){
+  (void)argcUnused;
   sqlite3_value_text(argv[0]);
   sqlite3_result_value(context, argv[0]);
 }
@@ -31742,7 +31986,9 @@ static int testcase_glob(const char *zGlob, const char *z){
       }
       if( c==0 ){
         return 1;
-      }else if( c=='[' ){
+      }else if( c=='[' || c=='#' || IsSpace(c) ){
+        /* The next pattern element is not a literal character.  Try to
+        ** match it at each position in the remaining text. */
         while( *z && testcase_glob(zGlob-1,z)==0 ){
           z++;
         }
@@ -33202,6 +33448,7 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
   const char *zLAF = "lost_and_found";
   int bFreelist = 1;              /* 0 if --ignore-freelist is specified */
   int bRowids = 1;                /* 0 if --no-rowids */
+  int bUnsafe = 0;                /* 1 if --unsafe */
   sqlite3_recover *p = 0;
   int i = 0;
 
@@ -33228,6 +33475,9 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
     }else
     if( n<=10 && memcmp("-no-rowids", z, n)==0 ){
       bRowids = 0;
+    }else
+    if( n<=7 && memcmp("-unsafe", z, n)==0 ){
+      bUnsafe = 1;
     }
     else{
       cli_printf(stderr,"unexpected option: %s\n", azArg[i]);
@@ -33248,6 +33498,7 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
   sqlite3_recover_config(p, SQLITE_RECOVER_FREELIST_CORRUPT,(void*)&bFreelist);
 
   cli_printf(pState->out, ".dbconfig defensive off\n");
+  if( !bUnsafe ) cli_printf(pState->out, ".safe\n");
   sqlite3_recover_run(p);
   if( sqlite3_recover_errcode(p)!=SQLITE_OK ){
     const char *zErr = sqlite3_recover_errmsg(p);
@@ -34265,17 +34516,17 @@ static int dotCmdMode(ShellState *p){
       chng = 1;
     }else if( 0<=(k=pickStr(z,0,
                   "-charlimit","-linelimit","-titlelimit","-multiinsert","")) ){
-      int w;   /*  0            1            2             3 */
+      i64 w;   /*  0            1            2             3 */
       if( i+1>=nArg ){
         dotCmdError(p, i, "missing argument", 0);
         return 1;
       }
       w = integerValue(azArg[++i]);
       switch( k ){
-        case 0:   p->mode.spec.nCharLimit = w;    break;
-        case 1:   p->mode.spec.nLineLimit = w;    break;
-        case 2:   p->mode.spec.nTitleLimit = w;   break;
-        default:  p->mode.spec.nMultiInsert = w;  break;
+        case 0:   p->mode.spec.nCharLimit = modeClamp32(w);   break;
+        case 1:   p->mode.spec.nLineLimit = modeClamp16(w);   break;
+        case 2:   p->mode.spec.nTitleLimit = modeClamp16(w);  break;
+        default:  p->mode.spec.nMultiInsert = modeClamp32(w); break;
       }
       chng = 1;
     }else if( 0<=(k=pickStr(z,0,"-tablename","-rowsep","-colsep","-null","")) ){
@@ -35037,24 +35288,68 @@ static char *captureHereDoc(ShellState *p, const char *zTerminator){
 }
 
 /*
+** Return a pointer to the first non-whitespace character in the input
+** string, or a pointer to the string terminator if the input contains
+** no non-whitespace characters.
+**
+** The number of bytes that follow, excluding trailing whitespace, is
+** written into *pN if pN!=0.
+*/
+static char *trimSpace(char *zIn, int *pN){
+  while( IsSpace(zIn[0]) ){ zIn++; }
+  if( pN ){
+    size_t n = strlen(zIn);
+    while( n>0 && IsSpace(zIn[n-1]) ){ n--; }
+    *pN = n;
+  }
+  return zIn;
+}
+
+/*
 ** DOT-COMMAND: .check
 ** USAGE: .check [OPTIONS] PATTERN
 **
-** Verify results of commands since the most recent .testcase command.
-** Restore output to the console, unless --keep is used.
+** Verify the output of all commands since the most recent .testcase
+** command.  Both stdout and stderr are captured and compared, so error
+** messages are part of the text being compared, however output from
+** the ".echo on" dot-command is not captured and is not part of the test
+** result.
 **
-** If PATTERN starts with "<<ENDMARK" then the actual pattern is taken from
-** subsequent lines of text up to the first line that begins with ENDMARK.
-** All pattern lines and the ENDMARK are discarded.
+** After checking the result, all captured output is discarded and
+** output starts going back to the console, unless --keep is used.
+**
+** If PATTERN is "<<ENDMARK" (for any ENDMARK) then the actual pattern is
+** taken from subsequent lines of text up to the first line that begins
+** with ENDMARK.
+**
+** The default comparison algorithm is to ignore all leading and trailing
+** whitespace and compare the pattern against the result byte-for-byte except
+** that whitespace characters are equal to other whitespace characters.
+** Thus if the pattern contains a space character and the result contains
+** a tab in the same spot, they would still compare equal.  The number of
+** whitespace characters must be the same in the pattern and the result.
+**
+** The --glob, --notglob, and --allglob comparisons are extended so that
+** "#" in the pattern matches a sequence of one or more digits with an
+** optional leading "+" or "-", and a space in the pattern matches a run
+** of one or more whitespace characters.
 **
 ** Options:
-**   --exact                Do an exact comparison including leading and
-**                          trailing whitespace.
-**   --glob                 Treat PATTERN as a GLOB
-**   --keep                 Do not reset the testcase.  More .check commands
-**                          will follow.
-**   --notglob              Output should not match PATTERN
-**   --show                 Write testcase output to the screen, for debugging.
+**   --allglob      PATTERN is a GLOB matching the entire test output except
+**                  leading and trailing whitespace.
+**   --any          PATTERN is any substring within the test output.
+**   --exact        PATTERN matches the entire test output, byte for byte.
+**   --glob         PATTERN is a GLOB matching any substring of the test
+**                  output.  Leading and trailing whitespace on the PATTERN
+**                  is ignored.
+**   --keep         Do not reset the test output.  One or more .check commands
+**                  will follow and do additional tests.
+**   --not          Pass if the test output does *not* match PATTERN.
+**   --notglob      Shorthand for "--not --glob".
+**   --nowhere      Shorthand for "--not --any".
+**   --regexp       PATTERN is a regular expression matching any substring
+**                  of the test output.
+**   --show         Write test output to the screen, for debugging.
 */
 static int dotCmdCheck(ShellState *p){
   int nArg = p->dot.nArg;            /* Number of arguments */
@@ -35065,8 +35360,11 @@ static int dotCmdCheck(ShellState *p){
   int bKeep = 0;                     /* --keep option */
   char *zCheck = 0;                  /* PATTERN argument */
   char *zPattern = 0;                /* Actual test pattern */
-  int eCheck = 0;                    /* 1: --glob,  2: --notglob,  3: --exact */
-  int isOk;                          /* True if results are OK */
+  char *zToFree = 0;                 /* allocated text to free */
+  int eCheck = 0;                    /* 0: default.  Else 1+index of option */
+  int isOk = 0;                      /* True if results are OK */
+  int bNot = 0;                      /* Invert the sense of the test */
+  int iPat = -1;                     /* Location of the pattern */
   sqlite3_int64 iStart = p->lineno;  /* Line number of .check statement */
 
   if( p->mIf!=0 ){
@@ -35093,23 +35391,30 @@ static int dotCmdCheck(ShellState *p){
       }
       bKeep = 1;
     }else if( z[0]=='-'
-          && (k = pickStr(&z[1],0,"glob","notglob","exact",""))>=0
+          && (k = pickStr(&z[1],0,
+   /*  0      1       2        3     4         5         6         7 */
+      "glob","exact","regexp","any","nowhere","allglob","notglob","not",""))>=0
     ){
-      if( eCheck && eCheck!=k+1 ){
+      if( k==7 ){
+        bNot = !bNot;
+      }else if( eCheck==0 || eCheck==k+1 ){
+        eCheck = k+1;
+      }else{
+        output_reset(p);
         dotCmdError(p, i, "incompatible with prior options",0);
         return 1;
       }
-      eCheck = k+1;
     }else if( zCheck ){
+      output_reset(p);
       dotCmdError(p, i, "unknown option", 0);
       return 1;
     }else{
       zCheck = azArg[i];
+      iPat = i;
     }
   }
   if( zCheck==0 ){
-    dotCmdError(p, 0, "no PATTERN specified", 0);
-    return 1;
+    zCheck = "";  /* No pattern string defaults to mean no output */
   }
   if( sqlite3_str_length(cli_output_capture) ){
     zTest = sqlite3_str_value(cli_output_capture);
@@ -35123,42 +35428,87 @@ static int dotCmdCheck(ShellState *p){
     if( zPattern==0 ){
       zPattern = sqlite3_mprintf("");
     }
+    zToFree = zPattern;
   }else{
     zPattern = zCheck;
+    zToFree = 0;
   }
   shell_check_oom(zPattern);
   switch( eCheck ){
-    case 1: {
-      char *zGlob = sqlite3_mprintf("*%s*", zPattern);
+    case 6:           /* --allglob */
+    case 7:           /* --notglob */
+    case 1: {         /* --glob */
+      int nPat = 0;
+      char *zGlob;
+      zPattern = trimSpace(zPattern, &nPat);
+      zTest = trimSpace(zTest, 0);
+      if( eCheck==6 ){
+        zGlob = sqlite3_mprintf("%.*s", nPat, zPattern);
+      }else{
+        zGlob = sqlite3_mprintf("*%.*s*", nPat, zPattern);
+      }
+      shell_check_oom(zGlob);
       isOk = testcase_glob(zGlob, zTest)!=0;
+      if( eCheck==7 ) isOk = !isOk;
       sqlite3_free(zGlob);
       break;
     }
-    case 2: {
-      char *zGlob = sqlite3_mprintf("*%s*", zPattern);
-      isOk = testcase_glob(zGlob, zTest)==0;
-      sqlite3_free(zGlob);
-      break;
-    }
-    case 3: {
+    case 2: {         /* --exact */
       isOk = cli_strcmp(zTest,zPattern)==0;
       break;
     }
-    default: {
-      /* Skip leading and trailing \n and \r on both pattern and test output */
-      const char *z1 = zPattern;
-      const char *z2 = zTest;
-      size_t n1, n2;
-      while( z1[0]=='\n' || z1[0]=='\r' ) z1++;
-      n1 = strlen(z1);
-      while( n1>0 && (z1[n1-1]=='\n' || z1[n1-1]=='\r') ) n1--;
-      while( z2[0]=='\n' || z2[0]=='\r' ) z2++;
-      n2 = strlen(z2);
-      while( n2>0 && (z2[n2-1]=='\n' || z2[n2-1]=='\r') ) n2--;
-      isOk = n1==n2 && memcmp(z1,z2,n1)==0;
+    case 3: {         /* --regexp */
+      ReCompiled *pRe = 0;
+      const char *zErr = re_compile(&pRe, zPattern, 1000, 0);
+      if( zErr ){
+        re_free(pRe);
+        sqlite3_free(zToFree);
+        output_reset(p);
+        p->nTestErr++;
+        dotCmdError(p, iPat, "bad regexp", "bad regular expression: %s", zErr);
+        return 1;
+      }
+      shell_check_oom(pRe);
+      isOk = re_match(pRe, (const unsigned char*)zTest, -1);
+      re_free(pRe);
+      break;
+    }
+    case 4: {         /* --any */
+      isOk = strstr(zTest,zPattern)!=0;
+      break;
+    }
+    case 5: {         /* --nowhere */
+      isOk = strstr(zTest,zPattern)==0;
+      break;
+    }
+    default: {        /* default matching rule */
+      /* Ignore leading and trailing whitespace on both the pattern and the
+      ** test output.  Each interior whitespace character will compare equal
+      ** to exactly one other whitespace character. */
+      int nPat = 0;
+      int nTest = 0;
+      zPattern = trimSpace(zPattern, &nPat);
+      zTest = trimSpace(zTest, &nTest);
+      if( nPat!=nTest ){
+        isOk = 0;
+      }else if( memcmp(zPattern, zTest, nPat)==0 ){
+        isOk = 1;
+      }else{
+        int ii;
+        isOk = 1;
+        for(ii=0; ii<nPat; ii++){
+          if( zPattern[ii]!=zTest[ii]
+           && !(IsSpace(zPattern[ii]) && IsSpace(zTest[ii]))
+          ){
+            isOk = 0;
+            break;
+          }
+        }
+      }
       break;
     }
   }
+  if( bNot ) isOk = !isOk;
   if( !isOk ){
     static const char zDL[] = "\342\225\255\342\224\200";
     static const char zDR[] = "\342\224\200\342\225\256";
@@ -35190,9 +35540,7 @@ static int dotCmdCheck(ShellState *p){
       sqlite3_fprintf(stderr, "Got:      [%s]\n", zTest);
     }
   }
-  if( zPattern!=zCheck ){
-    sqlite3_free(zPattern);
-  }
+  sqlite3_free(zToFree);
   if( !bKeep ){
     output_reset(p);
     p->zTestcase[0] = 0;
@@ -35297,7 +35645,7 @@ static int dotCmdStats(ShellState *p){
 **
 ** Start a new test case identified by NAME.  All output
 ** through the next ".check" command is captured for comparison. See the
-** ".check" command for additional informatioon.
+** ".check" command for additional information.
 **
 ** Options:
 **   --error-prefix TEXT       Change error message prefix text to TEXT
@@ -35475,7 +35823,136 @@ static int dotCmdEndif(ShellState *p){
   return 0;
 }
 
+/*
+** DOT-COMMAND: .eqp
+** USAGE: .eqp EQPMODE [>OUTPUTFILE]
+**
+** The .eqp command enables or disables the automatic display of EXPLAIN
+** output for each SQL statement evaluated.  The required EQPMODE argument
+** may be one of the following:
+**
+**   full          Show both EXPLAIN QUERY PLAN and EXPLAIN output.
+**
+**   off           Disable all explain output.
+**
+**   on            Show EXPLAIN QUERY PLAN output only.
+**
+**   trace         Like "full" but also enable VDBE tracing using
+**                 PRAGMA vdbe_trace=ON.  This option only works if the
+**                 CLI is compiled with -DSQLITE_DEBUG.  The trace output
+**                 always appears on stdout and is not redirected to a file.
+**
+**   trigger       Like "full" but also show EXPLAIN output for trigger
+**                 subprograms.
+**
+** The EQPMODE maybe be optionally followed by a filename.  If a file is
+** specified, with or without a single leading ">", then the file is
+** deleted and all subsequent explain output is appended to that file.
+** If the filename begins with ">>" then the content of the file is retained
+** and all output is appended.  If not redirection argument is provided,
+** output redirection is cancelled.  The ability to redirect is not available
+** for --safe mode.
+*/
+static int dotCmdEqp(ShellState *p){
+  int nArg = p->dot.nArg;       /* Number of arguments */
+  char **azArg = p->dot.azArg;  /* Argument list */
+  if( nArg==2 || nArg==3 ){
+    int isTrace = 0;
+    if( p->db ) sqlite3_db_config(p->db, SQLITE_DBCONFIG_VDBE_TRACE, 0,
+                                  (int*)0);
+    if( cli_strcmp(azArg[1],"full")==0 ){
+      p->mode.autoEQP = AUTOEQP_full;
+    }else if( cli_strcmp(azArg[1],"trigger")==0 ){
+      p->mode.autoEQP = AUTOEQP_trigger;
+    }else if( cli_strcmp(azArg[1],"trace")==0 ){
+#ifdef SQLITE_DEBUG
+      p->mode.autoEQP = AUTOEQP_full;
+      if( p->db==0 ){
+        open_db(p, 0);
+        sqlite3_exec(p->db, "SELECT name FROM sqlite_schema LIMIT 1",0,0,0);
+      }
+      sqlite3_db_config(p->db, SQLITE_DBCONFIG_VDBE_TRACE, 1, (int*)0);
+      isTrace = 1;
+#else
+      eputz("\".eqp trace\" is only available in debug builds\n");
+      return 1;
+#endif
+    }else{
+      p->mode.autoEQP = (u8)booleanValue(azArg[1]);
+    }
+    free(p->zEqpFile);
+    if( nArg==3 ){
+      const char *zOut = azArg[2];
+      int bAppend = 0;
+      failIfSafeMode(p, "cannot redirect .eqp output in safe mode");
+      if( zOut[0]=='>' ) zOut++;
+      if( zOut[0]=='>' ){ bAppend = 1; zOut++; }
+      p->zEqpFile = strdup(zOut);
+      if( !bAppend ){
+        (void)shellDeleteFile(p->zEqpFile, 0);
+      }
+      if( isTrace ){
+        cli_printf(p->out, "WARNING: trace output will not be redirected\n");
+      }
+    }else{
+      p->zEqpFile = 0;
+    }
+  }else{
+    eputz("Usage: .eqp off|on|trace|trigger|full [OUTPUTFILE]\n");
+    return 1;
+  }
+  return 0;
+}
 
+
+/*
+** DOT-COMMAND: .safe
+** USAGE: .safe
+**
+** This command puts the CLI into "safe mode".  This command cannot be
+** undone.  The only way to restore full capabilities is to exit and
+** restart the CLI.
+**
+** Safe mode restricts SQL statements and dot-commands so that no
+** changes may be made to the filesystem other than writing to database
+** files that are already open.
+**
+**    *  The .open command is blocked unless the database is ":memory:"
+**       or the --hexdb option is used.
+**    *  The ATTACH command of SQL may not be used
+**    *  SQL functions with side effects (ex: writefile()) are blocked.
+**    *  The ".shell" and ".system" dot-commands are blocked.
+**    *  Dot-command like ".archive", ".backup", ".load", ".log", ".save"
+**       are blocked.
+**    *  Other commands with deleterious side effects are blocked.
+**
+** Unsafe actions might be simply blocked, or the CLI might issue an error
+** and exit immediately.
+**
+** Safe mode does not prevent harm to database files that are already open.
+** An attacker can still delete content and even use commands like
+** "PRAGMA writable_schema=ON" to corrupt a database file that is already
+** open.  Safe mode only blocks access to other previously unopened files.
+**
+** CAUTION: If third-party extensions with system side effects have been
+** loaded prior to the .safe command, the CLI has no knowledge of those
+** extensions and does not know to block them.  Unsafe actions might still
+** be possible using those third-party extension.
+*/
+static int dotCmdSafe(ShellState *p){
+  int i;
+  p->bSafeMode = 1;
+  p->bSafeModePersist = 1;
+  for(i=0; i<ArraySize(p->aAuxDb); i++){
+    sqlite3 *db = p->aAuxDb[i].db;
+    if( db==0 ) continue;
+    sqlite3_create_module(db, "fsdir", 0, 0);
+    sqlite3_create_function(db, "writefile", -1, 0, 0, 0, 0, 0);
+    sqlite3_create_module(db, "zipfile", 0, 0);
+    sqlite3_create_function(db, "zipfile", -1, 0, 0, 0, 0, 0);
+  }
+  return 0;
+}
 
 /*
 ** Enlarge the space allocated in p->dot so that it can hold more
@@ -35490,7 +35967,6 @@ static void parseDotRealloc(ShellState *p, int nArg){
   p->dot.abQuot = realloc(p->dot.abQuot,p->dot.nAlloc);
   shell_check_oom(p->dot.abQuot);
 }
-
 
 /*
 ** Parse input line zLine up into individual arguments.  Retain the
@@ -36131,29 +36607,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
   }else
 
   if( c=='e' && cli_strncmp(azArg[0], "eqp", n)==0 ){
-    if( nArg==2 ){
-      if( p->db ) sqlite3_db_config(p->db, SQLITE_DBCONFIG_VDBE_TRACE, 0,
-                                    (int*)0);
-      if( cli_strcmp(azArg[1],"full")==0 ){
-        p->mode.autoEQP = AUTOEQP_full;
-      }else if( cli_strcmp(azArg[1],"trigger")==0 ){
-        p->mode.autoEQP = AUTOEQP_trigger;
-#ifdef SQLITE_DEBUG
-      }else if( cli_strcmp(azArg[1],"trace")==0 ){
-        p->mode.autoEQP = AUTOEQP_full;
-        if( p->db==0 ){
-          open_db(p, 0);
-          sqlite3_exec(p->db, "SELECT name FROM sqlite_schema LIMIT 1",0,0,0);
-        }
-        sqlite3_db_config(p->db, SQLITE_DBCONFIG_VDBE_TRACE, 1, (int*)0);
-#endif
-      }else{
-        p->mode.autoEQP = (u8)booleanValue(azArg[1]);
-      }
-    }else{
-      eputz("Usage: .eqp off|on|trace|trigger|full\n");
-      rc = 1;
-    }
+    rc = dotCmdEqp(p);
   }else
 
 #ifndef SQLITE_SHELL_FIDDLE
@@ -37301,6 +37755,10 @@ static int do_meta_command(const char *zLine, ShellState *p){
   }else
 #endif /* !defined(SQLITE_SHELL_FIDDLE) */
 
+  if( c=='s' && cli_strcmp(azArg[0], "safe")==0 ){
+    rc = dotCmdSafe(p);
+  }else
+
   if( c=='s' &&
      (cli_strncmp(azArg[0], "scanstats",  n)==0 ||
       cli_strncmp(azArg[0], "scanstatus", n)==0)
@@ -38266,6 +38724,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
           int ii, jj;                /* Loop counters */
           int nOff;                  /* Number of disabled optimizations */
           const char *zName;         /* Name of an optimization */
+          int bQuiet = 0;            /* Suppress output echo */
 
           sqlite3_test_control(SQLITE_TESTCTRL_GETOPT, p->db, &curOpt);
           newOpt = curOpt;
@@ -38284,6 +38743,11 @@ static int do_meta_command(const char *zLine, ShellState *p){
             }
             if( useLabel ){
               if( sqlite3_optimization_mask(zLabel,&m)==SQLITE_NOTFOUND ){
+                if( strcmp(zLabel,"q")==0 ){
+                  /* Special -q option suppresses output */
+                  bQuiet = 1;
+                  continue;
+                }
                 cli_printf(stderr,
                     "Error: no such optimization: \"%s\"\n", zLabel);
                 cli_puts("Should be one of: All", stderr);
@@ -38305,29 +38769,31 @@ static int do_meta_command(const char *zLine, ShellState *p){
           if( curOpt!=newOpt ){
             sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS,p->db,newOpt);
           }
-          for(ii=nOff=0, m=1; ii<64; ii++, m <<= 1){
-            if( m & newOpt ) nOff++;
-          }
-          if( nOff<12 ){
-            cli_puts("+All", p->out);
-            for(ii=0, m=1; ii<64; ii++, m <<= 1){
-              if( (newOpt & m)!=0 
-               && (zName = sqlite3_optimization_name(m))!=0
-              ){
-                cli_printf(p->out, " -%s", zName);
+          if( !bQuiet ){
+            for(ii=nOff=0, m=1; ii<64; ii++, m <<= 1){
+              if( m & newOpt ) nOff++;
+            }
+            if( nOff<12 ){
+              cli_puts("+All", p->out);
+              for(ii=0, m=1; ii<64; ii++, m <<= 1){
+                if( (newOpt & m)!=0 
+                 && (zName = sqlite3_optimization_name(m))!=0
+                ){
+                  cli_printf(p->out, " -%s", zName);
+                }
+              }
+            }else{
+              cli_puts("-All", p->out);
+              for(ii=0, m=1; ii<64; ii++, m <<= 1){
+                if( (newOpt & m)==0
+                 && (zName = sqlite3_optimization_name(m))!=0
+                ){
+                  cli_printf(p->out, " +%s", zName);
+                }
               }
             }
-          }else{
-            cli_puts("-All", p->out);
-            for(ii=0, m=1; ii<64; ii++, m <<= 1){
-              if( (newOpt & m)==0
-               && (zName = sqlite3_optimization_name(m))!=0
-              ){
-                cli_printf(p->out, " +%s", zName);
-              }
-            }
+            cli_puts("\n", p->out);
           }
-          cli_puts("\n", p->out);
           rc2 = isOk = 3;
           break;
         }
@@ -39551,6 +40017,7 @@ static const char zOptions[] =
   "   -pcachetrace         trace all page cache operations\n"
   "   -quote               set '.mode quote'\n"
   "   -readonly            open the database read-only\n"
+  "   -runtests SCRIPT...  Run multiple *.sql test script in subprocesses\n"
   "   -safe                enable safe-mode\n"
   "   -screenwidth N       use N as the default screenwidth \n"
   "   -separator SEP       set output column separator. Default: '|'\n"
@@ -39590,6 +40057,127 @@ static void verify_uninitialized(void){
           " initialization.\n");
   }
 }
+
+/*
+** Run a copy of this program as a subprocess
+*/
+static void runShellSubprocess(
+  const char *zProg,
+  const char *zScript,
+  int *pNErr,
+  int *pNTest
+){
+  FILE *in;
+  char *zCmd;
+  const char *zTail;
+  char zIn[1000];
+  zTail = strrchr(zScript, '/');
+  if( zTail ){
+    zTail++;
+  }else{
+    zTail = zScript;
+  }
+#ifdef _WIN32
+  {
+    const char *zBackslash = strrchr(zTail, '\\');
+    if( zBackslash ) zTail = zBackslash+1;
+  }
+#endif
+  sqlite3_fprintf(stdout, "%-24s ", zTail);
+  fflush(stdout);
+  if( !isScriptFile(zScript,0) ){
+    sqlite3_fprintf(stdout, "not an SQL script\n");
+    (*pNErr)++;
+    return;
+  }
+#ifdef _WIN32
+  /* The command runs as "cmd.exe /c COMMAND".  If COMMAND starts with a
+  ** double-quote and contains more than two of them, then cmd.exe removes
+  ** the first and the last double-quote before doing anything else.
+  ** The extra pair of quotes around the whole command is there to be
+  ** removed, so that the quotes on the individual arguments survive. */
+  zCmd = sqlite3_mprintf("\"\"%s\" \"%s\" 2>NUL\"", zProg, zScript);
+#else
+  zCmd = sqlite3_mprintf("\"%s\" \"%s\" 2>/dev/null", zProg, zScript);
+#endif
+  in = sqlite3_popen(zCmd, "r");
+  if( in==0 ){
+    sqlite3_fprintf(stdout, "cannot start subprocess\n");
+    sqlite3_free(zCmd);
+    (*pNErr)++;
+    return;
+  }
+  while( sqlite3_fgets(zIn, sizeof(zIn), in) ){
+    int n = 0;
+    int m = 0;
+    char *zRunWith;
+    zRunWith = strstr(zIn, " run with ");
+    if( zRunWith==0 ) continue;
+    if( zIn[0]<'0' || zIn[0]>'9' ) continue;
+    if( zRunWith[10]<'0' || zRunWith[10]>'9' ) continue;
+    n = atoi(zIn);
+    m = atoi(&zRunWith[10]);
+    if( m==0 ){
+      sqlite3_fprintf(stdout, "tests %5d\n", n);
+    }else{
+      sqlite3_fprintf(stdout, "tests %5d   errors %5d\n", n, m);
+    }
+    (*pNErr) += m;
+    (*pNTest) += n;
+    pclose(in);
+    sqlite3_free(zCmd);
+    return;
+  }
+  pclose(in);
+  sqlite3_free(zCmd);
+  sqlite3_fprintf(stdout, "did not complete\n");
+  fflush(stdout);
+  (*pNErr)++;
+}
+
+#ifdef _WIN32
+/*
+** Run a subprocess for each script file that matches the wildcard zPattern.
+** CMD.EXE does not expand wildcards, so the application must do it.
+** Only the final path component of zPattern may contain wildcards.
+** Return the number of scripts run.
+*/
+static int runShellSubprocessGlob(
+  const char *zProg,
+  const char *zPattern,
+  int *pNErr,
+  int *pNTest
+){
+  WIN32_FIND_DATAW sFind;
+  HANDLE hFind;
+  LPWSTR zW = sqlite3_win32_utf8_to_unicode(zPattern);
+  int nDir;
+  int nRun = 0;
+  shell_check_oom(zW);
+  for(nDir=(int)strlen(zPattern); nDir>0; nDir--){
+    char c = zPattern[nDir-1];
+    if( c=='/' || c=='\\' || c==':' ) break;
+  }
+  hFind = FindFirstFileW(zW, &sFind);
+  sqlite3_free(zW);
+  if( hFind==INVALID_HANDLE_VALUE ) return 0;
+  do{
+    char *zName, *zPath;
+    if( sFind.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ) continue;
+    zName = sqlite3_win32_unicode_to_utf8(sFind.cFileName);
+    zPath = sqlite3_mprintf("%.*s%s", nDir, zPattern, zName);
+    shell_check_oom(zPath);
+    if( isScriptFile(zPath,0) ){  /* Also rejects 8.3-name false matches */
+      runShellSubprocess(zProg, zPath, pNErr, pNTest);
+      nRun++;
+    }
+    sqlite3_free(zPath);
+    sqlite3_free(zName);
+  }while( FindNextFileW(hFind, &sFind) );
+  FindClose(hFind);
+  return nRun;
+}
+#endif
 
 #if HAVE_EDITLINE
 /*
@@ -39771,6 +40359,7 @@ int SQLITE_CDECL main(int argc, char **argv){
   int nCmd = 0;
   int nOptsEnd = argc;
   int bEnableVfstrace = 0;
+  int bTestMode = 0;              /* --runtests option */
   char **azCmd = 0;
   int *aiCmd = 0;
   const char *zVfs = 0;           /* Value of -vfs command-line option */
@@ -39865,7 +40454,11 @@ int SQLITE_CDECL main(int argc, char **argv){
     char *z;
     z = argv[i];
     if( z[0]!='-' || i>nOptsEnd ){
-      if( data.aAuxDb->zDbFilename==0 && !isScriptFile(z,1) ){
+      if( data.aAuxDb->zDbFilename==0
+       && !bTestMode
+       && (z[0]!='.' || !(z[1]>='a' && z[1]<='z'))
+       && !isScriptFile(z,1)
+      ){
         data.aAuxDb->zDbFilename = z;
       }else{
         /* Excess arguments are interpreted as SQL (or dot-commands) and
@@ -40036,6 +40629,8 @@ int SQLITE_CDECL main(int argc, char **argv){
       i++;
     }else if( cli_strcmp(z,"-cmdline-edit")==0 ){
       shellCmdLineEdit = booleanValue(cmdline_option_value(argc,argv,++i));
+    }else if( cli_strcmp(z,"-runtests")==0 ){
+      bTestMode = 1;
     }else if( cli_strcmp(z,"-test-argv")==0 ){
       /* Undocumented test option.  Print the values in argv[] and exit.
       ** Use this to verify that any translation of the argv[], for example
@@ -40050,7 +40645,7 @@ int SQLITE_CDECL main(int argc, char **argv){
       /* Undocumented test option.  Read input normally and process all
       ** dot-commands.  But do not process any SQL.  Instead, whenever input
       ** text would have been processed as SQL, print a one-line summary of
-      ** the input.  This is used by test script to verify that the end-of-SQL
+      ** the input.  This is used by test scripts to verify that the end-of-SQL
       ** parsing logic is working correctly. */
       data.bTestParse = 1;
     }
@@ -40059,6 +40654,35 @@ int SQLITE_CDECL main(int argc, char **argv){
   if( !bEnableVfstrace ) verify_uninitialized();
 #endif
 
+#ifndef SQLITE_SHELL_FIDDLE
+  if( bTestMode ){
+    int nErr = 0;
+    int nTest = 0;
+    int nScript = 0;
+#ifdef _WIN32
+    /* Child processes inherit this.  Without it, a crash in a test script
+    ** might raise a dialog box that stalls the run until it is dismissed. */
+    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+#endif
+    for(i=0; i<nCmd; i++){
+#ifdef _WIN32
+      if( strpbrk(azCmd[i], "*?") ){
+        int n = runShellSubprocessGlob(argv[0], azCmd[i], &nErr, &nTest);
+        if( n>0 ){
+          nScript += n;
+          continue;
+        }
+      }
+#endif
+      runShellSubprocess(argv[0], azCmd[i], &nErr, &nTest);
+      nScript++;
+    }
+    sqlite3_fprintf(stdout, "%-24s tests %5d   errors %5d   scripts %5d\n",
+                    "TOTAL", nTest, nErr, nScript);
+    rc = nErr>0;
+    goto shell_main_exit;
+  }
+#endif
 
 #ifdef SQLITE_SHELL_INIT_PROC
   {
@@ -40352,6 +40976,8 @@ int SQLITE_CDECL main(int argc, char **argv){
     }else if( cli_strcmp(z,"-unsafe-testing")==0 
            || cli_strcmp(z,"-unsafe")==0 ){
       /* Acted upon in first pass. */
+    }else if( cli_strcmp(z,"-runtests")==0 ){
+      /* Acted upon in first pass. */
     }else if( cli_strcmp(z,"-test-parse")==0 ){
       /* Acted upon in first pass. */
     }else{
@@ -40499,6 +41125,7 @@ int SQLITE_CDECL main(int argc, char **argv){
     }
     free(data.aSavedModes);
   }
+  free(data.zEqpFile);
   free(data.zErrPrefix);
   free(data.zNonce);
   free(data.dot.zCopy);

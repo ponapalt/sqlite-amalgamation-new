@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.55.0"
 #define SQLITE_VERSION_NUMBER 3055000
-#define SQLITE_SOURCE_ID      "2026-11-06 16:53:43 9f8bf750d9a0eea4bf9e280008ad9163d84d8c28c2ad6839e0f-experimental"
+#define SQLITE_SOURCE_ID      "2026-11-13 17:01:43 ebcb9bb98fc31604a14273ce7140ea67616bb86846f67ff851b-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-11-06T16:53:43.630Z"
+#define SQLITE_SCM_DATETIME   "2026-11-13T17:01:43.508Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -476,6 +476,7 @@ SQLITE_API int sqlite3_exec(
 #define SQLITE_NOTADB      26   /* File opened that is not a database file */
 #define SQLITE_NOTICE      27   /* Notifications from sqlite3_log() */
 #define SQLITE_WARNING     28   /* Warnings from sqlite3_log() */
+#define SQLITE_MOVED       29   /* Internal use only:  Cursor moved */
 #define SQLITE_ROW         100  /* sqlite3_step() has another row ready */
 #define SQLITE_DONE        101  /* sqlite3_step() has finished executing */
 /* end-of-error-codes */
@@ -2664,7 +2665,7 @@ struct sqlite3_mem_methods {
 ** default value 17, as of SQLite version 3.52.0.  The value was 15 in all
 ** prior versions.<p>
 ** This option takes two arguments which are an integer and a pointer
-** to an integer.  The first argument is a small integer, between 3 and 23, or
+** to an integer.  The first argument is a small integer, between 4 and 23, or
 ** zero.  The FP_DIGITS setting is changed to that small integer, or left
 ** unaltered if the first argument is zero or out of range. The second argument
 ** is a pointer to an integer.  If the pointer is not NULL, then the value of
