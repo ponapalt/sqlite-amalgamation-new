@@ -39013,10 +39013,10 @@ SQLITE_PRIVATE int sqlite3AtoF(const char *zIn, double *pResult){
       z++;
       mState |= 2;
       while( (v = (unsigned)z[0] - '0')<10 ){
-        exp = exp*10 + v + (exp & (0xffULL<<32));
+        exp = exp*10 + v + (exp & (UINT64_C(0xff)<<32));
         z++;
       }
-      d += esign*(exp & ((1ULL<<48)-1));
+      d += esign*(exp & ((((u64)1)<<48)-1));
     }else{
       z--;  /* Leave z[0] at 'e' or '+' or '-',
             ** so that the return is 0 or -1 */
@@ -219574,7 +219574,7 @@ static int jsonConvertInteger(const char *zIn, u32 sz, i64 *pI, double *pR){
     return 1;
   }else{
     memcpy(pI, &u, sizeof(u));
-    if( bNeg && u!=0x8000000000000000ULL ) *pI = -*pI;
+    if( bNeg && u!=(((u64)1)<<63) ) *pI = -*pI;
     return 0;
   }
 }
