@@ -27,6 +27,7 @@
 **   ext/misc/sqlite3_stdio.h
 **   ext/misc/stmtrand.c
 **   ext/misc/strdup.c
+**   ext/misc/tryeval.c
 **   ext/misc/uint.c
 **   ext/misc/vfstrace.c
 **   ext/misc/windirent.h
@@ -1682,6 +1683,24 @@ static int qrfDisplayWidth(const char *zIn, sqlite3_int64 nByte, int *pnNL){
 }
 
 /*
+** Return true if the zero-terminated string zIn contains any character
+** that is more than one column wide.
+*/
+static int qrfHasWideChar(const char *zIn){
+  const unsigned char *z = (const unsigned char*)zIn;
+  while( z[0] ){
+    if( z[0]>=0xc0 ){
+      int u = 0;
+      z += sqlite3_qrf_decode_utf8(z, &u);
+      if( sqlite3_qrf_wcwidth(u)>1 ) return 1;
+    }else{
+      z++;
+    }
+  }
+  return 0;
+}
+
+/*
 ** Escape the text starting at byte iStart of pStr, if needed, using the
 ** escape encoding of eEsc, which is either QRF_ESC_Ascii or QRF_ESC_Symbol.
 ** The pStr string is modified appropriately.
@@ -3112,6 +3131,17 @@ static void qrfColumnar(Qrf *p){
       if( p->spec.nWrap>0 && w>p->spec.nWrap ){
         w = p->spec.nWrap;
         data.bMultiRow = 1;
+        if( w==1 ){
+          /* A double-wide character needs a column at least 2 wide, so
+          ** that qrfWrapLine() always makes progress. */
+          int jj;
+          for(jj=i; jj<data.n; jj+=nColumn){
+            if( qrfHasWideChar(data.az[jj]) ){
+              w = 2;
+              break;
+            }
+          }
+        }
       }
     }else if( (data.bMultiRow==0 || w==1) && data.a[i].mxW>w ){
       data.bMultiRow = 1;
@@ -3239,6 +3269,7 @@ static void qrfColumnar(Qrf *p){
         int iNext = 0;
         int nWS;
         qrfWrapLine(data.a[j].z, data.a[j].w, bWW, &nThis, &nWide, &iNext);
+        assert( iNext>0 || data.a[j].z[0]==0 );
         nWS = data.a[j].w - nWide;
         qrfPrintAligned(p->pOut, &data.a[j], nThis, nWS);
         data.a[j].z += iNext;
@@ -8326,6 +8357,963 @@ int sqlite3_ieee_init(
 }
 
 /************************* End ext/misc/ieee754.c ********************/
+/************************* Begin ext/misc/regexp.c ******************/
+/*
+** 2012-11-13
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** The code in this file implements a compact but reasonably
+** efficient regular-expression matcher for posix extended regular
+** expressions against UTF8 text.
+**
+** This file is an SQLite extension.  It registers a single function
+** named "regexp(A,B)" where A is the regular expression and B is the
+** string to be matched.  By registering this function, SQLite will also
+** then implement the "B regexp A" operator.  Note that with the function
+** the regular expression comes first, but with the operator it comes
+** second.
+**
+**  The following regular expression syntax is supported:
+**
+**     X*      zero or more occurrences of X
+**     X+      one or more occurrences of X
+**     X?      zero or one occurrences of X
+**     X{p,q}  between p and q occurrences of X
+**     X{p,}   p or more occurrences of X
+**     (X)     match X
+**     X|Y     X or Y
+**     ^X      X occurring at the beginning of the string
+**     X$      X occurring at the end of the string
+**     .       Match any single character
+**     \c      Character c where c is one of \{}()[]|*+?-.
+**     \c      C-language escapes for c in afnrtv.  ex: \t or \n
+**     \uXXXX  Where XXXX is exactly 4 hex digits, unicode value XXXX
+**     \xXX    Where XX is exactly 2 hex digits, unicode value XX
+**     [abc]   Any single character from the set abc
+**     [^abc]  Any single character not in the set abc
+**     [a-z]   Any single character in the range a-z
+**     [^a-z]  Any single character not in the range a-z
+**     \b      Word boundary
+**     \w      Word character.  [A-Za-z0-9_]
+**     \W      Non-word character
+**     \d      Digit
+**     \D      Non-digit
+**     \s      Whitespace character
+**     \S      Non-whitespace character
+**
+** A nondeterministic finite automaton (NFA) is used for matching, so the
+** performance is bounded by O(N*M) where N is the size of the regular
+** expression and M is the size of the input string.  The matcher never
+** exhibits exponential behavior.  Note that the X{p,q} operator expands
+** to p copies of X following by q-p copies of X? and that the size of the
+** regular expression in the O(N*M) performance bound is computed after
+** this expansion.
+**
+** To help prevent DoS attacks, the maximum size of the NFA is restricted.
+*/
+#include <string.h>
+#include <stdlib.h>
+/* #include "sqlite3ext.h" */
+SQLITE_EXTENSION_INIT1
+
+/*
+** The following #defines change the names of some functions implemented in
+** this file to prevent name collisions with C-library functions of the
+** same name.
+*/
+#define re_match   sqlite3re_match
+#define re_compile sqlite3re_compile
+#define re_free    sqlite3re_free
+
+/* The end-of-input character */
+#define RE_EOF            0    /* End of input */
+#define RE_START  0xfffffff    /* Start of input - larger than an UTF-8 */
+
+/* The NFA is implemented as sequence of opcodes taken from the following
+** set.  Each opcode has a single integer argument.
+*/
+#define RE_OP_MATCH       1    /* Match the one character in the argument */
+#define RE_OP_ANY         2    /* Match any one character.  (Implements ".") */
+#define RE_OP_ANYSTAR     3    /* Special optimized version of .* */
+#define RE_OP_FORK        4    /* Continue to both next and opcode at iArg */
+#define RE_OP_GOTO        5    /* Jump to opcode at iArg */
+#define RE_OP_ACCEPT      6    /* Halt and indicate a successful match */
+#define RE_OP_CC_INC      7    /* Beginning of a [...] character class */
+#define RE_OP_CC_EXC      8    /* Beginning of a [^...] character class */
+#define RE_OP_CC_VALUE    9    /* Single value in a character class */
+#define RE_OP_CC_RANGE   10    /* Range of values in a character class */
+#define RE_OP_WORD       11    /* Perl word character [A-Za-z0-9_] */
+#define RE_OP_NOTWORD    12    /* Not a perl word character */
+#define RE_OP_DIGIT      13    /* digit:  [0-9] */
+#define RE_OP_NOTDIGIT   14    /* Not a digit */
+#define RE_OP_SPACE      15    /* space:  [ \t\n\r\v\f] */
+#define RE_OP_NOTSPACE   16    /* Not a digit */
+#define RE_OP_BOUNDARY   17    /* Boundary between word and non-word */
+#define RE_OP_ATSTART    18    /* Currently at the start of the string */
+#define RE_OP_ATEND      19    /* Currently at the end of the string */
+
+/* Each opcode is a "state" in the NFA */
+typedef unsigned short ReStateNumber;
+
+/* Because this is an NFA and not a DFA, multiple states can be active at
+** once.  An instance of the following object records all active states in
+** the NFA.  The implementation is optimized for the common case where the
+** number of actives states is small.
+*/
+typedef struct ReStateSet {
+  unsigned nState;            /* Number of current states */
+  ReStateNumber *aState;      /* Current states */
+} ReStateSet;
+
+/* An input string read one character at a time.
+*/
+typedef struct ReInput ReInput;
+struct ReInput {
+  const unsigned char *z;  /* All text */
+  int i;                   /* Next byte to read */
+  int mx;                  /* EOF when i>=mx */
+};
+
+/* A compiled NFA (or an NFA that is in the process of being compiled) is
+** an instance of the following object.
+*/
+typedef struct ReCompiled ReCompiled;
+struct ReCompiled {
+  ReInput sIn;                /* Regular expression text */
+  const char *zErr;           /* Error message to return */
+  char *aOp;                  /* Operators for the virtual machine */
+  int *aArg;                  /* Arguments to each operator */
+  unsigned (*xNextChar)(ReInput*);  /* Next character function */
+  unsigned char zInit[12];    /* Initial text to match */
+  int nInit;                  /* Number of bytes in zInit */
+  unsigned nState;            /* Number of entries in aOp[] and aArg[] */
+  unsigned nAlloc;            /* Slots allocated for aOp[] and aArg[] */
+  unsigned mxAlloc;           /* Complexity limit */
+};
+
+/* Add a state to the given state set if it is not already there */
+static void re_add_state(ReStateSet *pSet, int newState){
+  unsigned i;
+  for(i=0; i<pSet->nState; i++) if( pSet->aState[i]==newState ) return;
+  pSet->aState[pSet->nState++] = (ReStateNumber)newState;
+}
+
+/* Extract the next unicode character from *pzIn and return it.  Advance
+** *pzIn to the first byte past the end of the character returned.  To
+** be clear:  this routine converts utf8 to unicode.  This routine is 
+** optimized for the common case where the next character is a single byte.
+*/
+static unsigned re_next_char(ReInput *p){
+  unsigned c;
+  if( p->i>=p->mx ) return 0;
+  c = p->z[p->i++];
+  if( c>=0x80 ){
+    if( (c&0xe0)==0xc0 && p->i<p->mx && (p->z[p->i]&0xc0)==0x80 ){
+      c = (c&0x1f)<<6 | (p->z[p->i++]&0x3f);
+      if( c<0x80 ) c = 0xfffd;
+    }else if( (c&0xf0)==0xe0 && p->i+1<p->mx && (p->z[p->i]&0xc0)==0x80
+           && (p->z[p->i+1]&0xc0)==0x80 ){
+      c = (c&0x0f)<<12 | ((p->z[p->i]&0x3f)<<6) | (p->z[p->i+1]&0x3f);
+      p->i += 2;
+      if( c<=0x7ff || (c>=0xd800 && c<=0xdfff) ) c = 0xfffd;
+    }else if( (c&0xf8)==0xf0 && p->i+2<p->mx && (p->z[p->i]&0xc0)==0x80
+           && (p->z[p->i+1]&0xc0)==0x80 && (p->z[p->i+2]&0xc0)==0x80 ){
+      c = (c&0x07)<<18 | ((p->z[p->i]&0x3f)<<12) | ((p->z[p->i+1]&0x3f)<<6)
+                       | (p->z[p->i+2]&0x3f);
+      p->i += 3;
+      if( c<=0xffff || c>0x10ffff ) c = 0xfffd;
+    }else{
+      c = 0xfffd;
+    }
+  }
+  return c;
+}
+static unsigned re_next_char_nocase(ReInput *p){
+  unsigned c = re_next_char(p);
+  if( c>='A' && c<='Z' ) c += 'a' - 'A';
+  return c;
+}
+
+/* Return true if c is a perl "word" character:  [A-Za-z0-9_] */
+static int re_word_char(int c){
+  return (c>='0' && c<='9') || (c>='a' && c<='z')
+      || (c>='A' && c<='Z') || c=='_';
+}
+
+/* Return true if c is a "digit" character:  [0-9] */
+static int re_digit_char(int c){
+  return (c>='0' && c<='9');
+}
+
+/* Return true if c is a perl "space" character:  [ \t\r\n\v\f] */
+static int re_space_char(int c){
+  return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\v' || c=='\f';
+}
+
+/* Run a compiled regular expression on the zero-terminated input
+** string zIn[].  Return true on a match and false if there is no match.
+*/
+static int re_match(ReCompiled *pRe, const unsigned char *zIn, int nIn){
+  ReStateSet aStateSet[2], *pThis, *pNext;
+  ReStateNumber aSpace[100];
+  ReStateNumber *pToFree;
+  unsigned int i = 0;
+  unsigned int iSwap = 0;
+  int c = RE_START;
+  int cPrev = 0;
+  int rc = 0;
+  ReInput in;
+
+  in.z = zIn;
+  in.i = 0;
+  in.mx = nIn>=0 ? nIn : (int)strlen((char const*)zIn);
+
+  /* Look for the initial prefix match, if there is one. */
+  if( pRe->nInit ){
+    unsigned char x = pRe->zInit[0];
+    while( in.i+pRe->nInit<=in.mx 
+     && (zIn[in.i]!=x ||
+         strncmp((const char*)zIn+in.i, (const char*)pRe->zInit, pRe->nInit)!=0)
+    ){
+      in.i++;
+    }
+    if( in.i+pRe->nInit>in.mx ) return 0;
+    c = RE_START-1;
+  }
+
+  if( pRe->nState<=(sizeof(aSpace)/(sizeof(aSpace[0])*2)) ){
+    pToFree = 0;
+    aStateSet[0].aState = aSpace;
+  }else{
+    pToFree = sqlite3_malloc64( sizeof(ReStateNumber)*2*pRe->nState );
+    if( pToFree==0 ) return -1;
+    aStateSet[0].aState = pToFree;
+  }
+  aStateSet[1].aState = &aStateSet[0].aState[pRe->nState];
+  pNext = &aStateSet[1];
+  pNext->nState = 0;
+  re_add_state(pNext, 0);
+  while( c!=RE_EOF && pNext->nState>0 ){
+    cPrev = c;
+    c = pRe->xNextChar(&in);
+    pThis = pNext;
+    pNext = &aStateSet[iSwap];
+    iSwap = 1 - iSwap;
+    pNext->nState = 0;
+    for(i=0; i<pThis->nState; i++){
+      int x = pThis->aState[i];
+      switch( pRe->aOp[x] ){
+        case RE_OP_MATCH: {
+          if( pRe->aArg[x]==c ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_ATSTART: {
+          if( cPrev==RE_START ) re_add_state(pThis, x+1);
+          break;
+        }
+        case RE_OP_ATEND: {
+          if( c==RE_EOF ) re_add_state(pThis, x+1);
+          break;
+        }
+        case RE_OP_ANY: {
+          if( c!=0 ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_WORD: {
+          if( re_word_char(c) ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_NOTWORD: {
+          if( !re_word_char(c) && c!=0 ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_DIGIT: {
+          if( re_digit_char(c) ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_NOTDIGIT: {
+          if( !re_digit_char(c) && c!=0 ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_SPACE: {
+          if( re_space_char(c) ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_NOTSPACE: {
+          if( !re_space_char(c) && c!=0 ) re_add_state(pNext, x+1);
+          break;
+        }
+        case RE_OP_BOUNDARY: {
+          if( re_word_char(c)!=re_word_char(cPrev) ) re_add_state(pThis, x+1);
+          break;
+        }
+        case RE_OP_ANYSTAR: {
+          re_add_state(pNext, x);
+          re_add_state(pThis, x+1);
+          break;
+        }
+        case RE_OP_FORK: {
+          re_add_state(pThis, x+pRe->aArg[x]);
+          re_add_state(pThis, x+1);
+          break;
+        }
+        case RE_OP_GOTO: {
+          re_add_state(pThis, x+pRe->aArg[x]);
+          break;
+        }
+        case RE_OP_ACCEPT: {
+          rc = 1;
+          goto re_match_end;
+        }
+        case RE_OP_CC_EXC: {
+          if( c==0 ) break;
+          /* fall-through */ goto re_op_cc_inc;
+        }
+        case RE_OP_CC_INC: re_op_cc_inc: {
+          int j = 1;
+          int n = pRe->aArg[x];
+          int hit = 0;
+          for(j=1; j>0 && j<n; j++){
+            if( pRe->aOp[x+j]==RE_OP_CC_VALUE ){
+              if( pRe->aArg[x+j]==c ){
+                hit = 1;
+                j = -1;
+              }
+            }else{
+              if( pRe->aArg[x+j]<=c && pRe->aArg[x+j+1]>=c ){
+                hit = 1;
+                j = -1;
+              }else{
+                j++;
+              }
+            }
+          }
+          if( pRe->aOp[x]==RE_OP_CC_EXC ) hit = !hit;
+          if( hit ) re_add_state(pNext, x+n);
+          break;
+        }
+      }
+    }
+  }
+  for(i=0; i<pNext->nState; i++){
+    int x = pNext->aState[i];
+    while( pRe->aOp[x]==RE_OP_GOTO ) x += pRe->aArg[x];
+    if( pRe->aOp[x]==RE_OP_ACCEPT ){ rc = 1; break; }
+  }
+re_match_end:
+  sqlite3_free(pToFree);
+  return rc;
+}
+
+/* Resize the opcode and argument arrays for an RE under construction.
+*/
+static int re_resize(ReCompiled *p, unsigned int N){
+  char *aOp;
+  int *aArg;
+  if( N>p->mxAlloc ){ p->zErr = "REGEXP pattern too big"; return 1; }
+  aOp = sqlite3_realloc64(p->aOp, N*sizeof(p->aOp[0]));
+  if( aOp==0 ){ p->zErr = "out of memory"; return 1; }
+  p->aOp = aOp;
+  aArg = sqlite3_realloc64(p->aArg, N*sizeof(p->aArg[0]));
+  if( aArg==0 ){ p->zErr = "out of memory"; return 1; }
+  p->aArg = aArg;
+  p->nAlloc = N;
+  return 0;
+}
+
+/* Insert a new opcode and argument into an RE under construction.  The
+** insertion point is just prior to existing opcode iBefore.
+*/
+static int re_insert(ReCompiled *p, int iBefore, int op, int arg){
+  int i;
+  if( p->nAlloc<=p->nState && re_resize(p, p->nAlloc*2) ) return 0;
+  for(i=p->nState; i>iBefore; i--){
+    p->aOp[i] = p->aOp[i-1];
+    p->aArg[i] = p->aArg[i-1];
+  }
+  p->nState++;
+  p->aOp[iBefore] = (char)op;
+  p->aArg[iBefore] = arg;
+  return iBefore;
+}
+
+/* Append a new opcode and argument to the end of the RE under construction.
+*/
+static int re_append(ReCompiled *p, int op, int arg){
+  return re_insert(p, p->nState, op, arg);
+}
+
+/* Make a copy of N opcodes starting at iStart onto the end of the RE
+** under construction.
+*/
+static void re_copy(ReCompiled *p, int iStart, unsigned int N){
+  if( p->nState+N>=p->nAlloc && re_resize(p, p->nAlloc*2+N) ) return;
+  memcpy(&p->aOp[p->nState], &p->aOp[iStart], N*sizeof(p->aOp[0]));
+  memcpy(&p->aArg[p->nState], &p->aArg[iStart], N*sizeof(p->aArg[0]));
+  p->nState += N;
+}
+
+/* Return true if c is a hexadecimal digit character:  [0-9a-fA-F]
+** If c is a hex digit, also set *pV = (*pV)*16 + valueof(c).  If
+** c is not a hex digit *pV is unchanged.
+*/
+static int re_hex(int c, int *pV){
+  if( c>='0' && c<='9' ){
+    c -= '0';
+  }else if( c>='a' && c<='f' ){
+    c -= 'a' - 10;
+  }else if( c>='A' && c<='F' ){
+    c -= 'A' - 10;
+  }else{
+    return 0;
+  }
+  *pV = (*pV)*16 + (c & 0xff);
+  return 1;
+}
+
+/* A backslash character has been seen, read the next character and
+** return its interpretation.
+*/
+static unsigned re_esc_char(ReCompiled *p){
+  static const char zEsc[] = "afnrtv\\()*.+?[$^{|}]-";
+  static const char zTrans[] = "\a\f\n\r\t\v";
+  int i, v = 0;
+  char c;
+  if( p->sIn.i>=p->sIn.mx ){
+    p->zErr = "unknown \\ escape";
+    return 0;
+  }
+  c = p->sIn.z[p->sIn.i];
+  if( c=='u' && p->sIn.i+4<p->sIn.mx ){
+    const unsigned char *zIn = p->sIn.z + p->sIn.i;
+    if( re_hex(zIn[1],&v)
+     && re_hex(zIn[2],&v)
+     && re_hex(zIn[3],&v)
+     && re_hex(zIn[4],&v)
+    ){
+      p->sIn.i += 5;
+      return v;
+    }
+  }
+  if( c=='x' && p->sIn.i+2<p->sIn.mx ){
+    const unsigned char *zIn = p->sIn.z + p->sIn.i;
+    if( re_hex(zIn[1],&v)
+     && re_hex(zIn[2],&v)
+    ){
+      p->sIn.i += 3;
+      return v;
+    }
+  }
+  for(i=0; zEsc[i] && zEsc[i]!=c; i++){}
+  if( zEsc[i] ){
+    if( i<6 ) c = zTrans[i];
+    p->sIn.i++;
+  }else{
+    p->zErr = "unknown \\ escape";
+  }
+  return c;
+}
+
+/* Forward declaration */
+static const char *re_subcompile_string(ReCompiled*);
+
+/* Peek at the next byte of input */
+static unsigned char rePeek(ReCompiled *p){
+  return p->sIn.i<p->sIn.mx ? p->sIn.z[p->sIn.i] : 0;
+}
+
+/* Compile RE text into a sequence of opcodes.  Continue up to the
+** first unmatched ")" character, then return.  If an error is found,
+** return a pointer to the error message string.
+*/
+static const char *re_subcompile_re(ReCompiled *p){
+  const char *zErr;
+  int iStart, iEnd, iGoto;
+  iStart = p->nState;
+  zErr = re_subcompile_string(p);
+  if( zErr ) return zErr;
+  while( rePeek(p)=='|' ){
+    iEnd = p->nState;
+    re_insert(p, iStart, RE_OP_FORK, iEnd + 2 - iStart);
+    iGoto = re_append(p, RE_OP_GOTO, 0);
+    p->sIn.i++;
+    zErr = re_subcompile_string(p);
+    if( zErr ) return zErr;
+    p->aArg[iGoto] = p->nState - iGoto;
+  }
+  return 0;
+}
+
+/* Compile an element of regular expression text (anything that can be
+** an operand to the "|" operator).  Return NULL on success or a pointer
+** to the error message if there is a problem.
+*/
+static const char *re_subcompile_string(ReCompiled *p){
+  int iPrev = -1;
+  int iStart;
+  unsigned c;
+  const char *zErr;
+  while( (c = p->xNextChar(&p->sIn))!=0 ){
+    iStart = p->nState;
+    switch( c ){
+      case '|':
+      case ')': {
+        p->sIn.i--;
+        return 0;
+      }
+      case '(': {
+        zErr = re_subcompile_re(p);
+        if( zErr ) return zErr;
+        if( rePeek(p)!=')' ) return "unmatched '('";
+        p->sIn.i++;
+        break;
+      }
+      case '.': {
+        if( rePeek(p)=='*' ){
+          re_append(p, RE_OP_ANYSTAR, 0);
+          p->sIn.i++;
+        }else{
+          re_append(p, RE_OP_ANY, 0);
+        }
+        break;
+      }
+      case '*': {
+        if( iPrev<0 ) return "'*' without operand";
+        re_insert(p, iPrev, RE_OP_GOTO, p->nState - iPrev + 1);
+        re_append(p, RE_OP_FORK, iPrev - p->nState + 1);
+        break;
+      }
+      case '+': {
+        if( iPrev<0 ) return "'+' without operand";
+        re_append(p, RE_OP_FORK, iPrev - p->nState);
+        break;
+      }
+      case '?': {
+        if( iPrev<0 ) return "'?' without operand";
+        re_insert(p, iPrev, RE_OP_FORK, p->nState - iPrev+1);
+        break;
+      }
+      case '$': {
+        re_append(p, RE_OP_ATEND, 0);
+        break;
+      }
+      case '^': {
+        re_append(p, RE_OP_ATSTART, 0);
+        break;
+      }
+      case '{': {
+        unsigned int m = 0, n = 0;
+        unsigned int sz, j;
+        int bOpen = 0;          /* True for the open-ended form X{m,} */
+        if( iPrev<0 ) return "'{m,n}' without operand";
+        while( (c=rePeek(p))>='0' && c<='9' ){
+          m = m*10 + c - '0';
+          if( m*2>p->mxAlloc ) return "REGEXP pattern too big";
+          p->sIn.i++;
+        }
+        n = m;
+        if( c==',' ){
+          p->sIn.i++;
+          n = 0;
+          if( rePeek(p)=='}' ) bOpen = 1;
+          while( (c=rePeek(p))>='0' && c<='9' ){
+            n = n*10 + c-'0';
+            if( n*2>p->mxAlloc ) return "REGEXP pattern too big";
+            p->sIn.i++;
+          }
+        }
+        if( c!='}' ) return "unmatched '{'";
+        if( !bOpen && n<m ) return "n less than m in '{m,n}'";
+        p->sIn.i++;
+        sz = p->nState - iPrev;
+        if( m==0 && bOpen ){
+          /* X{0,} is the same as X* */
+          re_insert(p, iPrev, RE_OP_GOTO, sz+1);
+          re_append(p, RE_OP_FORK, -(int)sz);
+          break;
+        }
+        if( m==0 ){
+          if( n==0 ) return "both m and n are zero in '{m,n}'";
+          re_insert(p, iPrev, RE_OP_FORK, sz+1);
+          iPrev++;
+          n--;
+        }else{
+          for(j=1; j<m; j++) re_copy(p, iPrev, sz);
+        }
+        for(j=m; j<n; j++){
+          re_append(p, RE_OP_FORK, sz+1);
+          re_copy(p, iPrev, sz);
+        }
+        if( bOpen ){
+          re_append(p, RE_OP_FORK, -(int)sz);
+        }
+        break;
+      }
+      case '[': {
+        unsigned int iFirst = p->nState;
+        if( rePeek(p)=='^' ){
+          re_append(p, RE_OP_CC_EXC, 0);
+          p->sIn.i++;
+        }else{
+          re_append(p, RE_OP_CC_INC, 0);
+        }
+        while( (c = p->xNextChar(&p->sIn))!=0 ){
+          if( c=='[' && rePeek(p)==':' ){
+            return "POSIX character classes not supported";
+          }
+          if( c=='\\' ) c = re_esc_char(p);
+          if( rePeek(p)=='-' ){
+            re_append(p, RE_OP_CC_RANGE, c);
+            p->sIn.i++;
+            c = p->xNextChar(&p->sIn);
+            if( c=='\\' ) c = re_esc_char(p);
+            re_append(p, RE_OP_CC_RANGE, c);
+          }else{
+            re_append(p, RE_OP_CC_VALUE, c);
+          }
+          if( rePeek(p)==']' ){ p->sIn.i++; break; }
+        }
+        if( c==0 ) return "unclosed '['";
+        if( p->nState>iFirst ) p->aArg[iFirst] = p->nState - iFirst;
+        break;
+      }
+      case '\\': {
+        int specialOp = 0;
+        switch( rePeek(p) ){
+          case 'b': specialOp = RE_OP_BOUNDARY;   break;
+          case 'd': specialOp = RE_OP_DIGIT;      break;
+          case 'D': specialOp = RE_OP_NOTDIGIT;   break;
+          case 's': specialOp = RE_OP_SPACE;      break;
+          case 'S': specialOp = RE_OP_NOTSPACE;   break;
+          case 'w': specialOp = RE_OP_WORD;       break;
+          case 'W': specialOp = RE_OP_NOTWORD;    break;
+        }
+        if( specialOp ){
+          p->sIn.i++;
+          re_append(p, specialOp, 0);
+        }else{
+          c = re_esc_char(p);
+          re_append(p, RE_OP_MATCH, c);
+        }
+        break;
+      }
+      default: {
+        re_append(p, RE_OP_MATCH, c);
+        break;
+      }
+    }
+    iPrev = iStart;
+  }
+  return 0;
+}
+
+/* Free and reclaim all the memory used by a previously compiled
+** regular expression.  Applications should invoke this routine once
+** for every call to re_compile() to avoid memory leaks.
+*/
+static void re_free(ReCompiled *pRe){
+  if( pRe ){
+    sqlite3_free(pRe->aOp);
+    sqlite3_free(pRe->aArg);
+    sqlite3_free(pRe);
+  }
+}
+
+/*
+** Version of re_free() that accepts a pointer of type (void*). Required
+** to satisfy sanitizers when the re_free() function is called via a
+** function pointer.
+*/
+static void re_free_voidptr(void *p){
+  re_free((ReCompiled*)p);
+}
+
+/*
+** Compile a textual regular expression in zIn[] into a compiled regular
+** expression suitable for us by re_match() and return a pointer to the
+** compiled regular expression in *ppRe.  Return NULL on success or an
+** error message if something goes wrong.
+*/
+static const char *re_compile(
+  ReCompiled **ppRe,      /* OUT: write compiled NFA here */
+  const char *zIn,        /* Input regular expression */
+  int mxRe,               /* Complexity limit */
+  int noCase              /* True for caseless comparisons */
+){
+  ReCompiled *pRe;
+  const char *zErr;
+  int i, j;
+
+  *ppRe = 0;
+  pRe = sqlite3_malloc64( sizeof(*pRe) );
+  if( pRe==0 ){
+    return "out of memory";
+  }
+  memset(pRe, 0, sizeof(*pRe));
+  pRe->xNextChar = noCase ? re_next_char_nocase : re_next_char;
+  pRe->mxAlloc = mxRe;
+  if( re_resize(pRe, 30) ){
+    zErr = pRe->zErr;
+    re_free(pRe);
+    return zErr;
+  }
+  re_append(pRe, RE_OP_ANYSTAR, 0);
+  pRe->sIn.z = (unsigned char*)zIn;
+  pRe->sIn.i = 0;
+  pRe->sIn.mx = (int)strlen(zIn);
+  zErr = re_subcompile_re(pRe);
+  if( zErr ){
+    re_free(pRe);
+    return zErr;
+  }
+  if( pRe->sIn.i>=pRe->sIn.mx ){
+    re_append(pRe, RE_OP_ACCEPT, 0);
+    *ppRe = pRe;
+  }else{
+    re_free(pRe);
+    return "unrecognized character";
+  }
+
+  /* If the regex begins with "^" and has no "|" at the top level, then
+  ** the whole regex is anchored at the start of the input and the
+  ** initial ".*" is not needed.  Convert it into a no-op so that
+  ** re_match() can stop as soon as the start of the input fails to
+  ** match.  A "|" at the top level would have caused a FORK to be
+  ** inserted at aOp[1], so aOp[1]==RE_OP_ATSTART is sufficient.  Do
+  ** not remove the initial "^" itself, as there might be jumps back
+  ** to it, as in "^+". */
+  if( pRe->aOp[1]==RE_OP_ATSTART ){
+    pRe->aOp[0] = RE_OP_GOTO;
+    pRe->aArg[0] = 1;
+  }
+
+  /* The following is a performance optimization.  If the regex begins with
+  ** ".*" (if the input regex lacks an initial "^") and afterwards there are
+  ** one or more matching characters, enter those matching characters into
+  ** zInit[].  The re_match() routine can then search ahead in the input 
+  ** string looking for the initial match without having to run the whole
+  ** regex engine over the string.  Do not worry about trying to match
+  ** unicode characters beyond plane 0 - those are very rare and this is
+  ** just an optimization. */
+  if( pRe->aOp[0]==RE_OP_ANYSTAR && !noCase ){
+    for(j=0, i=1; j<(int)sizeof(pRe->zInit)-2 && pRe->aOp[i]==RE_OP_MATCH; i++){
+      unsigned x = pRe->aArg[i];
+      if( x<=0x7f ){
+        pRe->zInit[j++] = (unsigned char)x;
+      }else if( x<=0x7ff ){
+        pRe->zInit[j++] = (unsigned char)(0xc0 | (x>>6));
+        pRe->zInit[j++] = 0x80 | (x&0x3f);
+      }else if( x<=0xffff ){
+        pRe->zInit[j++] = (unsigned char)(0xe0 | (x>>12));
+        pRe->zInit[j++] = 0x80 | ((x>>6)&0x3f);
+        pRe->zInit[j++] = 0x80 | (x&0x3f);
+      }else{
+        break;
+      }
+    }
+    if( j>0 && pRe->zInit[j-1]==0 ) j--;
+    pRe->nInit = j;
+  }
+  return pRe->zErr;
+}
+
+/*
+** The value of LIMIT_MAX_PATTERN_LENGTH.
+*/
+static int re_maxlen(sqlite3_context *context){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  return sqlite3_limit(db, SQLITE_LIMIT_LIKE_PATTERN_LENGTH,-1);
+}
+
+/*
+** Maximum NFA size given a maximum pattern length.
+*/
+static int re_maxnfa(int mxlen){
+  return 75+mxlen/2;
+}
+
+/*
+** Implementation of the regexp() SQL function.  This function implements
+** the build-in REGEXP operator.  The first argument to the function is the
+** pattern and the second argument is the string.  So, the SQL statements:
+**
+**       A REGEXP B
+**
+** is implemented as regexp(B,A).
+*/
+static void re_sql_func(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  ReCompiled *pRe;          /* Compiled regular expression */
+  const char *zPattern;     /* The regular expression */
+  const unsigned char *zStr;/* String being searched */
+  const char *zErr;         /* Compile error message */
+  int setAux = 0;           /* True to invoke sqlite3_set_auxdata() */
+
+  (void)argc;  /* Unused */
+  pRe = sqlite3_get_auxdata(context, 0);
+  if( pRe==0 ){
+    int mxLen = re_maxlen(context);
+    int nPattern;
+    zPattern = (const char*)sqlite3_value_text(argv[0]);
+    if( zPattern==0 ) return;
+    nPattern = sqlite3_value_bytes(argv[0]);
+    if( nPattern>mxLen ){
+      zErr = "REGEXP pattern too big";
+    }else{
+      zErr = re_compile(&pRe, zPattern, re_maxnfa(mxLen),
+                        sqlite3_user_data(context)!=0);
+    }
+    if( zErr ){
+      re_free(pRe);
+      sqlite3_result_error(context, zErr, -1);
+      return;
+    }
+    if( pRe==0 ){
+      sqlite3_result_error_nomem(context);
+      return;
+    }
+    setAux = 1;
+  }
+  zStr = (const unsigned char*)sqlite3_value_text(argv[1]);
+  if( zStr!=0 ){
+    sqlite3_result_int(context, re_match(pRe, zStr, -1));
+  }
+  if( setAux ){
+    sqlite3_set_auxdata(context, 0, pRe, re_free_voidptr);
+  }
+}
+
+#if defined(SQLITE_DEBUG)
+/*
+** This function is used for testing and debugging only.  It is only available
+** if the SQLITE_DEBUG compile-time option is used.
+**
+** Compile a regular expression and then convert the compiled expression into
+** text and return that text.
+*/
+static void re_bytecode_func(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const char *zPattern;
+  const char *zErr;
+  ReCompiled *pRe;
+  sqlite3_str *pStr;
+  int i;
+  int n;
+  char *z;
+  static const char *ReOpName[] = {
+    "EOF",
+    "MATCH",
+    "ANY",
+    "ANYSTAR",
+    "FORK",
+    "GOTO",
+    "ACCEPT",
+    "CC_INC",
+    "CC_EXC",
+    "CC_VALUE",
+    "CC_RANGE",
+    "WORD",
+    "NOTWORD",
+    "DIGIT",
+    "NOTDIGIT",
+    "SPACE",
+    "NOTSPACE",
+    "BOUNDARY",
+    "ATSTART",
+    "ATEND",
+  };
+
+  (void)argc;
+  zPattern = (const char*)sqlite3_value_text(argv[0]);
+  if( zPattern==0 ) return;
+  zErr = re_compile(&pRe, zPattern, re_maxnfa(re_maxlen(context)),
+                    sqlite3_user_data(context)!=0);
+  if( zErr ){
+    re_free(pRe);
+    sqlite3_result_error(context, zErr, -1);
+    return;
+  }
+  if( pRe==0 ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  pStr = sqlite3_str_new(0);
+  if( pRe->nInit>0 ){
+    sqlite3_str_appendf(pStr, "INIT     ");
+    for(i=0; i<pRe->nInit; i++){
+      sqlite3_str_appendf(pStr, "%02x", pRe->zInit[i]);
+    }
+    sqlite3_str_appendf(pStr, "\n");
+  }
+  for(i=0; (unsigned)i<pRe->nState; i++){
+    sqlite3_str_appendf(pStr, "%-8s %4d\n",
+         ReOpName[(unsigned char)pRe->aOp[i]], pRe->aArg[i]);
+  }
+  if( sqlite3_str_errcode(pStr)==SQLITE_NOMEM ){
+    sqlite3_str_finish(pStr);
+    re_free(pRe);
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  n = sqlite3_str_length(pStr);
+  z = sqlite3_str_finish(pStr);
+  sqlite3_result_text(context, z, n-1, sqlite3_free);
+  re_free(pRe);
+}
+
+#endif /* SQLITE_DEBUG */
+
+
+/*
+** Invoke this routine to register the regexp() function with the
+** SQLite database connection.
+*/
+#ifdef _WIN32
+
+#endif
+int sqlite3_regexp_init(
+  sqlite3 *db, 
+  char **pzErrMsg, 
+  const sqlite3_api_routines *pApi
+){
+  int rc = SQLITE_OK;
+  SQLITE_EXTENSION_INIT2(pApi);
+  (void)pzErrMsg;  /* Unused */
+  rc = sqlite3_create_function(db, "regexp", 2, 
+                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+                            0, re_sql_func, 0, 0);
+  if( rc==SQLITE_OK ){
+    /* The regexpi(PATTERN,STRING) function is a case-insensitive version
+    ** of regexp(PATTERN,STRING). */
+    rc = sqlite3_create_function(db, "regexpi", 2,
+                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+                            (void*)db, re_sql_func, 0, 0);
+#if defined(SQLITE_DEBUG)
+    if( rc==SQLITE_OK ){
+      rc = sqlite3_create_function(db, "regexp_bytecode", 1,
+                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+                            0, re_bytecode_func, 0, 0);
+    }
+#endif /* SQLITE_DEBUG */
+  }
+  return rc;
+}
+
+/************************* End ext/misc/regexp.c ********************/
 /************************* Begin ext/misc/series.c ******************/
 /*
 ** 2015-08-18, 2023-04-28
@@ -9317,9 +10305,9 @@ int sqlite3_series_init(
 }
 
 /************************* End ext/misc/series.c ********************/
-/************************* Begin ext/misc/regexp.c ******************/
+/************************* Begin ext/misc/tryeval.c ******************/
 /*
-** 2012-11-13
+** 2026-10-26
 **
 ** The author disclaims copyright to this source code.  In place of
 ** a legal notice, here is a blessing:
@@ -9330,935 +10318,125 @@ int sqlite3_series_init(
 **
 ******************************************************************************
 **
-** The code in this file implements a compact but reasonably
-** efficient regular-expression matcher for posix extended regular
-** expressions against UTF8 text.
+** This is an extension used for testing SQLite.  It is not intended for
+** production use.  The interface might change.  This file might go out
+** of support and disappear at any moment.  Do not depend on this extension.
 **
-** This file is an SQLite extension.  It registers a single function
-** named "regexp(A,B)" where A is the regular expression and B is the
-** string to be matched.  By registering this function, SQLite will also
-** then implement the "B regexp A" operator.  Note that with the function
-** the regular expression comes first, but with the operator it comes
-** second.
+** Apparent from comments in the code, this extension is undocumented.
 **
-**  The following regular expression syntax is supported:
+** This SQLite extension implements the SQL function tryeval(). The tryeval()
+** function takes zero or more arguments, each of which is an SQL statement.
+** The tryeval() function returns the first column of the first row that
+** has a non-NULL first column across each of the argument SQL statements.
+** Evaluation stops as soon as the first row with a non-NULL first column
+** is encountered.  Errors in evaluation are silently ignored, moving on
+** the next SQL statement argument. If none of the arguments successfully
+** executes and returns a row with a non-NULL first column, then NULL is
+** returned.
 **
-**     X*      zero or more occurrences of X
-**     X+      one or more occurrences of X
-**     X?      zero or one occurrences of X
-**     X{p,q}  between p and q occurrences of X
-**     (X)     match X
-**     X|Y     X or Y
-**     ^X      X occurring at the beginning of the string
-**     X$      X occurring at the end of the string
-**     .       Match any single character
-**     \c      Character c where c is one of \{}()[]|*+?-.
-**     \c      C-language escapes for c in afnrtv.  ex: \t or \n
-**     \uXXXX  Where XXXX is exactly 4 hex digits, unicode value XXXX
-**     \xXX    Where XX is exactly 2 hex digits, unicode value XX
-**     [abc]   Any single character from the set abc
-**     [^abc]  Any single character not in the set abc
-**     [a-z]   Any single character in the range a-z
-**     [^a-z]  Any single character not in the range a-z
-**     \b      Word boundary
-**     \w      Word character.  [A-Za-z0-9_]
-**     \W      Non-word character
-**     \d      Digit
-**     \D      Non-digit
-**     \s      Whitespace character
-**     \S      Non-whitespace character
+** Update:  Also the expire(V) and expire(V,N) functions.  See comments
+** below for details.
 **
-** A nondeterministic finite automaton (NFA) is used for matching, so the
-** performance is bounded by O(N*M) where N is the size of the regular
-** expression and M is the size of the input string.  The matcher never
-** exhibits exponential behavior.  Note that the X{p,q} operator expands
-** to p copies of X following by q-p copies of X? and that the size of the
-** regular expression in the O(N*M) performance bound is computed after
-** this expansion.
+** The purpose of this function is to help evaluate recursive
+** behavior, and expecially the bug report at
+** sqlite.org/bugs/info/3577bc69c52237a4 (2026-10-25T19:26:00Z)
+** as well as other bugs.
 **
-** To help prevent DoS attacks, the maximum size of the NFA is restricted.
+** To build (with SODIR being the directory that contains your
+** sqlite3.h and sqlite3ext.h headers):
+**
+** Linux: gcc -O2 -shared -I$SQDIR -fPIC -o tryeval.so tryeval.c
+** Mac:   gcc -O2 -dynamiclib -fPIC -I$SQDIR -o tryeval.dylib tryeval.c
+** Win32: cl /Os -I%SQDIR% tryeval.c -link -dll -out:tryeval.dll
 */
-#include <string.h>
-#include <stdlib.h>
 /* #include "sqlite3ext.h" */
 SQLITE_EXTENSION_INIT1
+#include <string.h>
 
 /*
-** The following #defines change the names of some functions implemented in
-** this file to prevent name collisions with C-library functions of the
-** same name.
+** Implementation of the tryeval(...)
 */
-#define re_match   sqlite3re_match
-#define re_compile sqlite3re_compile
-#define re_free    sqlite3re_free
-
-/* The end-of-input character */
-#define RE_EOF            0    /* End of input */
-#define RE_START  0xfffffff    /* Start of input - larger than an UTF-8 */
-
-/* The NFA is implemented as sequence of opcodes taken from the following
-** set.  Each opcode has a single integer argument.
-*/
-#define RE_OP_MATCH       1    /* Match the one character in the argument */
-#define RE_OP_ANY         2    /* Match any one character.  (Implements ".") */
-#define RE_OP_ANYSTAR     3    /* Special optimized version of .* */
-#define RE_OP_FORK        4    /* Continue to both next and opcode at iArg */
-#define RE_OP_GOTO        5    /* Jump to opcode at iArg */
-#define RE_OP_ACCEPT      6    /* Halt and indicate a successful match */
-#define RE_OP_CC_INC      7    /* Beginning of a [...] character class */
-#define RE_OP_CC_EXC      8    /* Beginning of a [^...] character class */
-#define RE_OP_CC_VALUE    9    /* Single value in a character class */
-#define RE_OP_CC_RANGE   10    /* Range of values in a character class */
-#define RE_OP_WORD       11    /* Perl word character [A-Za-z0-9_] */
-#define RE_OP_NOTWORD    12    /* Not a perl word character */
-#define RE_OP_DIGIT      13    /* digit:  [0-9] */
-#define RE_OP_NOTDIGIT   14    /* Not a digit */
-#define RE_OP_SPACE      15    /* space:  [ \t\n\r\v\f] */
-#define RE_OP_NOTSPACE   16    /* Not a digit */
-#define RE_OP_BOUNDARY   17    /* Boundary between word and non-word */
-#define RE_OP_ATSTART    18    /* Currently at the start of the string */
-
-/* Each opcode is a "state" in the NFA */
-typedef unsigned short ReStateNumber;
-
-/* Because this is an NFA and not a DFA, multiple states can be active at
-** once.  An instance of the following object records all active states in
-** the NFA.  The implementation is optimized for the common case where the
-** number of actives states is small.
-*/
-typedef struct ReStateSet {
-  unsigned nState;            /* Number of current states */
-  ReStateNumber *aState;      /* Current states */
-} ReStateSet;
-
-/* An input string read one character at a time.
-*/
-typedef struct ReInput ReInput;
-struct ReInput {
-  const unsigned char *z;  /* All text */
-  int i;                   /* Next byte to read */
-  int mx;                  /* EOF when i>=mx */
-};
-
-/* A compiled NFA (or an NFA that is in the process of being compiled) is
-** an instance of the following object.
-*/
-typedef struct ReCompiled ReCompiled;
-struct ReCompiled {
-  ReInput sIn;                /* Regular expression text */
-  const char *zErr;           /* Error message to return */
-  char *aOp;                  /* Operators for the virtual machine */
-  int *aArg;                  /* Arguments to each operator */
-  unsigned (*xNextChar)(ReInput*);  /* Next character function */
-  unsigned char zInit[12];    /* Initial text to match */
-  int nInit;                  /* Number of bytes in zInit */
-  unsigned nState;            /* Number of entries in aOp[] and aArg[] */
-  unsigned nAlloc;            /* Slots allocated for aOp[] and aArg[] */
-  unsigned mxAlloc;           /* Complexity limit */
-};
-
-/* Add a state to the given state set if it is not already there */
-static void re_add_state(ReStateSet *pSet, int newState){
-  unsigned i;
-  for(i=0; i<pSet->nState; i++) if( pSet->aState[i]==newState ) return;
-  pSet->aState[pSet->nState++] = (ReStateNumber)newState;
-}
-
-/* Extract the next unicode character from *pzIn and return it.  Advance
-** *pzIn to the first byte past the end of the character returned.  To
-** be clear:  this routine converts utf8 to unicode.  This routine is 
-** optimized for the common case where the next character is a single byte.
-*/
-static unsigned re_next_char(ReInput *p){
-  unsigned c;
-  if( p->i>=p->mx ) return 0;
-  c = p->z[p->i++];
-  if( c>=0x80 ){
-    if( (c&0xe0)==0xc0 && p->i<p->mx && (p->z[p->i]&0xc0)==0x80 ){
-      c = (c&0x1f)<<6 | (p->z[p->i++]&0x3f);
-      if( c<0x80 ) c = 0xfffd;
-    }else if( (c&0xf0)==0xe0 && p->i+1<p->mx && (p->z[p->i]&0xc0)==0x80
-           && (p->z[p->i+1]&0xc0)==0x80 ){
-      c = (c&0x0f)<<12 | ((p->z[p->i]&0x3f)<<6) | (p->z[p->i+1]&0x3f);
-      p->i += 2;
-      if( c<=0x7ff || (c>=0xd800 && c<=0xdfff) ) c = 0xfffd;
-    }else if( (c&0xf8)==0xf0 && p->i+2<p->mx && (p->z[p->i]&0xc0)==0x80
-           && (p->z[p->i+1]&0xc0)==0x80 && (p->z[p->i+2]&0xc0)==0x80 ){
-      c = (c&0x07)<<18 | ((p->z[p->i]&0x3f)<<12) | ((p->z[p->i+1]&0x3f)<<6)
-                       | (p->z[p->i+2]&0x3f);
-      p->i += 3;
-      if( c<=0xffff || c>0x10ffff ) c = 0xfffd;
-    }else{
-      c = 0xfffd;
-    }
-  }
-  return c;
-}
-static unsigned re_next_char_nocase(ReInput *p){
-  unsigned c = re_next_char(p);
-  if( c>='A' && c<='Z' ) c += 'a' - 'A';
-  return c;
-}
-
-/* Return true if c is a perl "word" character:  [A-Za-z0-9_] */
-static int re_word_char(int c){
-  return (c>='0' && c<='9') || (c>='a' && c<='z')
-      || (c>='A' && c<='Z') || c=='_';
-}
-
-/* Return true if c is a "digit" character:  [0-9] */
-static int re_digit_char(int c){
-  return (c>='0' && c<='9');
-}
-
-/* Return true if c is a perl "space" character:  [ \t\r\n\v\f] */
-static int re_space_char(int c){
-  return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\v' || c=='\f';
-}
-
-/* Run a compiled regular expression on the zero-terminated input
-** string zIn[].  Return true on a match and false if there is no match.
-*/
-static int re_match(ReCompiled *pRe, const unsigned char *zIn, int nIn){
-  ReStateSet aStateSet[2], *pThis, *pNext;
-  ReStateNumber aSpace[100];
-  ReStateNumber *pToFree;
-  unsigned int i = 0;
-  unsigned int iSwap = 0;
-  int c = RE_START;
-  int cPrev = 0;
-  int rc = 0;
-  ReInput in;
-
-  in.z = zIn;
-  in.i = 0;
-  in.mx = nIn>=0 ? nIn : (int)strlen((char const*)zIn);
-
-  /* Look for the initial prefix match, if there is one. */
-  if( pRe->nInit ){
-    unsigned char x = pRe->zInit[0];
-    while( in.i+pRe->nInit<=in.mx 
-     && (zIn[in.i]!=x ||
-         strncmp((const char*)zIn+in.i, (const char*)pRe->zInit, pRe->nInit)!=0)
-    ){
-      in.i++;
-    }
-    if( in.i+pRe->nInit>in.mx ) return 0;
-    c = RE_START-1;
-  }
-
-  if( pRe->nState<=(sizeof(aSpace)/(sizeof(aSpace[0])*2)) ){
-    pToFree = 0;
-    aStateSet[0].aState = aSpace;
-  }else{
-    pToFree = sqlite3_malloc64( sizeof(ReStateNumber)*2*pRe->nState );
-    if( pToFree==0 ) return -1;
-    aStateSet[0].aState = pToFree;
-  }
-  aStateSet[1].aState = &aStateSet[0].aState[pRe->nState];
-  pNext = &aStateSet[1];
-  pNext->nState = 0;
-  re_add_state(pNext, 0);
-  while( c!=RE_EOF && pNext->nState>0 ){
-    cPrev = c;
-    c = pRe->xNextChar(&in);
-    pThis = pNext;
-    pNext = &aStateSet[iSwap];
-    iSwap = 1 - iSwap;
-    pNext->nState = 0;
-    for(i=0; i<pThis->nState; i++){
-      int x = pThis->aState[i];
-      switch( pRe->aOp[x] ){
-        case RE_OP_MATCH: {
-          if( pRe->aArg[x]==c ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_ATSTART: {
-          if( cPrev==RE_START ) re_add_state(pThis, x+1);
-          break;
-        }
-        case RE_OP_ANY: {
-          if( c!=0 ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_WORD: {
-          if( re_word_char(c) ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_NOTWORD: {
-          if( !re_word_char(c) && c!=0 ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_DIGIT: {
-          if( re_digit_char(c) ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_NOTDIGIT: {
-          if( !re_digit_char(c) && c!=0 ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_SPACE: {
-          if( re_space_char(c) ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_NOTSPACE: {
-          if( !re_space_char(c) && c!=0 ) re_add_state(pNext, x+1);
-          break;
-        }
-        case RE_OP_BOUNDARY: {
-          if( re_word_char(c)!=re_word_char(cPrev) ) re_add_state(pThis, x+1);
-          break;
-        }
-        case RE_OP_ANYSTAR: {
-          re_add_state(pNext, x);
-          re_add_state(pThis, x+1);
-          break;
-        }
-        case RE_OP_FORK: {
-          re_add_state(pThis, x+pRe->aArg[x]);
-          re_add_state(pThis, x+1);
-          break;
-        }
-        case RE_OP_GOTO: {
-          re_add_state(pThis, x+pRe->aArg[x]);
-          break;
-        }
-        case RE_OP_ACCEPT: {
-          rc = 1;
-          goto re_match_end;
-        }
-        case RE_OP_CC_EXC: {
-          if( c==0 ) break;
-          /* fall-through */ goto re_op_cc_inc;
-        }
-        case RE_OP_CC_INC: re_op_cc_inc: {
-          int j = 1;
-          int n = pRe->aArg[x];
-          int hit = 0;
-          for(j=1; j>0 && j<n; j++){
-            if( pRe->aOp[x+j]==RE_OP_CC_VALUE ){
-              if( pRe->aArg[x+j]==c ){
-                hit = 1;
-                j = -1;
-              }
-            }else{
-              if( pRe->aArg[x+j]<=c && pRe->aArg[x+j+1]>=c ){
-                hit = 1;
-                j = -1;
-              }else{
-                j++;
-              }
-            }
-          }
-          if( pRe->aOp[x]==RE_OP_CC_EXC ) hit = !hit;
-          if( hit ) re_add_state(pNext, x+n);
-          break;
-        }
-      }
-    }
-  }
-  for(i=0; i<pNext->nState; i++){
-    int x = pNext->aState[i];
-    while( pRe->aOp[x]==RE_OP_GOTO ) x += pRe->aArg[x];
-    if( pRe->aOp[x]==RE_OP_ACCEPT ){ rc = 1; break; }
-  }
-re_match_end:
-  sqlite3_free(pToFree);
-  return rc;
-}
-
-/* Resize the opcode and argument arrays for an RE under construction.
-*/
-static int re_resize(ReCompiled *p, unsigned int N){
-  char *aOp;
-  int *aArg;
-  if( N>p->mxAlloc ){ p->zErr = "REGEXP pattern too big"; return 1; }
-  aOp = sqlite3_realloc64(p->aOp, N*sizeof(p->aOp[0]));
-  if( aOp==0 ){ p->zErr = "out of memory"; return 1; }
-  p->aOp = aOp;
-  aArg = sqlite3_realloc64(p->aArg, N*sizeof(p->aArg[0]));
-  if( aArg==0 ){ p->zErr = "out of memory"; return 1; }
-  p->aArg = aArg;
-  p->nAlloc = N;
-  return 0;
-}
-
-/* Insert a new opcode and argument into an RE under construction.  The
-** insertion point is just prior to existing opcode iBefore.
-*/
-static int re_insert(ReCompiled *p, int iBefore, int op, int arg){
-  int i;
-  if( p->nAlloc<=p->nState && re_resize(p, p->nAlloc*2) ) return 0;
-  for(i=p->nState; i>iBefore; i--){
-    p->aOp[i] = p->aOp[i-1];
-    p->aArg[i] = p->aArg[i-1];
-  }
-  p->nState++;
-  p->aOp[iBefore] = (char)op;
-  p->aArg[iBefore] = arg;
-  return iBefore;
-}
-
-/* Append a new opcode and argument to the end of the RE under construction.
-*/
-static int re_append(ReCompiled *p, int op, int arg){
-  return re_insert(p, p->nState, op, arg);
-}
-
-/* Make a copy of N opcodes starting at iStart onto the end of the RE
-** under construction.
-*/
-static void re_copy(ReCompiled *p, int iStart, unsigned int N){
-  if( p->nState+N>=p->nAlloc && re_resize(p, p->nAlloc*2+N) ) return;
-  memcpy(&p->aOp[p->nState], &p->aOp[iStart], N*sizeof(p->aOp[0]));
-  memcpy(&p->aArg[p->nState], &p->aArg[iStart], N*sizeof(p->aArg[0]));
-  p->nState += N;
-}
-
-/* Return true if c is a hexadecimal digit character:  [0-9a-fA-F]
-** If c is a hex digit, also set *pV = (*pV)*16 + valueof(c).  If
-** c is not a hex digit *pV is unchanged.
-*/
-static int re_hex(int c, int *pV){
-  if( c>='0' && c<='9' ){
-    c -= '0';
-  }else if( c>='a' && c<='f' ){
-    c -= 'a' - 10;
-  }else if( c>='A' && c<='F' ){
-    c -= 'A' - 10;
-  }else{
-    return 0;
-  }
-  *pV = (*pV)*16 + (c & 0xff);
-  return 1;
-}
-
-/* A backslash character has been seen, read the next character and
-** return its interpretation.
-*/
-static unsigned re_esc_char(ReCompiled *p){
-  static const char zEsc[] = "afnrtv\\()*.+?[$^{|}]-";
-  static const char zTrans[] = "\a\f\n\r\t\v";
-  int i, v = 0;
-  char c;
-  if( p->sIn.i>=p->sIn.mx ){
-    p->zErr = "unknown \\ escape";
-    return 0;
-  }
-  c = p->sIn.z[p->sIn.i];
-  if( c=='u' && p->sIn.i+4<p->sIn.mx ){
-    const unsigned char *zIn = p->sIn.z + p->sIn.i;
-    if( re_hex(zIn[1],&v)
-     && re_hex(zIn[2],&v)
-     && re_hex(zIn[3],&v)
-     && re_hex(zIn[4],&v)
-    ){
-      p->sIn.i += 5;
-      return v;
-    }
-  }
-  if( c=='x' && p->sIn.i+2<p->sIn.mx ){
-    const unsigned char *zIn = p->sIn.z + p->sIn.i;
-    if( re_hex(zIn[1],&v)
-     && re_hex(zIn[2],&v)
-    ){
-      p->sIn.i += 3;
-      return v;
-    }
-  }
-  for(i=0; zEsc[i] && zEsc[i]!=c; i++){}
-  if( zEsc[i] ){
-    if( i<6 ) c = zTrans[i];
-    p->sIn.i++;
-  }else{
-    p->zErr = "unknown \\ escape";
-  }
-  return c;
-}
-
-/* Forward declaration */
-static const char *re_subcompile_string(ReCompiled*);
-
-/* Peek at the next byte of input */
-static unsigned char rePeek(ReCompiled *p){
-  return p->sIn.i<p->sIn.mx ? p->sIn.z[p->sIn.i] : 0;
-}
-
-/* Compile RE text into a sequence of opcodes.  Continue up to the
-** first unmatched ")" character, then return.  If an error is found,
-** return a pointer to the error message string.
-*/
-static const char *re_subcompile_re(ReCompiled *p){
-  const char *zErr;
-  int iStart, iEnd, iGoto;
-  iStart = p->nState;
-  zErr = re_subcompile_string(p);
-  if( zErr ) return zErr;
-  while( rePeek(p)=='|' ){
-    iEnd = p->nState;
-    re_insert(p, iStart, RE_OP_FORK, iEnd + 2 - iStart);
-    iGoto = re_append(p, RE_OP_GOTO, 0);
-    p->sIn.i++;
-    zErr = re_subcompile_string(p);
-    if( zErr ) return zErr;
-    p->aArg[iGoto] = p->nState - iGoto;
-  }
-  return 0;
-}
-
-/* Compile an element of regular expression text (anything that can be
-** an operand to the "|" operator).  Return NULL on success or a pointer
-** to the error message if there is a problem.
-*/
-static const char *re_subcompile_string(ReCompiled *p){
-  int iPrev = -1;
-  int iStart;
-  unsigned c;
-  const char *zErr;
-  while( (c = p->xNextChar(&p->sIn))!=0 ){
-    iStart = p->nState;
-    switch( c ){
-      case '|':
-      case ')': {
-        p->sIn.i--;
-        return 0;
-      }
-      case '(': {
-        zErr = re_subcompile_re(p);
-        if( zErr ) return zErr;
-        if( rePeek(p)!=')' ) return "unmatched '('";
-        p->sIn.i++;
-        break;
-      }
-      case '.': {
-        if( rePeek(p)=='*' ){
-          re_append(p, RE_OP_ANYSTAR, 0);
-          p->sIn.i++;
-        }else{
-          re_append(p, RE_OP_ANY, 0);
-        }
-        break;
-      }
-      case '*': {
-        if( iPrev<0 ) return "'*' without operand";
-        re_insert(p, iPrev, RE_OP_GOTO, p->nState - iPrev + 1);
-        re_append(p, RE_OP_FORK, iPrev - p->nState + 1);
-        break;
-      }
-      case '+': {
-        if( iPrev<0 ) return "'+' without operand";
-        re_append(p, RE_OP_FORK, iPrev - p->nState);
-        break;
-      }
-      case '?': {
-        if( iPrev<0 ) return "'?' without operand";
-        re_insert(p, iPrev, RE_OP_FORK, p->nState - iPrev+1);
-        break;
-      }
-      case '$': {
-        re_append(p, RE_OP_MATCH, RE_EOF);
-        break;
-      }
-      case '^': {
-        re_append(p, RE_OP_ATSTART, 0);
-        break;
-      }
-      case '{': {
-        unsigned int m = 0, n = 0;
-        unsigned int sz, j;
-        if( iPrev<0 ) return "'{m,n}' without operand";
-        while( (c=rePeek(p))>='0' && c<='9' ){
-          m = m*10 + c - '0';
-          if( m*2>p->mxAlloc ) return "REGEXP pattern too big";
-          p->sIn.i++;
-        }
-        n = m;
-        if( c==',' ){
-          p->sIn.i++;
-          n = 0;
-          while( (c=rePeek(p))>='0' && c<='9' ){
-            n = n*10 + c-'0';
-            if( n*2>p->mxAlloc ) return "REGEXP pattern too big";
-            p->sIn.i++;
-          }
-        }
-        if( c!='}' ) return "unmatched '{'";
-        if( n<m ) return "n less than m in '{m,n}'";
-        p->sIn.i++;
-        sz = p->nState - iPrev;
-        if( m==0 ){
-          if( n==0 ) return "both m and n are zero in '{m,n}'";
-          re_insert(p, iPrev, RE_OP_FORK, sz+1);
-          iPrev++;
-          n--;
-        }else{
-          for(j=1; j<m; j++) re_copy(p, iPrev, sz);
-        }
-        for(j=m; j<n; j++){
-          re_append(p, RE_OP_FORK, sz+1);
-          re_copy(p, iPrev, sz);
-        }
-        if( n==0 && m>0 ){
-          re_append(p, RE_OP_FORK, -(int)sz);
-        }
-        break;
-      }
-      case '[': {
-        unsigned int iFirst = p->nState;
-        if( rePeek(p)=='^' ){
-          re_append(p, RE_OP_CC_EXC, 0);
-          p->sIn.i++;
-        }else{
-          re_append(p, RE_OP_CC_INC, 0);
-        }
-        while( (c = p->xNextChar(&p->sIn))!=0 ){
-          if( c=='[' && rePeek(p)==':' ){
-            return "POSIX character classes not supported";
-          }
-          if( c=='\\' ) c = re_esc_char(p);
-          if( rePeek(p)=='-' ){
-            re_append(p, RE_OP_CC_RANGE, c);
-            p->sIn.i++;
-            c = p->xNextChar(&p->sIn);
-            if( c=='\\' ) c = re_esc_char(p);
-            re_append(p, RE_OP_CC_RANGE, c);
-          }else{
-            re_append(p, RE_OP_CC_VALUE, c);
-          }
-          if( rePeek(p)==']' ){ p->sIn.i++; break; }
-        }
-        if( c==0 ) return "unclosed '['";
-        if( p->nState>iFirst ) p->aArg[iFirst] = p->nState - iFirst;
-        break;
-      }
-      case '\\': {
-        int specialOp = 0;
-        switch( rePeek(p) ){
-          case 'b': specialOp = RE_OP_BOUNDARY;   break;
-          case 'd': specialOp = RE_OP_DIGIT;      break;
-          case 'D': specialOp = RE_OP_NOTDIGIT;   break;
-          case 's': specialOp = RE_OP_SPACE;      break;
-          case 'S': specialOp = RE_OP_NOTSPACE;   break;
-          case 'w': specialOp = RE_OP_WORD;       break;
-          case 'W': specialOp = RE_OP_NOTWORD;    break;
-        }
-        if( specialOp ){
-          p->sIn.i++;
-          re_append(p, specialOp, 0);
-        }else{
-          c = re_esc_char(p);
-          re_append(p, RE_OP_MATCH, c);
-        }
-        break;
-      }
-      default: {
-        re_append(p, RE_OP_MATCH, c);
-        break;
-      }
-    }
-    iPrev = iStart;
-  }
-  return 0;
-}
-
-/* Free and reclaim all the memory used by a previously compiled
-** regular expression.  Applications should invoke this routine once
-** for every call to re_compile() to avoid memory leaks.
-*/
-static void re_free(ReCompiled *pRe){
-  if( pRe ){
-    sqlite3_free(pRe->aOp);
-    sqlite3_free(pRe->aArg);
-    sqlite3_free(pRe);
-  }
-}
-
-/*
-** Version of re_free() that accepts a pointer of type (void*). Required
-** to satisfy sanitizers when the re_free() function is called via a
-** function pointer.
-*/
-static void re_free_voidptr(void *p){
-  re_free((ReCompiled*)p);
-}
-
-/*
-** Compile a textual regular expression in zIn[] into a compiled regular
-** expression suitable for us by re_match() and return a pointer to the
-** compiled regular expression in *ppRe.  Return NULL on success or an
-** error message if something goes wrong.
-*/
-static const char *re_compile(
-  ReCompiled **ppRe,      /* OUT: write compiled NFA here */
-  const char *zIn,        /* Input regular expression */
-  int mxRe,               /* Complexity limit */
-  int noCase              /* True for caseless comparisons */
+static void tryEvalFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
 ){
-  ReCompiled *pRe;
-  const char *zErr;
-  int i, j;
+  const char *zSql;       /* Next SQL statement to evaluate */
+  sqlite3 *db;            /* The database connection */
+  sqlite3_stmt *pStmt;    /* Compiled bytecode for zSql */
+  int bDone = 0;          /* True if a row with non-NULL first column seen */
+  int rc;                 /* Result from sqlite3 API calls */
+  int i;                  /* Loop counter */
 
-  *ppRe = 0;
-  pRe = sqlite3_malloc64( sizeof(*pRe) );
-  if( pRe==0 ){
-    return "out of memory";
-  }
-  memset(pRe, 0, sizeof(*pRe));
-  pRe->xNextChar = noCase ? re_next_char_nocase : re_next_char;
-  pRe->mxAlloc = mxRe;
-  if( re_resize(pRe, 30) ){
-    zErr = pRe->zErr;
-    re_free(pRe);
-    return zErr;
-  }
-  re_append(pRe, RE_OP_ANYSTAR, 0);
-  pRe->sIn.z = (unsigned char*)zIn;
-  pRe->sIn.i = 0;
-  pRe->sIn.mx = (int)strlen(zIn);
-  zErr = re_subcompile_re(pRe);
-  if( zErr ){
-    re_free(pRe);
-    return zErr;
-  }
-  if( pRe->sIn.i>=pRe->sIn.mx ){
-    re_append(pRe, RE_OP_ACCEPT, 0);
-    *ppRe = pRe;
-  }else{
-    re_free(pRe);
-    return "unrecognized character";
-  }
-
-  /* If the regex begins with "^" and has no "|" at the top level, then
-  ** the whole regex is anchored at the start of the input and the
-  ** initial ".*" is not needed.  Convert it into a no-op so that
-  ** re_match() can stop as soon as the start of the input fails to
-  ** match.  A "|" at the top level would have caused a FORK to be
-  ** inserted at aOp[1], so aOp[1]==RE_OP_ATSTART is sufficient.  Do
-  ** not remove the initial "^" itself, as there might be jumps back
-  ** to it, as in "^+". */
-  if( pRe->aOp[1]==RE_OP_ATSTART ){
-    pRe->aOp[0] = RE_OP_GOTO;
-    pRe->aArg[0] = 1;
-  }
-
-  /* The following is a performance optimization.  If the regex begins with
-  ** ".*" (if the input regex lacks an initial "^") and afterwards there are
-  ** one or more matching characters, enter those matching characters into
-  ** zInit[].  The re_match() routine can then search ahead in the input 
-  ** string looking for the initial match without having to run the whole
-  ** regex engine over the string.  Do not worry about trying to match
-  ** unicode characters beyond plane 0 - those are very rare and this is
-  ** just an optimization. */
-  if( pRe->aOp[0]==RE_OP_ANYSTAR && !noCase ){
-    for(j=0, i=1; j<(int)sizeof(pRe->zInit)-2 && pRe->aOp[i]==RE_OP_MATCH; i++){
-      unsigned x = pRe->aArg[i];
-      if( x<=0x7f ){
-        pRe->zInit[j++] = (unsigned char)x;
-      }else if( x<=0x7ff ){
-        pRe->zInit[j++] = (unsigned char)(0xc0 | (x>>6));
-        pRe->zInit[j++] = 0x80 | (x&0x3f);
-      }else if( x<=0xffff ){
-        pRe->zInit[j++] = (unsigned char)(0xe0 | (x>>12));
-        pRe->zInit[j++] = 0x80 | ((x>>6)&0x3f);
-        pRe->zInit[j++] = 0x80 | (x&0x3f);
-      }else{
+  db = sqlite3_context_db_handle(context);
+  for(i=0; !bDone && i<argc; i++){
+    zSql = (const char*)sqlite3_value_text(argv[i]);
+    if( zSql==0 ) continue;
+    rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+    if( rc==SQLITE_OK ){
+      while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
+        if( sqlite3_column_type(pStmt,0)==SQLITE_NULL ) continue;
+        sqlite3_result_value(context, sqlite3_column_value(pStmt,0));
+        bDone = 1;
         break;
       }
     }
-    if( j>0 && pRe->zInit[j-1]==0 ) j--;
-    pRe->nInit = j;
+    sqlite3_finalize(pStmt);
   }
-  return pRe->zErr;
 }
 
-/*
-** The value of LIMIT_MAX_PATTERN_LENGTH.
+/* SQL function:   expire(v,n)
+**
+** Return the first argument.  But before doing so, expire all prepared
+** statements that use schema n (0,1,...) or if n==-1 expire all prepared
+** statements.  If the second argument is omitted, it is assumed to be -1.
+**
+** This routine requires the (new) SQLITE_TESTCTRL_EXPIRE_STMTS test
+** control.  If your SQLite does not support that test control, or if
+** you compile with test controls disabled (you ought not do that!) then
+** this routine is just copies its first argument as its result.
 */
-static int re_maxlen(sqlite3_context *context){
+static void expireFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
   sqlite3 *db = sqlite3_context_db_handle(context);
-  return sqlite3_limit(db, SQLITE_LIMIT_LIKE_PATTERN_LENGTH,-1);
+  int iDb = argc>=2 ? sqlite3_value_int(argv[1]) : -1;
+#ifdef SQLITE_TESTCTRL_EXPIRE_STMTS
+  sqlite3_test_control(SQLITE_TESTCTRL_EXPIRE_STMTS, db, iDb);
+#endif
+  sqlite3_result_value(context, argv[0]);
 }
 
-/*
-** Maximum NFA size given a maximum pattern length.
-*/
-static int re_maxnfa(int mxlen){
-  return 75+mxlen/2;
-}
-
-/*
-** Implementation of the regexp() SQL function.  This function implements
-** the build-in REGEXP operator.  The first argument to the function is the
-** pattern and the second argument is the string.  So, the SQL statements:
-**
-**       A REGEXP B
-**
-** is implemented as regexp(B,A).
-*/
-static void re_sql_func(
-  sqlite3_context *context,
-  int argc,
-  sqlite3_value **argv
-){
-  ReCompiled *pRe;          /* Compiled regular expression */
-  const char *zPattern;     /* The regular expression */
-  const unsigned char *zStr;/* String being searched */
-  const char *zErr;         /* Compile error message */
-  int setAux = 0;           /* True to invoke sqlite3_set_auxdata() */
-
-  (void)argc;  /* Unused */
-  pRe = sqlite3_get_auxdata(context, 0);
-  if( pRe==0 ){
-    int mxLen = re_maxlen(context);
-    int nPattern;
-    zPattern = (const char*)sqlite3_value_text(argv[0]);
-    if( zPattern==0 ) return;
-    nPattern = sqlite3_value_bytes(argv[0]);
-    if( nPattern>mxLen ){
-      zErr = "REGEXP pattern too big";
-    }else{
-      zErr = re_compile(&pRe, zPattern, re_maxnfa(mxLen),
-                        sqlite3_user_data(context)!=0);
-    }
-    if( zErr ){
-      re_free(pRe);
-      sqlite3_result_error(context, zErr, -1);
-      return;
-    }
-    if( pRe==0 ){
-      sqlite3_result_error_nomem(context);
-      return;
-    }
-    setAux = 1;
-  }
-  zStr = (const unsigned char*)sqlite3_value_text(argv[1]);
-  if( zStr!=0 ){
-    sqlite3_result_int(context, re_match(pRe, zStr, -1));
-  }
-  if( setAux ){
-    sqlite3_set_auxdata(context, 0, pRe, re_free_voidptr);
-  }
-}
-
-#if defined(SQLITE_DEBUG)
-/*
-** This function is used for testing and debugging only.  It is only available
-** if the SQLITE_DEBUG compile-time option is used.
-**
-** Compile a regular expression and then convert the compiled expression into
-** text and return that text.
-*/
-static void re_bytecode_func(
-  sqlite3_context *context,
-  int argc,
-  sqlite3_value **argv
-){
-  const char *zPattern;
-  const char *zErr;
-  ReCompiled *pRe;
-  sqlite3_str *pStr;
-  int i;
-  int n;
-  char *z;
-  static const char *ReOpName[] = {
-    "EOF",
-    "MATCH",
-    "ANY",
-    "ANYSTAR",
-    "FORK",
-    "GOTO",
-    "ACCEPT",
-    "CC_INC",
-    "CC_EXC",
-    "CC_VALUE",
-    "CC_RANGE",
-    "WORD",
-    "NOTWORD",
-    "DIGIT",
-    "NOTDIGIT",
-    "SPACE",
-    "NOTSPACE",
-    "BOUNDARY",
-    "ATSTART",
-  };
-
-  (void)argc;
-  zPattern = (const char*)sqlite3_value_text(argv[0]);
-  if( zPattern==0 ) return;
-  zErr = re_compile(&pRe, zPattern, re_maxnfa(re_maxlen(context)),
-                    sqlite3_user_data(context)!=0);
-  if( zErr ){
-    re_free(pRe);
-    sqlite3_result_error(context, zErr, -1);
-    return;
-  }
-  if( pRe==0 ){
-    sqlite3_result_error_nomem(context);
-    return;
-  }
-  pStr = sqlite3_str_new(0);
-  if( pRe->nInit>0 ){
-    sqlite3_str_appendf(pStr, "INIT     ");
-    for(i=0; i<pRe->nInit; i++){
-      sqlite3_str_appendf(pStr, "%02x", pRe->zInit[i]);
-    }
-    sqlite3_str_appendf(pStr, "\n");
-  }
-  for(i=0; (unsigned)i<pRe->nState; i++){
-    sqlite3_str_appendf(pStr, "%-8s %4d\n",
-         ReOpName[(unsigned char)pRe->aOp[i]], pRe->aArg[i]);
-  }
-  if( sqlite3_str_errcode(pStr)==SQLITE_NOMEM ){
-    sqlite3_str_finish(pStr);
-    re_free(pRe);
-    sqlite3_result_error_nomem(context);
-    return;
-  }
-  n = sqlite3_str_length(pStr);
-  z = sqlite3_str_finish(pStr);
-  sqlite3_result_text(context, z, n-1, sqlite3_free);
-  re_free(pRe);
-}
-
-#endif /* SQLITE_DEBUG */
-
-
-/*
-** Invoke this routine to register the regexp() function with the
-** SQLite database connection.
-*/
 #ifdef _WIN32
 
 #endif
-int sqlite3_regexp_init(
+int sqlite3_tryeval_init(
   sqlite3 *db, 
   char **pzErrMsg, 
   const sqlite3_api_routines *pApi
 ){
   int rc = SQLITE_OK;
   SQLITE_EXTENSION_INIT2(pApi);
-  (void)pzErrMsg;  /* Unused */
-  rc = sqlite3_create_function(db, "regexp", 2, 
-                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
-                            0, re_sql_func, 0, 0);
+  (void)pzErrMsg;  /* Unused parameter */
+  rc = sqlite3_create_function(db, "tryeval", -1, 
+                               SQLITE_UTF8, 0,
+                               tryEvalFunc, 0, 0);
   if( rc==SQLITE_OK ){
-    /* The regexpi(PATTERN,STRING) function is a case-insensitive version
-    ** of regexp(PATTERN,STRING). */
-    rc = sqlite3_create_function(db, "regexpi", 2,
-                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
-                            (void*)db, re_sql_func, 0, 0);
-#if defined(SQLITE_DEBUG)
-    if( rc==SQLITE_OK ){
-      rc = sqlite3_create_function(db, "regexp_bytecode", 1,
-                            SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
-                            0, re_bytecode_func, 0, 0);
-    }
-#endif /* SQLITE_DEBUG */
+    rc = sqlite3_create_function(db, "expire", 1, 
+                               SQLITE_UTF8|SQLITE_DETERMINISTIC, 0,
+                               expireFunc, 0, 0);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_create_function(db, "expire", 2, 
+                               SQLITE_UTF8|SQLITE_DETERMINISTIC, 0,
+                               expireFunc, 0, 0);
   }
   return rc;
 }
 
-/************************* End ext/misc/regexp.c ********************/
+/************************* End ext/misc/tryeval.c ********************/
 #ifndef SQLITE_SHELL_FIDDLE
 /************************* Begin ext/misc/fileio.c ******************/
 /*
@@ -13255,6 +13433,18 @@ static void zipfileEntryFree(ZipfileEntry *p){
 static void zipfileCleanupTransaction(ZipfileTab *pTab){
   ZipfileEntry *pEntry;
   ZipfileEntry *pNext;
+  ZipfileCsr *pCsr;
+
+  /* A cursor that is not reading from a file or from a blob steps through
+  ** the pTab->pFirstEntry list, which is about to be deleted.  Such a
+  ** cursor has nothing left to return, so leave it at EOF rather than
+  ** pointing at freed memory. */
+  for(pCsr=pTab->pCsrList; pCsr; pCsr=pCsr->pCsrNext){
+    if( pCsr->pFile==0 && pCsr->pFreeEntry==0 ){
+      pCsr->pCurrent = 0;
+      pCsr->bEof = 1;
+    }
+  }
 
   if( pTab->pWriteFd ){
     fclose(pTab->pWriteFd);
@@ -13307,11 +13497,15 @@ static void zipfileResetCursor(ZipfileCsr *pCsr){
 
   pCsr->bEof = 0;
   if( pCsr->pFile ){
+    /* File mode: pCurrent is a private copy owned by this cursor. */
     fclose(pCsr->pFile);
     pCsr->pFile = 0;
     zipfileEntryFree(pCsr->pCurrent);
-    pCsr->pCurrent = 0;
   }
+  /* In the other modes pCurrent belongs to pFreeEntry or to the table.
+  ** It must not be left dangling, since a later xFilter() that switches
+  ** this cursor to file mode would free it. */
+  pCsr->pCurrent = 0;
 
   for(p=pCsr->pFreeEntry; p; p=pNext){
     pNext = p->pNext;
@@ -13805,7 +13999,7 @@ static int zipfileNext(sqlite3_vtab_cursor *cur){
       pCsr->pCurrent = p;
     }
   }else{
-    if( !pCsr->bNoop ){
+    if( !pCsr->bNoop && !pCsr->bEof ){
       pCsr->pCurrent = pCsr->pCurrent->pNext;
     }
     if( pCsr->pCurrent==0 ){
@@ -13925,8 +14119,13 @@ static int zipfileColumn(
   int i                       /* Which column to return */
 ){
   ZipfileCsr *pCsr = (ZipfileCsr*)cur;
-  ZipfileCDS *pCDS = &pCsr->pCurrent->cds;
+  ZipfileCDS *pCDS;
   int rc = SQLITE_OK;
+  if( pCsr->pCurrent==0 ){
+    /* The transaction ended while this row was being processed. */
+    return SQLITE_OK;
+  }
+  pCDS = &pCsr->pCurrent->cds;
   switch( i ){
     case 0:   /* name */
       sqlite3_result_text(ctx, pCDS->zFile, -1, SQLITE_TRANSIENT);
@@ -14771,7 +14970,7 @@ static void zipfileFunctionCds(
   assert( argc>0 );
 
   pCsr = zipfileFindCursor(pTab, sqlite3_value_int64(argv[0]));
-  if( pCsr ){
+  if( pCsr && pCsr->pCurrent ){
     ZipfileCDS *p = &pCsr->pCurrent->cds;
     char *zRes = sqlite3_mprintf("{"
         "\"version-made-by\" : %u, "
@@ -16758,6 +16957,37 @@ static int idxAuthCallback(
   return rc;
 }
 
+/*
+** Execute the CREATE statement in zSql, which was read from the
+** sqlite_schema table of the database being analyzed, using database
+** handle db. If no error occurs, set (*pzErr) to NULL and return
+** SQLITE_OK. Otherwise, return an SQLite error code and set (*pzErr) to
+** point to a buffer containing an English language error message.
+**
+** If the database was opened with "PRAGMA writable_schema=ON", the text
+** read from sqlite_schema is not guaranteed to be a single CREATE
+** statement. So the same rules are applied as when SQLite itself loads a
+** schema: text that does not begin with "CR" is ignored, as only CREATE
+** statements begin with those two letters, and only the first statement
+** in the text is executed. Anything that follows it is ignored.
+*/
+static int expertSchemaExec(sqlite3 *db, const char *zSql, char **pzErr){
+  int rc = SQLITE_OK;
+  if( pzErr ) *pzErr = 0;
+  if( (zSql[0]=='c' || zSql[0]=='C') && (zSql[1]=='r' || zSql[1]=='R') ){
+    sqlite3_stmt *pStmt = 0;
+    rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+    if( rc==SQLITE_OK && pStmt ){
+      while( SQLITE_ROW==sqlite3_step(pStmt) ){}
+      rc = sqlite3_finalize(pStmt);
+    }
+    if( rc!=SQLITE_OK && pzErr ){
+      *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(db));
+    }
+  }
+  return rc;
+}
+
 static int idxProcessOneTrigger(
   sqlite3expert *p, 
   IdxWrite *pWrite, 
@@ -16780,7 +17010,7 @@ static int idxProcessOneTrigger(
   while( rc==SQLITE_OK && SQLITE_ROW==sqlite3_step(pSelect) ){
     const char *zCreate = (const char*)sqlite3_column_text(pSelect, 0);
     if( zCreate==0 ) continue;
-    rc = sqlite3_exec(p->dbv, zCreate, 0, 0, pzErr);
+    rc = expertSchemaExec(p->dbv, zCreate, pzErr);
   }
   idxFinalize(&rc, pSelect);
 
@@ -16905,7 +17135,7 @@ static int expertSchemaSql(sqlite3 *db, const char *zSql, char **pzErr){
   int rc = SQLITE_OK;
   char *zErr = 0;
 
-  rc = sqlite3_exec(db, zSql, 0, 0, &zErr);
+  rc = expertSchemaExec(db, zSql, &zErr);
   if( rc!=SQLITE_OK && zErr ){
     int nErr = STRLEN(zErr);
     if( nErr>=15 && memcmp(zErr, "no such module:", 15)==0 ){
@@ -17373,7 +17603,8 @@ static int idxPopulateStat1(sqlite3expert *p, char **pzErr){
 ** Define and possibly pretend to use a useless collation sequence.
 ** This pretense allows expert to accept SQL using custom collations.
 */
-int dummyCompare(void *up1, int up2, const void *up3, int up4, const void *up5){
+static int dummyCompare(void *up1, int up2, const void *up3, int up4,
+                        const void *up5){
   (void)up1;
   (void)up2;
   (void)up3;
@@ -17383,7 +17614,7 @@ int dummyCompare(void *up1, int up2, const void *up3, int up4, const void *up5){
   return 0;
 }
 /* And a callback to register above upon actual need */
-void useDummyCS(void *up1, sqlite3 *db, int etr, const char *zName){
+static void useDummyCS(void *up1, sqlite3 *db, int etr, const char *zName){
   (void)up1;
   sqlite3_create_collation_v2(db, zName, etr, 0, dummyCompare, 0);
 }
@@ -17393,13 +17624,13 @@ void useDummyCS(void *up1, sqlite3 *db, int etr, const char *zName){
 /*
 ** dummy functions for no-op implementation of UDFs during expert's work
 */
-void dummyUDF(sqlite3_context *up1, int up2, sqlite3_value **up3){
+static void dummyUDF(sqlite3_context *up1, int up2, sqlite3_value **up3){
   (void)up1;
   (void)up2;
   (void)up3;
   assert(0); /* VDBE should never be run. */
 }
-void dummyUDFvalue(sqlite3_context *up1){
+static void dummyUDFvalue(sqlite3_context *up1){
   (void)up1;
   assert(0); /* VDBE should never be run. */
 }
@@ -17407,7 +17638,7 @@ void dummyUDFvalue(sqlite3_context *up1){
 /*
 ** Register UDFs from user database with another.
 */
-int registerUDFs(sqlite3 *dbSrc, sqlite3 *dbDst){
+static int registerUDFs(sqlite3 *dbSrc, sqlite3 *dbDst){
   sqlite3_stmt *pStmt;
   int rc = sqlite3_prepare_v2(dbSrc,
             "SELECT name,type,enc,narg,flags "
@@ -21609,6 +21840,13 @@ static int dbdataConnect(
   (void)argv;
   (void)pzErr;
   sqlite3_vtab_config(db, SQLITE_VTAB_USES_ALL_SCHEMAS);
+
+  /* These tables expose the raw content of the database pages of any
+  ** attached database, in the same way as sqlite_dbpage. And, like
+  ** sqlite_dbpage, they may only be used from top-level SQL, not from
+  ** within triggers or views. Otherwise a view or trigger in the schema
+  ** of one database could be used to read the content of another.  */
+  sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
   if( rc==SQLITE_OK ){
     pTab = (DbdataTable*)sqlite3_malloc64(sizeof(DbdataTable));
     if( pTab==0 ){
@@ -25701,6 +25939,7 @@ static const char *qrfQuoteNames[] =
 #define SHFLG_DumpDataOnly   0x00000100 /* .dump show data only */
 #define SHFLG_DumpNoSys      0x00000200 /* .dump omits system tables */
 #define SHFLG_TestingMode    0x00000400 /* allow unsafe testing features */
+#define SHFLG_Verbose        0x00000800 /* The -v option is used */
 
 /*
 ** Macros for testing and setting shellFlgs
@@ -26397,6 +26636,58 @@ static void appendCompletion(
 }
 
 /*
+** The text in z[] is an SQL statement taken from the sql column of
+** sqlite_schema.  Normally it is exactly one statement.  But if the
+** database file is corrupt or hostile it might contain additional
+** statements after the first one, separated by ";".  Return the number
+** of bytes in the prefix of z[] that form the first complete SQL statement,
+** including its terminating ";".  Set *pbComplete to true if the returned
+** prefix is such a complete statement.  If z[] has no complete statement
+** prefix, return strlen(z) and set *pbComplete to false, in which case
+** the caller should use appendCompletion() to close off the statement.
+**
+** The usual case is that z[] contains no ";" at all, which strchr()
+** detects immediately.  Otherwise each ";" is tried in turn as the end of
+** the statement, using sqlite3_complete() to skip over semicolons that are
+** inside of strings, comments, or CREATE TRIGGER bodies.
+**
+** z[] is modified temporarily but is restored before this routine returns.
+*/
+static int firstStatementLen(char *z, int *pbComplete){
+  char *zSemi = strchr(z, ';');
+  *pbComplete = 0;
+  while( zSemi ){
+    char c = zSemi[1];
+    int rc;
+    zSemi[1] = 0;
+    rc = sqlite3_complete(z);
+    zSemi[1] = c;
+    if( rc ){
+      *pbComplete = 1;
+      return (int)(zSemi + 1 - z);
+    }
+    zSemi = strchr(zSemi+1, ';');
+  }
+  return (int)strlen(z);
+}
+
+/*
+** Truncate the SQL text held in pOut so that it contains at most one
+** SQL statement.  See firstStatementLen().  If bSemi is false and the
+** statement was cut off at a ";" then the ";" is also removed, on the
+** assumption that the caller will add its own statement terminator.
+*/
+static void truncateToOneStatement(sqlite3_str *pOut, int bSemi){
+  char *z = sqlite3_str_value(pOut);
+  int bComplete;
+  int n;
+  if( z==0 ) return;
+  n = firstStatementLen(z, &bComplete);
+  if( bComplete && !bSemi ) n--;
+  if( n<sqlite3_str_length(pOut) ) sqlite3_str_truncate(pOut, n);
+}
+
+/*
 ** SQL function:  shell_complete_sql(SQL)
 **                shell_complete_sql(SQL, FLAGS)
 **
@@ -26411,6 +26702,9 @@ static void appendCompletion(
 **   0x01        Include the final semicolon
 **   0x02        Only return the completion text.  Omit the original SQL.
 **   0x04        Assume that SQL has a \n at the end.
+**   0x08        If SQL contains more than one statement, keep only the
+**               first.  Unless 0x01 is also set, the ";" at the end
+**               of that first statement is omitted.
 **
 ** The /C substitution in the CLI prompt is computed using the
 ** equivalent of shell_complete_sql(SQL,3);
@@ -26426,15 +26720,29 @@ static void shell_complete_sql(
 
   if( nVal!=1 && nVal!=2 ) return;
   if( nVal==2 ){
-    flags = 0x7 & sqlite3_value_int64(apVal[1]);
+    flags = 0xf & sqlite3_value_int64(apVal[1]);
   }else{
     flags = 0;
   }
   zSql = (const char*)sqlite3_value_text(apVal[0]);
   if( zSql==0 ) return;
   pOut = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
-  if( (flags & 0x02)==0 ) sqlite3_str_appendall(pOut, zSql);
-  appendCompletion(pOut, zSql, flags & 0x05);
+  if( (flags & 0x08)!=0 ){
+    sqlite3_str_appendall(pOut, zSql);
+    truncateToOneStatement(pOut, (flags & 0x01)!=0);
+    zSql = sqlite3_str_value(pOut);
+    if( flags & 0x02 ){
+      sqlite3_str *pCompletion = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
+      appendCompletion(pCompletion, zSql, flags & 0x05);
+      sqlite3_str_free(pOut);
+      pOut = pCompletion;
+    }else{
+      appendCompletion(pOut, zSql, flags & 0x05);
+    }
+  }else{
+    if( (flags & 0x02)==0 ) sqlite3_str_appendall(pOut, zSql);
+    appendCompletion(pOut, zSql, flags & 0x05);
+  }
   sqlite3_result_str(pCtx, pOut, SQLITE_FINISH);
 }
 
@@ -26985,23 +27293,26 @@ static char *shellFakeSchema(
 **
 ** A build has capability X if any of the following are true:
 **
-**   (1)  A function named X exists.
-**   (2)  A module named X exists.
-**   (3)  A compile-time option X is used for the build.
+**   (1)  A VFS named X exists.
+**   (2)  A function named X exists.
+**   (3)  A module named X exists.
+**   (4)  A compile-time option X is used for the build.
 **
 ** Comparison between X and the various items above is done
-** without to case.  So capable('generate_series') and
-** capable('GENERATE_SERIES') and capable('Generate_Series')
-** all work the same.
+** using sqlite_stricmp() so that upper/lower case does not matter.
+** So capable('generate_series') and capable('GENERATE_SERIES')
+** both work the same.
 **
 ** There are also special names "vtab", "fkey", and "load_ext"
 ** that return true as long as compile-time options
 ** SQLITE_OMIT_VIRTUALTABLE, SQLITE_OMIT_FOREIGN_KEY, and
 ** SQLITE_OMIT_LOAD_EXTENSION are omitted from the build,
-** respectively.  New special names may be added in the future.
-** Thus, for example, "capable('vtab')" means that the build
-** lacks SQLITE_OMIT_VIRTUALTABLE and hence does support
-** virtual tables.
+** respectively.  Thus capable('vtab') means that virtual table
+** features of SQLite are available in the current build.
+**
+** There is also the special name "unsafe" which is true as long
+** as the CLI is not in safe mode.  New special names may be added
+** in the future.
 **
 ** For other "OMIT" options (besides the three special ones noted
 ** in the previous paragraph) you have to say something like
@@ -27043,9 +27354,32 @@ static void shellCapable(
   size_t i;
   int invert = 0;
   int res = 0;
+  sqlite3_vfs *pVfs;
 
   UNUSED_PARAMETER(nVal);
   if( z==0 ) return;
+
+  /* Check available VFS names */
+  for(pVfs=sqlite3_vfs_find(0); pVfs; pVfs=pVfs->pNext){
+    if( sqlite3_stricmp(z,pVfs->zName)==0 ){
+      res = 1;
+      goto capable_finished;
+    }
+  }
+
+  /* Special case:  capable('unsafe') is true if not in safe mode */
+  if( sqlite3_stricmp(z, "unsafe")==0 && p->bSafeMode==0 ){
+    res = 1;
+    goto capable_finished;
+  }
+  /* Special case:  capable('unsafe-testing') is true if the CLI
+  ** was launched with the --unsafe-testing flag */
+  if( sqlite3_stricmp(z, "unsafe-testing")==0 ){
+    res = ShellHasFlag(p,SHFLG_TestingMode);
+    goto capable_finished;
+  }
+
+  /* Check special cases likek "vtab" and "fkey" */
   for(i=0; i<sizeof(azInversions)/sizeof(azInversions[0])-1; i+=2){
     if( sqlite3_stricmp(z, azInversions[i])==0 ){
       z = azInversions[i+1];
@@ -27053,12 +27387,14 @@ static void shellCapable(
       break;
     }
   } 
+
+  /* Run pragmas listing compile-time options, virtual tables, and functions */
   for(i=0; i<sizeof(azSql)/sizeof(azSql[0]); i++){
     sqlite3_stmt *pStmt = 0;
     sqlite3_prepare_v2(p->db, azSql[i], -1, &pStmt, 0);
     while( sqlite3_step(pStmt)==SQLITE_ROW ){
       const char *zRow = (const char*)sqlite3_column_text(pStmt, 0);
-      if( sqlite3_stricmp(zRow, z)==0 ){
+      if( sqlite3_stricmp(z,zRow)==0 ){
         res = 1;
         break;
       }
@@ -27066,6 +27402,8 @@ static void shellCapable(
     sqlite3_finalize(pStmt);
     if( res ) break;
   }
+
+capable_finished:
   if( invert ) res = !res;
   sqlite3_result_int(pCtx, res);
 }
@@ -27182,6 +27520,7 @@ static void shellAddSchemaName(
         }else{
           sqlite3_str_appendall(pOut, zIn);
         }
+        truncateToOneStatement(pOut, 1);
         appendCompletion(pOut, sqlite3_str_value(pOut), 1);
         if( zName
          && aPrefix[i][0]=='V'
@@ -30156,6 +30495,9 @@ static const struct {
 "After checking the result, all captured output is discarded and\n"
 "output starts going back to the console, unless --keep is used.\n"
 "\n"
+"The PATTERN is the concatenation (with a single space separator) of\n"
+"all arguments that are not part of OPTIONS.\n"
+"\n"
 "If PATTERN is \"<<ENDMARK\" (for any ENDMARK) then the actual pattern is\n"
 "taken from subsequent lines of text up to the first line that begins\n"
 "with ENDMARK.\n"
@@ -30945,7 +31287,7 @@ static void open_db(ShellState *p, int openFlags){
     }
 
 #ifndef SQLITE_OMIT_LOAD_EXTENSION
-    sqlite3_enable_load_extension(p->db, 1);
+    sqlite3_enable_load_extension(p->db, !p->bSafeMode);
 #endif
     sqlite3_sha_init(p->db, 0, 0);
     sqlite3_shathree_init(p->db, 0, 0);
@@ -30960,17 +31302,18 @@ static void open_db(ShellState *p, int openFlags){
     sqlite3_diskused_init(p->db, 0, 0);
     sqlite3_strdup_init(p->db, 0, 0);
 #ifndef SQLITE_SHELL_FIDDLE
-    if( !p->bSafeMode ){
-      sqlite3_fileio_init(p->db, 0, 0);
-    }
     sqlite3_completion_init(p->db, 0, 0);
 #endif
+    if( !p->bSafeMode ){
+      sqlite3_tryeval_init(p->db, 0, 0);
+#ifndef SQLITE_SHELL_FIDDLE
+      sqlite3_fileio_init(p->db, 0, 0);
+#endif
 #ifdef SQLITE_HAVE_ZLIB
-    if( !p->bSafeModePersist ){
       sqlite3_zipfile_init(p->db, 0, 0);
       sqlite3_sqlar_init(p->db, 0, 0);
-    }
 #endif
+    }
 #ifdef SQLITE_SHELL_EXTFUNCS
     /* Create a preprocessing mechanism for extensions to make
      * their own provisions for being built into the shell.
@@ -32078,15 +32421,11 @@ static char *shellFilenameFromUri(const char *zFN){
       zOut[j++] = zOut[i];
       continue;
     }
-    d1 = hexDigitValue(zOut[i+1]);
-    if( d1<0 ){
-      zOut[j] = 0;
-      break;
-    }
-    d2 = hexDigitValue(zOut[i+2]);
+    d2 = d1 = hexDigitValue(zOut[i+1]);
+    if( d2>=0 ) d2 = hexDigitValue(zOut[i+2]);
     if( d2<0 ){
-      zOut[j] = 0;
-      break;
+      zOut[j++] = zOut[i];
+      continue;
     }
     zOut[j++] = d1*16 + d2;
     i += 2;
@@ -33454,34 +33793,40 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
 
   for(i=1; i<nArg; i++){
     char *z = azArg[i];
-    int n;
     if( z[0]=='-' && z[1]=='-' ) z++;
-    n = strlen30(z);
-    if( n<=17 && memcmp("-ignore-freelist", z, n)==0 ){
+    if( optionMatch(z,"ignore-freelist") ){
       bFreelist = 0;
     }else
-    if( n<=12 && memcmp("-recovery-db", z, n)==0 && i<(nArg-1) ){
+    if( optionMatch(z, "recovery-db") ){
       /* This option determines the name of the ATTACH-ed database used
       ** internally by the recovery extension.  The default is "" which
       ** means to use a temporary database that is automatically deleted
       ** when closed.  This option is undocumented and might disappear at
       ** any moment. */
+      if( i+1>=nArg ){
+        dotCmdError(pState, i, "missing argument", 0);
+        return 1;
+      }
       i++;
       zRecoveryDb = azArg[i];
     }else
-    if( n<=15 && memcmp("-lost-and-found", z, n)==0 && i<(nArg-1) ){
+    if( optionMatch(z, "lost-and-found") ){
+      if( i+1>=nArg ){
+        dotCmdError(pState, i, "missing argument", 0);
+        return 1;
+      }
       i++;
       zLAF = azArg[i];
     }else
-    if( n<=10 && memcmp("-no-rowids", z, n)==0 ){
+    if( optionMatch(z,"no-rowids") ){
       bRowids = 0;
     }else
-    if( n<=7 && memcmp("-unsafe", z, n)==0 ){
+    if( optionMatch(z,"unsafe") ){
       bUnsafe = 1;
     }
     else{
-      cli_printf(stderr,"unexpected option: %s\n", azArg[i]);
-      showHelp(pState->out, azArg[0]);
+      dotCmdError(pState, i, "unknown mode",
+                  "Use \".help .recover\" for more info");
       return 1;
     }
   }
@@ -35267,24 +35612,29 @@ dotCmdOutput_error:
 ** Return true if the argument is <<MARK for some arbitrary mark
 */
 static int isHereDoc(const char *z){
-  return z[0]=='<' && z[1]=='<' && z[2]!=0;
+  return z && z[0]=='<' && z[1]=='<' && z[2]!=0;
 }
 
 /*
 ** Capture lines of input text up until a line that matches zTerminator.
 ** Return a memory buffer (allocated using sqlite3_malloc64()) that
-** contains the complete text, without the terminator.
+** contains the complete text, without the terminator.  The buffer is
+** never NULL, even if the text is empty.
 */
 static char *captureHereDoc(ShellState *p, const char *zTerminator){
   int nTerminator = strlen30(zTerminator);
-  sqlite3_str *pHeredoc = sqlite3_str_new(p->db);
+  sqlite3_str *pHeredoc = sqlite3_str_new(0);
+  char *zHeredoc;
   char zLine[2000];
   while( shell_fgets(p, zLine,sizeof(zLine),p->in) ){
     if( strchr(zLine,'\n') ) p->lineno++;
     if( cli_strncmp(zTerminator,zLine,nTerminator)==0 ) break;
     sqlite3_str_appendall(pHeredoc, zLine);
   }
-  return sqlite3_str_finish(pHeredoc);
+  zHeredoc = sqlite3_str_finish(pHeredoc);
+  if( zHeredoc==0 ) zHeredoc = sqlite3_mprintf("");
+  shell_check_oom(zHeredoc);
+  return zHeredoc;
 }
 
 /*
@@ -35299,8 +35649,9 @@ static char *trimSpace(char *zIn, int *pN){
   while( IsSpace(zIn[0]) ){ zIn++; }
   if( pN ){
     size_t n = strlen(zIn);
+    assert( n<=0x7fffffff );
     while( n>0 && IsSpace(zIn[n-1]) ){ n--; }
-    *pN = n;
+    *pN = (int)n;
   }
   return zIn;
 }
@@ -35317,6 +35668,9 @@ static char *trimSpace(char *zIn, int *pN){
 **
 ** After checking the result, all captured output is discarded and
 ** output starts going back to the console, unless --keep is used.
+**
+** The PATTERN is the concatenation (with a single space separator) of
+** all arguments that are not part of OPTIONS.
 **
 ** If PATTERN is "<<ENDMARK" (for any ENDMARK) then the actual pattern is
 ** taken from subsequent lines of text up to the first line that begins
@@ -35358,9 +35712,9 @@ static int dotCmdCheck(ShellState *p){
   int k;                             /* Result of pickStr() */
   char *zTest;                       /* Textcase result */
   int bKeep = 0;                     /* --keep option */
-  char *zCheck = 0;                  /* PATTERN argument */
-  char *zPattern = 0;                /* Actual test pattern */
-  char *zToFree = 0;                 /* allocated text to free */
+  sqlite3_str *pPattern;             /* PATTERN argument */
+  char *zPattern = 0;                /* Test pattern */
+  char *zToFree = 0;                 /* Start of test pattern */
   int eCheck = 0;                    /* 0: default.  Else 1+index of option */
   int isOk = 0;                      /* True if results are OK */
   int bNot = 0;                      /* Invert the sense of the test */
@@ -35380,6 +35734,7 @@ static int dotCmdCheck(ShellState *p){
     dotCmdError(p, 0, "no .testcase is active", 0);
     return 1;
   }
+  pPattern = sqlite3_str_new(0);
   for(i=1; i<nArg; i++){
     char *z = azArg[i];
     if( z[0]=='-' && z[1]=='-' && z[2]!=0 ) z++;
@@ -35401,20 +35756,18 @@ static int dotCmdCheck(ShellState *p){
         eCheck = k+1;
       }else{
         output_reset(p);
+        sqlite3_str_free(pPattern);
         dotCmdError(p, i, "incompatible with prior options",0);
         return 1;
       }
-    }else if( zCheck ){
-      output_reset(p);
-      dotCmdError(p, i, "unknown option", 0);
-      return 1;
     }else{
-      zCheck = azArg[i];
-      iPat = i;
+      if( sqlite3_str_length(pPattern)>0 ){
+        sqlite3_str_appendchar(pPattern, 1, ' ');
+      }else{
+        iPat = i;
+      }
+      sqlite3_str_appendall(pPattern, azArg[i]);
     }
-  }
-  if( zCheck==0 ){
-    zCheck = "";  /* No pattern string defaults to mean no output */
   }
   if( sqlite3_str_length(cli_output_capture) ){
     zTest = sqlite3_str_value(cli_output_capture);
@@ -35423,15 +35776,14 @@ static int dotCmdCheck(ShellState *p){
     zTest = "";
   }
   p->nTestRun++;
-  if( isHereDoc(zCheck) ){
-    zPattern = captureHereDoc(p, zCheck+2);
-    if( zPattern==0 ){
-      zPattern = sqlite3_mprintf("");
-    }
+  zToFree = zPattern = sqlite3_str_finish(pPattern);
+  if( isHereDoc(zPattern) ){
+    zPattern = captureHereDoc(p, zPattern+2);
+    sqlite3_free(zToFree);
     zToFree = zPattern;
-  }else{
-    zPattern = zCheck;
-    zToFree = 0;
+  }
+  if( zPattern==0 ){
+    zToFree = zPattern = sqlite3_mprintf("");
   }
   shell_check_oom(zPattern);
   switch( eCheck ){
@@ -35539,6 +35891,10 @@ static int dotCmdCheck(ShellState *p){
     }else{
       sqlite3_fprintf(stderr, "Got:      [%s]\n", zTest);
     }
+  }else if( ShellHasFlag(p, SHFLG_Verbose) ){
+    /* Report each passing .check when the -v option is used. */
+    sqlite3_fprintf(stdout, "%s:%lld: testcase %s ok\n",
+                    p->zInFile, iStart, p->zTestcase);
   }
   sqlite3_free(zToFree);
   if( !bKeep ){
@@ -35666,7 +36022,7 @@ static int dotCmdTestcase(ShellState *p){
       }
       free(p->zErrPrefix);
       i++;
-      p->zErrPrefix = azArg[i][0]==0 ? 0 : strdup(azArg[i]);
+      p->zErrPrefix = (azArg[i] && azArg[i][0]) ? strdup(azArg[i]) : 0;
     }else if( zName ){
       dotCmdError(p, i, "unknown option", 0);
       return 1;
@@ -35943,13 +36299,21 @@ static int dotCmdSafe(ShellState *p){
   int i;
   p->bSafeMode = 1;
   p->bSafeModePersist = 1;
+#if !defined(SQLITE_OMIT_LOAD_EXTENSION)
+  if( p->db ) sqlite3_enable_load_extension(p->db, 0);
+#endif
   for(i=0; i<ArraySize(p->aAuxDb); i++){
     sqlite3 *db = p->aAuxDb[i].db;
     if( db==0 ) continue;
+#ifndef SQLITE_OMIT_VIRTUALTABLE
     sqlite3_create_module(db, "fsdir", 0, 0);
-    sqlite3_create_function(db, "writefile", -1, 0, 0, 0, 0, 0);
     sqlite3_create_module(db, "zipfile", 0, 0);
+#endif
+    sqlite3_create_function(db, "writefile", -1, 0, 0, 0, 0, 0);
     sqlite3_create_function(db, "zipfile", -1, 0, 0, 0, 0, 0);
+    sqlite3_create_function(db, "tryeval", -1, 0, 0, 0, 0, 0);
+    sqlite3_create_function(db, "expire", 1, 0, 0, 0, 0, 0);
+    sqlite3_create_function(db, "expire", 2, 0, 0, 0, 0, 0);
   }
   return 0;
 }
@@ -36380,7 +36744,6 @@ static int do_meta_command(const char *zLine, ShellState *p){
         { "enable_trigger",     SQLITE_DBCONFIG_ENABLE_TRIGGER        },
         { "enable_view",        SQLITE_DBCONFIG_ENABLE_VIEW           },
         { "fts3_tokenizer",     SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER },
-        { "fp_digits",          SQLITE_DBCONFIG_FP_DIGITS             },
         { "legacy_alter_table", SQLITE_DBCONFIG_LEGACY_ALTER_TABLE    },
         { "legacy_file_format", SQLITE_DBCONFIG_LEGACY_FILE_FORMAT    },
         { "load_extension",     SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION },
@@ -36544,7 +36907,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     p->nErr = 0;
     if( zLike==0 ) zLike = sqlite3_mprintf("true");
     zSql = sqlite3_mprintf(
-      "SELECT name, type, shell_complete_sql(sql) FROM sqlite_schema AS o "
+      "SELECT name, type, shell_complete_sql(sql,8) FROM sqlite_schema AS o "
       "WHERE (%s) AND type=='table'"
       "  AND sql NOT NULL"
       " ORDER BY tbl_name='sqlite_sequence', rowid",
@@ -36554,7 +36917,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     sqlite3_free(zSql);
     if( (p->shellFlgs & SHFLG_DumpDataOnly)==0 ){
       zSql = sqlite3_mprintf(
-        "SELECT shell_complete_sql(sql) FROM sqlite_schema AS o "
+        "SELECT shell_complete_sql(sql,8) FROM sqlite_schema AS o "
         "WHERE (%s) AND sql NOT NULL"
         "  AND type IN ('index','trigger','view') "
         "ORDER BY type COLLATE NOCASE DESC",
@@ -36808,7 +37171,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     }
     open_db(p, 0);
     zSql = sqlite3_mprintf(
-       "SELECT shell_format_schema(shell_complete_sql(sql),%d) FROM"
+       "SELECT shell_format_schema(shell_complete_sql(sql,8),%d) FROM"
        "  (SELECT sql sql, type type, tbl_name tbl_name, name name, rowid x"
        "     FROM sqlite_schema UNION ALL"
        "   SELECT sql, type, tbl_name, name, rowid FROM sqlite_temp_schema) "
@@ -38640,6 +39003,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     {"extra_schema_checks",SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS,0,"BOOLEAN"  },
     {"fault_install",      SQLITE_TESTCTRL_FAULT_INSTALL, 1,"args..."       },
     {"fk_no_action",       SQLITE_TESTCTRL_FK_NO_ACTION, 0, "BOOLEAN"       },
+    {"fp_digits",          SQLITE_TESTCTRL_FP_DIGITS, 0, "?NDIGIT?"         },
     {"imposter",         SQLITE_TESTCTRL_IMPOSTER,1,"SCHEMA ON/OFF ROOTPAGE"},
     {"internal_functions", SQLITE_TESTCTRL_INTERNAL_FUNCTIONS,0,""          },
     {"json_selfcheck",     SQLITE_TESTCTRL_JSON_SELFCHECK ,0,"BOOLEAN"      },
@@ -38655,7 +39019,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
     {"prng_seed",          SQLITE_TESTCTRL_PRNG_SEED,   0, "SEED ?db?"      },
     {"seek_count",         SQLITE_TESTCTRL_SEEK_COUNT,  0, ""               },
     {"sorter_mmap",        SQLITE_TESTCTRL_SORTER_MMAP, 0, "NMAX"           },
-    {"tune",               SQLITE_TESTCTRL_TUNE,        1, "ID VALUE"       },
+    {"tune",               SQLITE_TESTCTRL_TUNE,        1, "ID [VALUE]"     },
     };
     int testctrl = -1;
     int iCtrl = -1;
@@ -38917,11 +39281,9 @@ static int do_meta_command(const char *zLine, ShellState *p){
               int val = 0;
               rc2 = sqlite3_test_control(testctrl, -id, &val);
               if( rc2!=SQLITE_OK ) break;
-              if( id>1 ) cli_puts("  ", p->out);
-              cli_printf(p->out, "%d: %d", id, val);
+              cli_printf(p->out, "%2d: %d\n", id, val);
               id++;
             }
-            if( id>1 ) cli_puts("\n", p->out);
             isOk = 3;
           }
           break;
@@ -38985,6 +39347,21 @@ static int do_meta_command(const char *zLine, ShellState *p){
           x = sqlite3_test_control(testctrl, iSize, aOp);
           cli_printf(p->out, "result: %d\n", x);
           free(aOp);
+          break;
+        }
+        case SQLITE_TESTCTRL_FP_DIGITS: {
+          int nIn = 0;
+          isOk = 1;  /* Output shall be the value of rc2 */
+          rc2 = 0;
+          if( nArg==3 ){
+            if( !ShellHasFlag(p,SHFLG_TestingMode) ){
+              dotCmdError(p, 2, "fp_digits is read-only in this shell", 0);
+              isOk = 3; /* No output after error */
+            }else{
+              nIn = (int)integerValue(azArg[2]);
+            }
+          }
+          sqlite3_test_control(SQLITE_TESTCTRL_FP_DIGITS, p->db, nIn, &rc2);
           break;
         }
         case SQLITE_TESTCTRL_FAULT_INSTALL: {
@@ -39503,7 +39880,7 @@ static int runOneSqlLine(
     END_TIMER(p);
   }
   if( rc || zErrMsg ){
-    sqlite3_str *pPrefix = sqlite3_str_new(p->db);
+    sqlite3_str *pPrefix = sqlite3_str_new(0);
     const char *zErrorTail;
     const char *zErrorType;
     if( zErrMsg==0 ){
@@ -40028,6 +40405,7 @@ static const char zOptions[] =
   "   -table               set '.mode table'\n"
   "   -tabs                set '.mode tabs'\n"
   "   -unsafe-testing      allow unsafe commands and modes for testing\n"
+  "   -v                   show each passing .check command\n"
   "   -version             show SQLite version\n"
   "   -vfs NAME            use NAME as the default VFS\n"
   "   -vfstrace            enable tracing of all VFS calls\n"
@@ -40578,6 +40956,8 @@ int SQLITE_CDECL main(int argc, char **argv){
       verify_uninitialized();
       sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, (int)sz);
 #endif
+    }else if( cli_strcmp(z,"-v")==0 ){
+      ShellSetFlag(&data, SHFLG_Verbose);
     }else if( cli_strcmp(z,"-vfs")==0 ){
       zVfs = cmdline_option_value(argc, argv, ++i);
 #ifdef SQLITE_HAVE_ZLIB
@@ -40921,6 +41301,8 @@ int SQLITE_CDECL main(int argc, char **argv){
     }else if( cli_strcmp(z,"-sorterref")==0 ){
       i++;
 #endif
+    }else if( cli_strcmp(z,"-v")==0 ){
+      /* No-op.  The SHFLG_Verbose flag should already be set. */
     }else if( cli_strcmp(z,"-vfs")==0 ){
       i++;
     }else if( cli_strcmp(z,"-vfstrace")==0 ){
@@ -41011,6 +41393,7 @@ int SQLITE_CDECL main(int argc, char **argv){
         shell_check_oom(zErrCtx);
         sqlite3_snprintf(64,zErrCtx,"argv[%i]:",aiCmd[i]);
         data.zInFile = "<cmdline>";
+        free(data.zErrPrefix);
         data.zErrPrefix = zErrCtx;
         rc = do_meta_command(azCmd[i], &data);
         free(data.zErrPrefix);

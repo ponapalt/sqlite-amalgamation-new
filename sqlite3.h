@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.55.0"
 #define SQLITE_VERSION_NUMBER 3055000
-#define SQLITE_SOURCE_ID      "2026-11-13 17:01:43 ebcb9bb98fc31604a14273ce7140ea67616bb86846f67ff851b-experimental"
+#define SQLITE_SOURCE_ID      "2026-11-20 17:08:32 d8e9029696ee0b32e77c7440c1d8eb2dff6df8ffb577bdb8358-experimental"
 #define SQLITE_SCM_BRANCH     "unknown"
 #define SQLITE_SCM_TAGS       "unknown"
-#define SQLITE_SCM_DATETIME   "2026-11-13T17:01:43.508Z"
+#define SQLITE_SCM_DATETIME   "2026-11-20T17:08:32.895Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -2659,18 +2659,15 @@ struct sqlite3_mem_methods {
 **
 ** [[SQLITE_DBCONFIG_FP_DIGITS]]
 ** <dt>SQLITE_DBCONFIG_FP_DIGITS</dt>
-** <dd>The SQLITE_DBCONFIG_FP_DIGITS setting is a small integer that determines
-** the number of significant digits that SQLite will attempt to preserve when
-** converting floating point numbers (IEEE 754 "doubles") into text.  The
-** default value 17, as of SQLite version 3.52.0.  The value was 15 in all
-** prior versions.<p>
-** This option takes two arguments which are an integer and a pointer
-** to an integer.  The first argument is a small integer, between 4 and 23, or
-** zero.  The FP_DIGITS setting is changed to that small integer, or left
-** unaltered if the first argument is zero or out of range. The second argument
-** is a pointer to an integer.  If the pointer is not NULL, then the value of
-** the FP_DIGITS setting, after possibly being modified by the first
-** arguments, is written into the integer to which the second argument points.
+** <dd>The configuration settings is a no-op as of 2026-11-20 (first
+** release 3.55.0). Originally, the SQLITE_DBCONFIG_FP_DIGITS
+** setting was is a small integer that determines the number of significant
+** digits that SQLite will attempt to preserve when converting floating point
+** numbers (IEEE 754 "doubles") into text.  However, later discovered
+** that changing this value from its default can cause stale indexes.  For
+** that reason, the setting was removed.  There is still a test-control that
+** can be used to change the value for testing purposes, but as with all
+** test-controls, it should not be used by ordinary application.
 **
 ** [[SQLITE_DBCONFIG_VDBE_TRACE]]
 ** <dt>SQLITE_DBCONFIG_VDBE_TRACE</dt>
@@ -5567,7 +5564,7 @@ SQLITE_API int sqlite3_data_count(sqlite3_stmt *pStmt);
 ** <tr><td> INTEGER  <td>   BLOB    <td> Same as INTEGER->TEXT
 ** <tr><td>  FLOAT   <td> INTEGER   <td> [CAST] to INTEGER
 ** <tr><td>  FLOAT   <td>   TEXT    <td> ASCII rendering of the float
-** <tr><td>  FLOAT   <td>   BLOB    <td> [CAST] to BLOB
+** <tr><td>  FLOAT   <td>   BLOB    <td> Same as FLOAT->TEXT
 ** <tr><td>  TEXT    <td> INTEGER   <td> [CAST] to INTEGER
 ** <tr><td>  TEXT    <td>  FLOAT    <td> [CAST] to REAL
 ** <tr><td>  TEXT    <td>   BLOB    <td> No change
@@ -8803,7 +8800,8 @@ SQLITE_API int sqlite3_test_control(int op, ...);
 #define SQLITE_TESTCTRL_USELONGDOUBLE           34  /* NOT USED */
 #define SQLITE_TESTCTRL_ATOF                    34
 #define SQLITE_TESTCTRL_EXPIRE_STMTS            35
-#define SQLITE_TESTCTRL_LAST                    35  /* Largest TESTCTRL */
+#define SQLITE_TESTCTRL_FP_DIGITS               36
+#define SQLITE_TESTCTRL_LAST                    36  /* Largest TESTCTRL */
 
 /*
 ** CAPI3REF: SQL Keyword Checking
